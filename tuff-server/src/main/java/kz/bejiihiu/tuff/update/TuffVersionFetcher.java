@@ -13,9 +13,8 @@ import java.nio.charset.StandardCharsets;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.format.NamedTextColor;
-import org.checkerframework.checker.nullness.qual.NonNull;
-import org.checkerframework.checker.nullness.qual.Nullable;
-import org.checkerframework.framework.qual.DefaultQualifier;
+import org.jspecify.annotations.NullMarked;
+import org.jspecify.annotations.Nullable;
 
 import static net.kyori.adventure.text.Component.text;
 
@@ -25,7 +24,7 @@ import static net.kyori.adventure.text.Component.text;
  * Tuff releases live on GitHub, so we ask the GitHub API for the newest release tag and compare it
  * with the build we are running. PaperMC's fill/jenkins APIs are not used at all.
  */
-@DefaultQualifier(NonNull.class)
+@NullMarked
 public final class TuffVersionFetcher implements VersionFetcher {
 
     private static final String REPOSITORY = "bejiihiu/tuff";
@@ -76,12 +75,12 @@ public final class TuffVersionFetcher implements VersionFetcher {
             if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) {
                 return null;
             }
-            try (final BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8))) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8))) {
                 final JsonObject json = GSON.fromJson(reader, JsonObject.class);
                 final String tag = json.get("tag_name").getAsString();
                 return new Release(tag);
             }
-        } catch (final IOException | RuntimeException ex) {
+        } catch (IOException | RuntimeException _) {
             // network is down, repo is private, github changed the api, whatever - just stay quiet
             return null;
         }
