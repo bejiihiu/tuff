@@ -1,239 +1,117 @@
-[![Version](https://img.shields.io/maven-metadata/v?metadataUrl=https%3A%2F%2Fartifactory.papermc.io%2Fartifactory%2Funiverse%2Fdev%2Ffolia%2Ffolia-api%2Fmaven-metadata.xml&strategy=highestVersion&filter=26.3.*&label=version&color=%23344ceb
-)](https://papermc.io/downloads/folia)
-[![Folia Build Status](https://img.shields.io/github/actions/workflow/status/PaperMC/Folia/release-26.3.yaml?branch=ver/26.3.x)](https://github.com/PaperMC/Folia/actions)
-[![Discord](https://img.shields.io/discord/289587909051416579.svg?label=&logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://discord.gg/papermc)
-===========
+# Tuff
+
+[![Build](https://img.shields.io/github/actions/workflow/status/bejiihiu/tuff/build.yml?branch=ver/26.3.x&label=build)](https://github.com/bejiihiu/tuff/actions)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](./PATCHES-LICENSE)
 
 <div align=center>
-    <img src="./folia.png" alt="folia logo">
-    <br /><br />
-    <p>Fork of <a href="https://github.com/PaperMC/Paper">Paper</a> which adds regionised multithreading to the dedicated server.</p>
+    <p><b>Tuff</b> is a fork of <a href="https://github.com/PaperMC/Folia">Folia</a>, which itself is a fork of
+    <a href="https://github.com/PaperMC/Paper">Paper</a>. Folia adds regionised multithreading to the dedicated server; Tuff keeps
+    all of that machinery untouched and builds its own stuff on top of it.</p>
 </div>
 
-## Overview
+## What Tuff changes
 
-Folia groups nearby loaded chunks to form an "independent region."
-See [the PaperMC documentation](https://docs.papermc.io/folia/reference/region-logic) for exact details on how Folia
-will group nearby chunks.
-Each independent region has its own tick loop, which is ticked at the
-regular Minecraft tickrate (20TPS). The tick loops are executed
-on a thread pool in parallel. There is no main thread anymore, 
-as each region effectively has its own "main thread" that executes
+Tuff is a **branding + feature** layer over Folia. Upstream Folia (and therefore Paper) is merged regularly, so everything
+inside `io.papermc.paper.threadedregions.*`, the `folia-supported` plugin flag, the `folia:*` ticket ids and the rest of the
+Folia internals are exactly the same as upstream. No renames, no "hidden" Folia.
+
+On top of that, Tuff ships:
+
+- its own server identity (`Brand-Name: Tuff`, `Brand-Id: kz.bejiihiu:tuff`, `tuff-bundler` / `tuff-paperclip` jars);
+- an update checker that talks to [our GitHub releases](https://github.com/bejiihiu/tuff/releases) instead of PaperMC's fill API;
+- bStats submissions disabled by default (Folia's page is not ours). Opt in with `-Dtuff.bstats=true` if you really want them;
+- a home for new systems in the `kz.bejiihiu.tuff` package. That code lives in `tuff-server/src/main/java`, outside of the patch stack,
+  so it never gets in the way of upstream updates.
+
+## Building
+
+You need Git and a JDK. Gradle picks up JDK 25 through the toolchain resolver, so a local JDK 21 install is fine.
+
+```bash
+git clone https://github.com/bejiihiu/tuff.git
+cd tuff
+./gradlew applyAllPatches   # decompiles Minecraft and applies the patch stack
+./gradlew build             # produces tuff-server/build/libs/tuff-paperclip-<version>.jar
+```
+
+Windows: use `gradlew.bat` (or the helper scripts `patch.bat` / `rb.bat`). Make sure `git config --global core.autocrlf false`
+is set before the first build, otherwise checkstyle fails on CRLF in the generated sources.
+
+Downloads for people who just want to run a server are on the
+[releases page](https://github.com/bejiihiu/tuff/releases).
+
+## Using the API
+
+`tuff-api` is published to GitHub Packages:
+
+```kotlin
+repositories {
+    maven("https://maven.pkg.github.com/bejiihiu/tuff") {
+        credentials {
+            username = "your-github-name"
+            password = System.getenv("GITHUB_TOKEN") // needs read:packages
+        }
+    }
+}
+
+dependencies {
+    compileOnly("kz.bejiihiu.tuff:tuff-api:26.3.local-SNAPSHOT")
+}
+```
+
+For local plugin development the simplest option is:
+
+```bash
+./gradlew publishToMavenLocal
+```
+
+and then use `mavenLocal()` with the same coordinates. Publishing from CI uses the `tuffUsername` / `tuffPassword`
+Gradle properties (see `.github/workflows/release.yml`).
+
+## Region threading (the Folia part)
+
+Folia groups nearby loaded chunks into an "independent region". See
+[the PaperMC documentation](https://docs.papermc.io/folia/reference/region-logic) for the exact grouping rules.
+Each independent region has its own tick loop, ticked at the regular Minecraft tickrate (20 TPS). The tick loops run on a
+thread pool in parallel. There is no main thread anymore: each region effectively has its own "main thread" that executes
 the entire tick loop.
 
-For a server with many spread out players, Folia will create many
-spread out regions and tick them all in parallel on a configurable sized
-threadpool. Thus, Folia should scale well for servers like this.
+For a server with many spread out players, this creates many spread out regions and ticks them all in parallel on a
+configurable sized threadpool, so it scales well for skyblock/SMP style servers with a sizeable player count. Ideally you
+want at least 16 _cores_ (not threads).
 
-Folia is also its own project, this will not be merged into Paper
-for the foreseeable future. 
+### Configuration starting point
 
-A more detailed but abstract overview: [Project overview](https://docs.papermc.io/folia/reference/overview).
+Pre-generate your world first, then allocate threads roughly like this (based on a ~330 player peak test, tune from there):
 
-## FAQ
-
-### What server types can benefit from Folia?
-Server types that naturally spread players out, 
-like skyblock or SMP, will benefit the most from Folia. The server
-should have a sizeable player count, too.
-
-### What hardware will Folia run best on?
-Ideally, at least 16 _cores_ (not threads).
-
-### How to best configure Folia?
-First, it is recommended that the world is pre-generated so that the number
-of chunk system worker threads required is reduced greatly.
-
-The following is a _very rough_ estimation based off of the testing
-done before Folia was released on the test server we ran that
-had ~330 players peak. So, it is not exact and will require further tuning - 
-just take it as a starting point.
-
-The total number of cores on the machine available should be 
-taken into account. Then, allocate threads for: 
-- netty IO :~4 per 200-300 players
+- netty IO: ~4 per 200-300 players
 - chunk system io threads: ~3 per 200-300 players
-- chunk system workers if pre-generated, ~2 per 200-300 players
-- There is no best guess for chunk system workers if not pre-generated, as
-  on the test server we ran we gave 16 threads but chunk generation was still
-  slow at ~300 players.
-- GC Settings: ???? But, GC settings _do_ allocate concurrent threads, and you need
-  to know exactly how many. This is typically through the `-XX:ConcGCThreads=n` flag. Do not
-  confuse this flag with `-XX:ParallelGCThreads=n`, as parallel GC threads only run when
-  the application is paused by GC and as such should not be taken into account.
-
-After all of that allocation, the remaining cores on the system until 80%
-allocation (total threads allocated < 80% of cpus available) can be
-allocated to tickthreads (under global config, threaded-regions.threads). 
-
-The reason you should not allocate more than 80% of the cores is due to the
-fact that plugins or even the server may make use of additional threads 
-that you cannot configure or even predict.
-
-Additionally, the above is all a rough guess based on player count, but
-it is very likely that the thread allocation will not be ideal, and you 
-will need to tune it based on usage of the threads that you end up seeing.
+- chunk system workers (pre-generated): ~2 per 200-300 players
+- leave ~20% of the cores free for GC and anything plugins spawn
+- the rest goes to tick threads (`threaded-regions.threads` in the global config)
 
 ## Plugin compatibility
 
-There is no more main thread. I expect _every_ single plugin
-that exists to require _some_ level of modification to function
-in Folia. Additionally, multithreading of _any kind_ introduces
-possible race conditions in plugin held data - so, there are bound
-to be changes that need to be made.
+There is no main thread. Expect every plugin to need at least some changes to run on Folia-style threading, and plugins that
+share mutable state between regions will race. Only plugins explicitly marked with `folia-supported: true` in their
+`plugin.yml` are loaded at all. That flag is unchanged in Tuff, so existing Folia plugins work as-is.
 
-So, have your expectations for compatibility at 0.
+Folia's own API additions (unchanged in Tuff):
 
-## API plans
+- `RegionScheduler`, `AsyncScheduler`, `GlobalRegionScheduler` and `EntityScheduler` replace `BukkitScheduler`.
+- `Bukkit#isOwnedByCurrentRegion` tests whether the current region owns a position or entity.
+- `Entity#getScheduler` follows the entity across teleports.
 
-Currently, there is a lot of API that relies on the main thread. 
-I expect basically zero plugins that are compatible with Paper to 
-be compatible with Folia. However, there are plans to add API that 
-would allow Folia plugins to be compatible with Paper.
+Known broken upstream API (same as Folia): portals/respawn/login bits, all scoreboard API, world loading/unloading,
+and `Entity#teleport` (use `teleportAsync`).
 
-For example, the Bukkit Scheduler. The Bukkit Scheduler inherently
-relies on a single main thread. Folia's RegionScheduler and Folia's
-EntityScheduler allow scheduling of tasks to the "next tick" of whatever
-region "owns" either a location or an entity. These could be implemented
-on regular Paper, except they schedule to the main thread - in both cases,
-the execution of the task will occur on the thread that "owns" the
-location or entity. This concept applies in general, as the current Paper
-(single threaded) can be viewed as one giant "region" that encompasses
-all chunks in all worlds. 
+## Credits and license
 
-It is not yet decided whether to add this API to Paper itself directly
-or to Paperlib.
+Tuff would not exist without [Paper](https://github.com/PaperMC/Paper) and [Folia](https://github.com/PaperMC/Folia).
+Their code, patch stack and documentation are reused under their licenses; all upstream copyright headers are kept intact.
 
-### The new rules
+The patch stack (`tuff-api/paper-patches`, `tuff-server/paper-patches`, `tuff-server/minecraft-patches`) is licensed under the
+GNU General Public License v3, see [`PATCHES-LICENSE`](./PATCHES-LICENSE). If you distribute a Tuff build, you must also make
+the corresponding source available.
 
-First, Folia breaks many plugins. To aid users in figuring out which
-plugins work, only plugins that have been explicitly marked by the
-author(s) to work with Folia will be loaded. By placing
-"folia-supported: true" into the plugin's plugin.yml, plugin authors
-can mark their plugin as compatible with regionised multithreading.
-
-The other important rule is that the regions tick in _parallel_, and not 
-_concurrently_. They do not share data, they do not expect to share data,
-and sharing of data _will_ cause data corruption. 
-Code that is running in one region under no circumstance can 
-be accessing or modifying data that is in another region. Just 
-because multithreading is in the name, it doesn't mean that everything 
-is now thread-safe. In fact, there are only a _few_ things that were 
-made thread-safe to make this happen. As time goes on, the number 
-of thread context checks will only grow, even _if_ it comes at a 
-performance penalty - _nobody_ is going to use or develop for a 
-server platform that is buggy as hell, and the only way to 
-prevent and find these bugs is to make bad accesses fail _hard_ at the 
-source of the bad access.
-
-This means that Folia compatible plugins need to take advantage of 
-API like the RegionScheduler and the EntityScheduler to ensure 
-their code is running on the correct thread context.
-
-In general, it is safe to assume that a region owns chunk data
-in an approximate 8 chunks from the source of an event (i.e. player
-breaks block, can probably access 8 chunks around that block). But,
-this is not guaranteed - plugins should take advantage of upcoming
-thread-check API to ensure correct behavior.
-
-The only guarantee of thread-safety comes from the fact that a
-single region owns data in certain chunks - and if that region is
-ticking, then it has full access to that data. This data is 
-specifically entity/chunk/poi data, and is entirely unrelated
-to **ANY** plugin data.
-
-Normal multithreading rules apply to data that plugins store/access
-their own data or another plugin's - events/commands/etc. are called 
-in _parallel_ because regions are ticking in _parallel_ (we CANNOT 
-call them in a synchronous fashion, as this opens up deadlock issues 
-and would handicap performance). There are no easy ways out of this, 
-it depends solely on what data is being accessed. Sometimes a 
-concurrent collection (like ConcurrentHashMap) is enough, and often a 
-concurrent collection used carelessly will only _hide_ threading 
-issues, which then become near impossible to debug.
-
-### Current API additions
-
-To properly understand API additions, please read
-[Project overview](https://docs.papermc.io/folia/reference/overview).
-
-- RegionScheduler, AsyncScheduler, GlobalRegionScheduler, and EntityScheduler 
-  acting as a replacement for  the BukkitScheduler.
-  The entity scheduler is retrieved via Entity#getScheduler, and the
-  rest of the schedulers can be retrieved from the Bukkit/Server classes.
-- Bukkit#isOwnedByCurrentRegion to test if the current ticking region
-  owns positions/entities
-
-### Thread contexts for API
-
-To properly understand API additions, please read
-[Project overview](https://docs.papermc.io/folia/reference/overview).
-
-General rules of thumb:
-
-1. Commands for entities/players are called on the region which owns
-the entity/player. Console commands are executed on the global region.
-
-2. Events involving a single entity (i.e player breaks/places block) are
-called on the region owning entity. Events involving actions on an entity
-(such as entity damage) are invoked on the region owning the target entity.
-
-3. The async modifier for events is deprecated - all events
-fired from regions or the global region are considered _synchronous_, 
-even though there is no main thread anymore. 
-
-### Current broken API
-
-- Most API that interacts with portals / respawning players / some
-  player login API is broken.
-- ALL scoreboard API is considered broken (this is global state that
-  I've not figured out how to properly implement yet)
-- World loading/unloading
-- Entity#teleport. This will NEVER UNDER ANY CIRCUMSTANCE come back, 
-  use teleportAsync
-- Could be more
-
-### Planned API additions
-
-- Proper asynchronous events. This would allow the result of an event
-  to be completed later, on a different thread context. This is required
-  to implement some things like spawn position select, as asynchronous
-  chunk loads are required when accessing chunk data out-of-region.
-- World loading/unloading
-- More to come here
-
-### Planned API changes
-
-- Super aggressive thread checks across the board. This is absolutely
-  required to prevent plugin devs from shipping code that may randomly
-  break random parts of the server in entirely _undiagnosable_ manners.
-- More to come here
-
-### Maven information
-* Maven Repo (for folia-api):
-```xml
-<repository>
-    <id>papermc</id>
-    <url>https://repo.papermc.io/repository/maven-public/</url>
-</repository>
-```
-* Artifact Information:
-```xml
-<dependency>
-    <groupId>dev.folia</groupId>
-    <artifactId>folia-api</artifactId>
-    <version>[26.3.build,)</version>
-    <scope>provided</scope>
-</dependency>
- ```
-
-
-## License
-The PATCHES-LICENSE file describes the license for api & server patches,
-found in `./patches` and its subdirectories except when noted otherwise.
-
-The fork is based off of PaperMC's fork example found [here](https://github.com/PaperMC/paperweight-examples).
-As such, it contains modifications to it in this project, please see the repository for license information
-of modified files.
-
-[![CI powered by namespace badge](https://papermc.io/assets/misc/namespace-oss-badge.svg?project=folia)](https://namespace.so/github-actions/?utm_source=oss&utm_campaign=papermc)
+Paper, Folia and their logos are property of PaperMC. Tuff is not affiliated with or endorsed by PaperMC.

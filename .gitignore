@@ -6,14 +6,20 @@ build
 
 /run
 
-/folia-server/build.gradle.kts
-/folia-server/src/minecraft
+/tuff-server/build.gradle.kts
+/tuff-server/src/minecraft
 /paper-server
-/folia-api/build.gradle.kts
+/tuff-api/build.gradle.kts
 /paper-api
 /paper-api-generator
 /paper-checkstyle
 /.checkstyle
-/folia-checkstyle/build.gradle.kts
+/tuff-checkstyle/build.gradle.kts
 
 .idea/
+
+# agent notes, never part of the repo
+notes/
+
+# jvm crash dumps
+*.hprof

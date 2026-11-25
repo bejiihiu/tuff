@@ -14,34 +14,34 @@ paperweight {
 
         patchFile {
             path = "paper-server/build.gradle.kts"
-            outputFile = file("folia-server/build.gradle.kts")
-            patchFile = file("folia-server/build.gradle.kts.patch")
+            outputFile = file("tuff-server/build.gradle.kts")
+            patchFile = file("tuff-server/build.gradle.kts.patch")
         }
         patchFile {
             path = "paper-api/build.gradle.kts"
-            outputFile = file("folia-api/build.gradle.kts")
-            patchFile = file("folia-api/build.gradle.kts.patch")
+            outputFile = file("tuff-api/build.gradle.kts")
+            patchFile = file("tuff-api/build.gradle.kts.patch")
         }
         patchFile {
             path = "paper-checkstyle/build.gradle.kts"
-            outputFile = file("folia-checkstyle/build.gradle.kts")
-            patchFile = file("folia-checkstyle/build.gradle.kts.patch")
+            outputFile = file("tuff-checkstyle/build.gradle.kts")
+            patchFile = file("tuff-checkstyle/build.gradle.kts.patch")
         }
         patchDir("paperApi") {
             upstreamPath = "paper-api"
             excludes = setOf("build.gradle.kts")
-            patchesDir = file("folia-api/paper-patches")
+            patchesDir = file("tuff-api/paper-patches")
             outputDir = file("paper-api")
         }
         patchDir("paperCheckstyle") {
             upstreamPath = "paper-checkstyle"
             excludes = setOf("build.gradle.kts")
-            patchesDir = file("folia-checkstyle/paper-patches")
+            patchesDir = file("tuff-checkstyle/paper-patches")
             outputDir = file("paper-checkstyle")
         }
         patchDir("paperCheckstyleConfig") {
             upstreamPath = ".checkstyle"
-            patchesDir = file("folia-checkstyle/config-patches")
+            patchesDir = file("tuff-checkstyle/config-patches")
             outputDir = file(".checkstyle")
         }
     }
@@ -66,7 +66,7 @@ subprojects {
     }
 
     dependencies {
-        "checkstyle"(project(":folia-checkstyle"))
+        "checkstyle"(project(":tuff-checkstyle"))
         "testRuntimeOnly"("org.junit.platform:junit-platform-launcher")
     }
 
@@ -95,10 +95,14 @@ subprojects {
 
     extensions.configure<PublishingExtension> {
         repositories {
-            maven("https://artifactory.papermc.io/artifactory/releases/") {
-                name = "paperReleases"
+            // GitHub Packages: owner/repo path stays the same for every package of this repo.
+            // Credentials resolve from gradle properties tuffUsername / tuffPassword.
+            // In GitHub Actions pass -PtuffUsername=${{ github.actor }} -PtuffPassword=${{ secrets.GITHUB_TOKEN }}
+            maven("https://maven.pkg.github.com/bejiihiu/tuff") {
+                name = "tuff"
                 credentials(PasswordCredentials::class)
             }
+            mavenLocal()
         }
     }
 }

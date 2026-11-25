@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bejiihiu <83647537+bejiihiu@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 19:14:00 +0500
+Subject: [PATCH] Tuff rebrand
+
+
+diff --git a/src/main/java/com/destroystokyo/paper/Metrics.java b/src/main/java/com/destroystokyo/paper/Metrics.java
+index 08745a35b1ce8cc56d970472088de3cd17b9e43a..df046e85efa54f855a57784ed597f8dfe45bf2e1 100644
+--- a/src/main/java/com/destroystokyo/paper/Metrics.java
++++ b/src/main/java/com/destroystokyo/paper/Metrics.java
+@@ -562,6 +562,7 @@ public class Metrics {
+ 
+     public static class PaperMetrics {
+         public static void startMetrics() {
++            if (!Boolean.getBoolean("tuff.bstats")) return; // Tuff - bStats off by default
+             // Get the config file
+             File configFile = new File(new File((File) MinecraftServer.getServer().options.valueOf("plugins"), "bStats"), "config.yml");
+             YamlConfiguration config = YamlConfiguration.loadConfiguration(configFile);
+diff --git a/src/main/java/io/papermc/paper/PaperServerInternalAPIBridge.java b/src/main/java/io/papermc/paper/PaperServerInternalAPIBridge.java
+index 1f0ad3f6855adbc65a2f975e83846d0a3fd271c6..03ed3f9ec73476473e9f6ed799aff28191667d04 100644
+--- a/src/main/java/io/papermc/paper/PaperServerInternalAPIBridge.java
++++ b/src/main/java/io/papermc/paper/PaperServerInternalAPIBridge.java
+@@ -1,7 +1,6 @@
+ package io.papermc.paper;
+ 
+ import com.destroystokyo.paper.PaperSkinParts;
+-import com.destroystokyo.paper.PaperVersionFetcher;
+ import com.destroystokyo.paper.SkinParts;
+ import com.destroystokyo.paper.util.VersionFetcher;
+ import com.google.common.base.Preconditions;
+@@ -203,7 +202,7 @@ public class PaperServerInternalAPIBridge implements InternalAPIBridge {
+ 
+     @Override
+     public VersionFetcher getVersionFetcher() {
+-        return new PaperVersionFetcher();
++        return new kz.bejiihiu.tuff.update.TuffVersionFetcher(); // Tuff - own updater
+     }
+ 
+     @Override
+diff --git a/src/main/java/io/papermc/paper/ServerBuildInfoImpl.java b/src/main/java/io/papermc/paper/ServerBuildInfoImpl.java
+index 10a0be7a4db1a51579d113d279af7a9effe7f438..7b30a6328696f870fa0e9f75c01a74d6abac280a 100644
+--- a/src/main/java/io/papermc/paper/ServerBuildInfoImpl.java
++++ b/src/main/java/io/papermc/paper/ServerBuildInfoImpl.java
+@@ -42,9 +42,9 @@ public record ServerBuildInfoImpl(
+         this(
+             getManifestAttribute(manifest, ATTRIBUTE_BRAND_ID)
+                 .map(Key::key)
+-                .orElse(Key.key("papermc", "folia")), // Folia
++                .orElse(Key.key("kz.bejiihiu", "tuff")), // Tuff
+             getManifestAttribute(manifest, ATTRIBUTE_BRAND_NAME)
+-                .orElse("Folia"), // Folia
++                .orElse("Tuff"), // Tuff
+             SharedConstants.getCurrentVersion().id(),
+             SharedConstants.getCurrentVersion().name(),
+             getManifestAttribute(manifest, ATTRIBUTE_BUILD_NUMBER)

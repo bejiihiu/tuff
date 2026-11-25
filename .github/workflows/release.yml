@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "Build number to put into the version (26.3.build.<N>)"
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve build number
+        id: build
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ inputs.build_number }}" >> "$GITHUB_OUTPUT"
+          else
+            # tags look like v26.3.build.42, the gradle version is 26.3.build.42-stable
+            echo "number=$(echo "${GITHUB_REF_NAME#v}" | sed 's/.*\.build\.//')" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Configure git
+        run: |
+          git config --global user.email "no-reply@github.com"
+          git config --global user.name "GitHub Actions"
+
+      - name: Apply patches
+        run: ./gradlew applyAllPatches --stacktrace
+
+      - name: Build
+        env:
+          BUILD_NUMBER: ${{ steps.build.outputs.number }}
+          BUILD_STARTED_AT: ${{ github.event.repository.updated_at }}
+        run: ./gradlew build --stacktrace
+
+      - name: Publish API to GitHub Packages
+        run: >
+          ./gradlew :tuff-api:publish
+          -PtuffUsername=${{ github.actor }}
+          -PtuffPassword=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: tuff-server/build/libs/tuff-paperclip-*.jar
+          generate_release_notes: true
+          fail_on_unmatched_files: true

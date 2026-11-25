@@ -10,20 +10,20 @@ plugins {
     id("org.gradle.toolchains.foojay-resolver-convention") version "1.0.0"
 }
 
-rootProject.name = "folia"
+rootProject.name = "tuff"
 
-include("folia-api")
-include("folia-server")
-include("folia-checkstyle")
+include("tuff-api")
+include("tuff-server")
+include("tuff-checkstyle")
 
 gradle.lifecycle.beforeProject {
     val mcVersion = providers.gradleProperty("mcVersion").get().trim()
-    val foliaVersionChannel = providers.gradleProperty("channel").get().trim()
-    val foliaBuildNumber = providers.environmentVariable("BUILD_NUMBER").orNull?.trim()?.toInt()
-    val versionString = if (foliaBuildNumber == null) {
+    val tuffVersionChannel = providers.gradleProperty("channel").get().trim()
+    val tuffBuildNumber = providers.environmentVariable("BUILD_NUMBER").orNull?.trim()?.toInt()
+    val versionString = if (tuffBuildNumber == null) {
         "$mcVersion.local-SNAPSHOT"
     } else {
-        "$mcVersion.build.$foliaBuildNumber-${foliaVersionChannel.lowercase()}"
+        "$mcVersion.build.$tuffBuildNumber-${tuffVersionChannel.lowercase()}"
     }
     version = versionString
 }

@@ -29,7 +29,7 @@
      testData.implementationConfigurationName("org.jspecify:jspecify:1.0.0")
  
 -    checkstyle(project(":paper-checkstyle"))
-+    checkstyle(project(":folia-checkstyle"))
++    checkstyle(project(":tuff-checkstyle"))
  }
  
  tasks {
