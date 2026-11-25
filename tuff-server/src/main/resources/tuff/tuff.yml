@@ -1,0 +1,149 @@
+# Tuff - compute scheduler configuration.
+#
+# The compute scheduler is a shared worker pool for server side work that must not touch world state
+# from a foreign thread: chunk generation, pathfinding, AI planning and anything a plugin wants to
+# offload. Workers never own entities or chunks; results are handed back to the region thread that
+# asked for them.
+#
+# Values marked "-1" mean "let the scheduler choose". Durations are written in the unit named in the
+# key. Keys you leave out keep their default, unknown keys are reported in the console and ignored,
+# and a value that cannot be used is replaced by its default with a warning instead of stopping the
+# server.
+#
+# The file is read at startup and re-read by /tuff reload. A few settings are baked into the running
+# pool (enabled, queue capacity, scheduling, adaptive.enabled, dynamic registration); the reload log
+# lists them as "takes effect after a restart".
+
+async-compute:
+  # Master switch. When false the scheduler starts no worker threads and every submission is
+  # rejected; /tuff status still answers so the state is visible.
+  enabled: true
+
+  workers:
+    # Worker threads. -1 sizes the pool from the CPU budget left after the region, chunk and IO
+    # threads already running on the machine; a positive number is used as is.
+    threads: -1
+    # Workers kept alive while idle. At least 1.
+    min-threads: 2
+    # Hard ceiling for the pool, or -1 for "one worker per usable processor".
+    max-threads: -1
+    # Seconds an idle worker above min-threads is kept before it exits. Must be positive.
+    keep-alive-seconds: 30
+    # Prefix of worker thread names, visible in thread dumps and profilers.
+    thread-name-prefix: "Tuff Compute Worker"
+
+  queue:
+    # Maximum number of queued tasks across all consumers. Protects the heap from a submission
+    # burst rather than slowing the submitting thread down. At least 1.
+    capacity: 8192
+    # What happens when the queue is full:
+    #   reject      - refuse the new submission and let the caller decide (safest)
+    #   drop-oldest - cancel the oldest queued task of the same consumer to make room
+    overflow-policy: reject
+
+  scheduling:
+    # How the next task is picked:
+    #   weighted-fair - highest priority first, dispatch turns split between consumers by weight
+    #   priority      - strict priority order, aged so low priority work still runs
+    #   fifo          - submission order, ignores priority and weight (benchmark baseline)
+    strategy: weighted-fair
+    # Let an idle worker take a task that belongs to another worker's local batch. Only enable it
+    # when benchmarks show a gain.
+    work-stealing: false
+    # Raise the effective priority of long waiting tasks so background work cannot starve.
+    priority-aging: true
+    # Milliseconds a task waits before it gains one aging step. Must be positive.
+    aging-interval-millis: 1000
+    # Highest number of aging steps a task may gain. At least 1.
+    max-aging-boost: 3
+    # Milliseconds an idle worker waits for work before it parks or retires. Must be positive.
+    idle-wait-millis: 50
+
+  consumers:
+    # Whether a submission under an unknown consumer id registers that consumer on the fly with the
+    # policy from "default". When false such submissions are rejected as unknown.
+    allow-dynamic-registration: true
+
+    # Policy for consumers without a section of their own, and the base for the overrides below:
+    # every key you leave out of a consumer section is inherited from here.
+    default:
+      enabled: true
+      # Tasks of one consumer that may run at the same time:
+      #   -1    - the whole pool (default)
+      #   0.60  - a share of the pool; fractions are written with a decimal point
+      #   4     - a fixed number of tasks; whole numbers are absolute counts
+      # A share is a cap, not a reservation: it never guarantees that those slots are free.
+      max-concurrent: -1
+      # Relative dispatch weight while consumers compete for the pool; 2.0 means twice as many
+      # dispatch turns as 1.0.
+      fair-share-weight: 1.0
+      # Queued (not running) tasks of this consumer, or -1 for no per consumer bound.
+      max-queued-tasks: -1
+      # Overflow behaviour for this consumer when its bound or the global queue is full.
+      overflow-policy: reject
+      # Seconds a task of this consumer may wait in the queue before it is cancelled. 0 disables
+      # the expiry.
+      max-queue-wait-seconds: 0
+
+    # The three consumers below are the server subsystems that offload work first. Their limits are
+    # relative shares, not CPU guarantees - tune them under real load.
+    chunk-generation:
+      enabled: true
+      max-concurrent: 0.60
+      fair-share-weight: 1.0
+      max-queued-tasks: -1
+      overflow-policy: reject
+      max-queue-wait-seconds: 0
+
+    pathfinding:
+      enabled: true
+      max-concurrent: 0.30
+      fair-share-weight: 1.0
+      max-queued-tasks: -1
+      overflow-policy: reject
+      max-queue-wait-seconds: 0
+
+    ai-computation:
+      enabled: true
+      max-concurrent: 0.20
+      fair-share-weight: 1.0
+      max-queued-tasks: -1
+      overflow-policy: reject
+      max-queue-wait-seconds: 0
+
+  metrics:
+    # Counters and gauges: queue size, active and idle workers, submitted, completed, rejected,
+    # failed, wait and execution averages, throughput.
+    enabled: true
+    # Emit Java Flight Recorder events for submissions, executions and worker state changes.
+    jfr: false
+    # Seconds in the rolling window used for throughput and averages. Must be positive.
+    throughput-window-seconds: 10
+    # Estimate pool CPU utilisation from busy worker time. Coarse by design and never a system wide
+    # reading.
+    sample-cpu: true
+    # Seconds between gauge samples for JFR and periodic logging. Must be positive.
+    sample-interval-seconds: 1
+
+  adaptive:
+    # Let the scheduler move the concurrency limit between min-concurrency and max-concurrency based
+    # on observed queue wait instead of claiming more work than the machine can chew.
+    enabled: false
+    # Lowest limit the controller may pick. At least 1.
+    min-concurrency: 1
+    # Highest limit, or -1 for the current pool size.
+    max-concurrency: -1
+    # Seconds over which samples are aggregated before a decision. Must be positive.
+    sample-window-seconds: 5
+    # Finished tasks needed in a window before the limit may move. At least 1.
+    min-samples: 20
+    # Additive increase applied when the pool is not saturated, in (0.0, 1.0].
+    increase-step: 0.1
+    # Multiplicative decrease applied when latency degrades, in (0.0, 1.0).
+    decrease-factor: 0.5
+    # Estimated utilisation the controller aims for, in (0.0, 1.0].
+    target-utilization: 0.9
+
+  # Seconds a graceful shutdown lets running tasks finish. Queued tasks that did not start are
+  # cancelled. Kept short because the world save runs right after the pool stops.
+  shutdown-grace-seconds: 10
