@@ -31,9 +31,11 @@ import org.jspecify.annotations.Nullable;
  * }</pre>
  *
  * <p>The consumer runs on the owning region thread, so it may safely mutate blocks, entities and
- * inventories that belong to that region. The failure handler runs on the same thread when the
- * target is still alive; if the target disappeared first it runs on the thread that completed the
- * future, so it must not touch world state and should only log or release plugin owned resources.
+ * inventories that belong to that region. The failure handler runs on the owning region thread
+ * when the target can still accept work. If the plugin is disabled or the target scheduler cannot
+ * take the task, it runs on the thread that completed the future; if the entity retired, it runs
+ * inside the entity scheduler's retired callback. In those cases it must not touch world state and
+ * should only log or release plugin owned resources.
  *
  * <p>Delivery rules:
  *
