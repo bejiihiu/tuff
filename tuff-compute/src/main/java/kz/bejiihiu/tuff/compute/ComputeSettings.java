@@ -193,7 +193,7 @@ public record ComputeSettings(
      * than blocks the submitting thread.
      *
      * @param capacity        maximum number of queued tasks in the whole scheduler, at least {@code 1}
-     * @param overflowPolicy  what happens when the global capacity is exhausted; prefer REJECT here because DROP_OLDEST evicts the globally oldest queued task of any consumer
+     * @param overflowPolicy  what happens when the global capacity is exhausted; DROP_OLDEST still only evicts the oldest queued task of the submitting consumer, so a consumer with nothing queued is refused exactly like with REJECT
      */
     public record QueueSettings(int capacity, OverflowPolicy overflowPolicy) {
 

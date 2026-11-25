@@ -28,8 +28,17 @@ import org.jspecify.annotations.Nullable;
  * <p>Capacity is enforced in two places, exactly as the policies describe: the global
  * {@link #capacity()} and the per consumer {@link ConsumerPolicy#maxQueuedTasks()}. When a bound is
  * hit, the submitting consumer's {@link OverflowPolicy} decides between refusal and evicting its own
- * oldest queued task. The queue never blocks and never throws on overflow; it reports the outcome in
- * {@link OfferResult}.
+ * oldest queued task. The queue never blocks; refusal is reported in {@link OfferResult}.
+ *
+ * <p><b>Ownership invariant.</b> An accepted entry leaves the queue through exactly one path, and
+ * that path always gives the entry back to the scheduler: {@link #poll(ConsumerAdmission)} and
+ * {@link #steal(int, ConsumerAdmission)} return it, {@link #remove(QueueEntry)} reports removal to
+ * the caller, {@link #drainTo(Collection, int)}, {@link #clear()} and
+ * {@link #unregisterConsumer(String)} hand it back as a collection, and
+ * {@link #offer(QueueEntry)} eviction reports it through the
+ * {@link #setEvictionListener(EvictionListener) eviction listener}. The queue never destroys an
+ * entry behind the scheduler's back, because only the scheduler can complete the entry's
+ * {@link kz.bejiihiu.tuff.compute.ComputeTaskHandle#future()}.
  *
  * <p>Threading: implementations must be safe for concurrent {@code offer}, {@code poll},
  * {@code remove} and reads from many threads. {@code poll} is allowed to be lock free or lock based,
@@ -44,14 +53,40 @@ public interface ComputeQueue {
      * <p>The entry is accepted when both the global and the per consumer bounds have room. When they
      * do not, the consumer's {@link OverflowPolicy} is applied: {@link OverflowPolicy#REJECT} leaves
      * the queue untouched and reports which bound was hit, {@link OverflowPolicy#DROP_OLDEST} evicts
-     * the oldest queued entry of the same consumer and accepts the new one.
+     * the oldest queued entry of the same consumer, reports it to the
+     * {@link #setEvictionListener(EvictionListener) eviction listener} and accepts the new one.
+     *
+     * <p>Eviction never silently discards work: the entry is unlinked, the listener is called on the
+     * offering thread before this method returns, and only then the result is reported. The evicted
+     * entry is never returned by this method, so the listener is the only way the caller learns
+     * about it.
      *
      * <p>Offering to a closed queue never accepts anything and reports {@link OfferResult#CLOSED}.
      *
      * @param entry entry to enqueue
      * @return how the offer was handled
+     * @throws IllegalStateException if eviction is required by
+     *     {@link OverflowPolicy#DROP_OLDEST} but no eviction listener was installed, because
+     *     dropping the entry would strand its future forever
      */
     OfferResult offer(QueueEntry entry);
+
+    /**
+     * Installs the sink that receives entries evicted by {@link #offer(QueueEntry)}.
+     *
+     * <p>The scheduler owns task handles and metrics, so the queue cannot cancel an evicted task
+     * itself; it hands the entry over instead. The engine installs the listener once, before the
+     * scheduler starts; a later call replaces it, which is only useful for tests and for a scheduler
+     * restart.
+     *
+     * <p>A listener is mandatory as soon as {@link OverflowPolicy#DROP_OLDEST} is reachable for any
+     * consumer. Implementations must refuse such an offer with {@link IllegalStateException} when no
+     * listener is installed rather than drop the entry: a silently dropped entry is a future that
+     * never completes.
+     *
+     * @param listener sink for evicted entries, must not be {@code null}
+     */
+    void setEvictionListener(EvictionListener listener);
 
     /**
      * Removes and returns the next task that a worker may run.
@@ -134,7 +169,9 @@ public interface ComputeQueue {
      * Moves up to {@code maxEntries} tasks out of the queue, oldest and highest priority first.
      *
      * <p>Used on shutdown to cancel or hand over whatever is left. Moved entries are no longer in the
-     * queue and will never be returned by {@link #poll(ConsumerAdmission)}.
+     * queue and will never be returned by {@link #poll(ConsumerAdmission)}. Ownership transfers to
+     * the caller, which must complete every returned handle itself, normally with
+     * {@link kz.bejiihiu.tuff.compute.ComputeCancelledException.Reason#SHUTDOWN}.
      *
      * @param target     collection receiving the entries
      * @param maxEntries maximum number to move, must be positive
@@ -143,12 +180,18 @@ public interface ComputeQueue {
     int drainTo(Collection<? super QueueEntry> target, int maxEntries);
 
     /**
-     * Removes every queued entry without returning them.
+     * Removes every queued entry and hands them back.
      *
-     * <p>Only used when the scheduler is destroyed; entries cleared this way are not cancelled by the
-     * queue, the caller is responsible for completing their futures.
+     * <p>This is the bulk form of {@link #drainTo(Collection, int)} and the only supported way to
+     * empty the queue on teardown: ownership of the returned entries transfers to the caller, which
+     * must complete every handle. Entries are returned in dispatch order.
+     *
+     * <p>The queue itself never completes or cancels a task, so a variant that dropped entries
+     * silently would strand their futures; that is why this method returns them.
+     *
+     * @return the entries that were queued, in dispatch order, empty if nothing was queued
      */
-    void clear();
+    Collection<QueueEntry> clear();
 
     /**
      * Returns a point in time snapshot of the queue.
@@ -184,8 +227,9 @@ public interface ComputeQueue {
     /**
      * Forgets a consumer and everything it has queued.
      *
-     * <p>The queue drops the consumer's policy and unlinks its queued entries without returning
-     * them; the caller is responsible for cancelling those entries so their futures complete.
+     * <p>The queue drops the consumer's policy and unlinks its queued entries. Ownership of the
+     * returned entries transfers to the caller, which must complete every handle, normally with
+     * {@link kz.bejiihiu.tuff.compute.ComputeCancelledException.Reason#CONSUMER_DISABLED}.
      *
      * @param consumerId consumer to remove
      * @return the entries that were queued for that consumer, in dispatch order
@@ -195,8 +239,10 @@ public interface ComputeQueue {
     /**
      * Closes the queue to new offers.
      *
-     * <p>Already queued entries can still be polled and drained, but {@link #offer(QueueEntry)}
-     * returns {@link OfferResult#CLOSED} from now on. Idempotent.
+     * <p>Already queued entries stay queued and can still be polled and drained; {@link #close()}
+     * never removes work. {@link #offer(QueueEntry)} returns {@link OfferResult#CLOSED} from now on.
+     * Idempotent. The caller is expected to drain the leftovers afterwards and complete their
+     * handles.
      */
     void close();
 
@@ -248,5 +294,45 @@ public interface ComputeQueue {
          * @return {@code true} if the entry may be handed to a worker
          */
         boolean admits(String consumerId);
+    }
+
+    /**
+     * Sink for entries evicted by {@link OverflowPolicy#DROP_OLDEST}.
+     *
+     * <p>Invocation guarantees the queue must uphold:
+     * <ul>
+     *     <li>exactly one callback per evicted entry, made by the {@code offer} call that evicted
+     *     it;</li>
+     *     <li>called on the offering thread, before that {@code offer} returns, so an accepted
+     *     submission cannot be observed before its eviction was reported;</li>
+     *     <li>the entry is already unlinked and both depth counters are updated, so the listener sees
+     *     a consistent queue;</li>
+     *     <li>called outside the queue's internal locks, so reading queue state is allowed;</li>
+     *     <li>claiming an entry for eviction is atomic, so two concurrent offers cannot both evict
+     *     the same entry and no entry is ever reported twice.</li>
+     * </ul>
+     *
+     * <p>What the listener must do: complete the evicted entry's handle with
+     * {@link kz.bejiihiu.tuff.compute.ComputeCancelledException} carrying
+     * {@link kz.bejiihiu.tuff.compute.ComputeCancelledException.Reason#EVICTED}, and record the
+     * cancellation in metrics. It must not touch consumer quotas, because a queued entry never held a
+     * slot. Complete the handle before doing anything else, so a later metrics failure cannot leave a
+     * future pending.
+     *
+     * <p>The listener must not call back into the queue: {@code offer}, {@code poll}, {@code steal},
+     * {@code remove}, {@code drainTo}, {@code clear}, {@code close}, {@code registerConsumer},
+     * {@code updatePolicy}, {@code unregisterConsumer} and {@code setEvictionListener} are all
+     * forbidden from inside a callback. Reading methods such as {@code size} and {@code snapshot} are
+     * safe but unnecessary. The callback must be fast, non blocking and must not throw.
+     */
+    @FunctionalInterface
+    interface EvictionListener {
+
+        /**
+         * Handles one entry that was just evicted.
+         *
+         * @param evicted entry that was removed from the queue and will never run
+         */
+        void onEvicted(QueueEntry evicted);
     }
 }
