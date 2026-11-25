@@ -11,7 +11,7 @@
  *     <li>the limit never leaves {@code [minLimit, maxLimit]};</li>
  *     <li>it never reaches zero, so the pool always makes progress;</li>
  *     <li>it changes at most once per sample window and only after enough samples arrived;</li>
- *     <li>a disabled controller never changes anything, {@link #currentLimit()} simply passes the
+ *     <li>a disabled controller never changes anything, {@link AdaptiveConcurrencyController#currentLimit()} simply passes the
  *     configured limit through.</li>
  * </ul>
  */

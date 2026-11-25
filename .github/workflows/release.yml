@@ -55,13 +55,27 @@ jobs:
         env:
           BUILD_NUMBER: ${{ steps.build.outputs.number }}
           BUILD_STARTED_AT: ${{ github.event.repository.updated_at }}
-        run: ./gradlew build --stacktrace
+        run: ./gradlew build :tuff-server:createPaperclipJar --stacktrace
+
+      # tuff-api depends on tuff-compute, publish the engine first so the api pom never
+      # points at coordinates that are not there yet.
+      - name: Publish compute to GitHub Packages
+        env:
+          BUILD_NUMBER: ${{ steps.build.outputs.number }}
+        run: >
+          ./gradlew :tuff-compute:publish
+          -PtuffUsername=${{ github.actor }}
+          -PtuffPassword=${{ secrets.GITHUB_TOKEN }}
+          --stacktrace
 
       - name: Publish API to GitHub Packages
+        env:
+          BUILD_NUMBER: ${{ steps.build.outputs.number }}
         run: >
           ./gradlew :tuff-api:publish
           -PtuffUsername=${{ github.actor }}
           -PtuffPassword=${{ secrets.GITHUB_TOKEN }}
+          --stacktrace
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2

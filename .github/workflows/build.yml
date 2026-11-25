@@ -1,4 +1,5 @@
 name: Build
+
 on:
   push:
     branches-ignore:
@@ -10,29 +11,67 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build:
     if: ${{ github.event_name != 'pull_request' || github.repository != github.event.pull_request.head.repo.full_name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: JDK 25
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 25
+
+      # setup-gradle restores ~/.gradle/caches plus the build cache between runs.
+      # paperweight artifacts (paperRef checkout, decompiled sources) live outside it and are re-created every run.
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
+
       - name: Configure git
         run: |
           git config --global user.email "no-reply@github.com"
           git config --global user.name "GitHub Actions"
+
       - name: Apply patches
         run: ./gradlew applyAllPatches --stacktrace
-      - name: Build
-        run: ./gradlew build --stacktrace
+
+      # build == check (checkstyle + tests of every module) and the paperclip jar is a separate task.
+      # javadoc tasks are not part of build, but they run on publish - fail here instead of on a release tag.
+      - name: Build and test
+        run: >
+          ./gradlew build :tuff-server:createPaperclipJar
+          :tuff-compute:javadoc :tuff-api:javadoc
+          --stacktrace
+
+      # a green build with zero executed compute tests is not green; make the count explicit.
+      - name: Verify compute tests ran
+        run: |
+          results="tuff-compute/build/test-results/test"
+          if ! ls "$results"/*.xml >/dev/null 2>&1; then
+            echo "no JUnit results under $results - tuff-compute tests did not run" >&2
+            exit 1
+          fi
+          cases=$(cat "$results"/*.xml | grep -c '<testcase ')
+          echo "tuff-compute test cases: $cases"
+          test "$cases" -gt 0
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            */build/reports/tests
+            */build/test-results
+          if-no-files-found: ignore
+
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
