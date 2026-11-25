@@ -15,6 +15,10 @@ import java.util.Objects;
  * many tasks of one consumer may run at the same time, it never guarantees that those slots are
  * actually available.
  *
+ * <p>The queue wait limit is enforced by the queue itself with a periodic sweep, not only when a
+ * worker picks a task up, so expired work never stays in the bounded queue just because higher
+ * priority work keeps winning.
+ *
  * @param enabled            whether the consumer may submit at all; a disabled consumer rejects every
  *                           submission with {@link ComputeRejectedException.Reason#CONSUMER_DISABLED}
  *                           but keeps its metrics

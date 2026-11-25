@@ -33,8 +33,8 @@ import org.jspecify.annotations.Nullable;
  * <p><b>Ownership invariant.</b> An accepted entry leaves the queue through exactly one path, and
  * that path always gives the entry back to the scheduler: {@link #poll(ConsumerAdmission)} and
  * {@link #steal(int, ConsumerAdmission)} return it, {@link #remove(QueueEntry)} reports removal to
- * the caller, {@link #drainTo(Collection, int)}, {@link #clear()} and
- * {@link #unregisterConsumer(String)} hand it back as a collection, and
+ * the caller, {@link #drainTo(Collection, int)}, {@link #drainExpired(long, Collection)},
+ * {@link #clear()} and {@link #unregisterConsumer(String)} hand it back as a collection, and
  * {@link #offer(QueueEntry)} eviction reports it through the
  * {@link #setEvictionListener(EvictionListener) eviction listener}. The queue never destroys an
  * entry behind the scheduler's back, because only the scheduler can complete the entry's
@@ -178,6 +178,65 @@ public interface ComputeQueue {
      * @return the number of entries actually moved
      */
     int drainTo(Collection<? super QueueEntry> target, int maxEntries);
+
+    /**
+     * Checks whether any queued entry is already past its consumer's
+     * {@link ConsumerPolicy#maxQueueWait()}.
+     *
+     * <p>This is the cheap probe the engine's expiry janitor runs before draining, because a sweep
+     * with nothing to sweep is pure overhead. Implementations must answer in {@code O(consumers)} or
+     * better and must never walk the queued entries: the per consumer heads are already the oldest
+     * entries of their consumer in dispatch order, so the answer can be derived from them. Returning
+     * {@code true} conservatively is allowed; returning {@code false} while
+     * {@link #drainExpired(long, Collection)} would move something is not.
+     *
+     * <p>An entry is expired when its consumer's {@link ConsumerPolicy#maxQueueWait()} is not
+     * {@link java.time.Duration#ZERO zero} and {@code nowNanos - entry.submittedAtNanos()} is greater
+     * than or equal to that limit. The policy in force at the moment of the call is used, so shortening
+     * a limit makes already queued work expire on the next sweep.
+     *
+     * @param nowNanos current reading of the scheduler clock, the same clock that stamped the entries
+     * @return {@code true} if {@link #drainExpired(long, Collection)} called with the same
+     *     {@code nowNanos} would move at least one entry
+     */
+    boolean hasExpired(long nowNanos);
+
+    /**
+     * Removes every queued entry that outlived its consumer's {@link ConsumerPolicy#maxQueueWait()}
+     * and hands them back.
+     *
+     * <p>Called by the engine's janitor, normally once per 100 ms, never from a worker and never from
+     * inside a callback. This sweep is what makes the queue wait limit real: a task that is only
+     * checked when a worker polls would stay in a bounded queue for as long as higher priority work
+     * keeps winning, holding capacity and lying to backpressure.
+     *
+     * <p>Rules, identical to {@link #drainTo(Collection, int)}:
+     * <ul>
+     *     <li>moved entries are unlinked and are never returned by {@link #poll(ConsumerAdmission)} or
+     *     {@link #steal(int, ConsumerAdmission)} afterwards;</li>
+     *     <li>ownership transfers to the caller, entries are appended to {@code target} in dispatch
+     *     order;</li>
+     *     <li>safe against concurrent {@code offer}, {@code poll}, {@code steal}, {@code remove} and
+     *     {@code unregisterConsumer}: an entry claimed by one of them is not returned here, an entry
+     *     is never returned twice, and nothing is lost;</li>
+     *     <li>the queue completes nothing itself and never calls the
+     *     {@link #setEvictionListener(EvictionListener) eviction listener} for expired entries.</li>
+     * </ul>
+     *
+     * <p>What the engine does with every returned entry: complete its handle with
+     * {@link kz.bejiihiu.tuff.compute.ComputeCancelledException} carrying
+     * {@link kz.bejiihiu.tuff.compute.ComputeCancelledException.Reason#QUEUE_EXPIRED}, then record the
+     * cancellation in metrics. No consumer quota slot has to be released, because a queued entry never
+     * held one.
+     *
+     * <p>The call never waits for producers or workers. Its cost is proportional to the number of
+     * consumers plus the number of entries it actually removes, never to the queue depth.
+     *
+     * @param nowNanos current reading of the scheduler clock, the same clock that stamped the entries
+     * @param target   collection receiving the expired entries
+     * @return the number of entries moved, {@code 0} when nothing expired
+     */
+    int drainExpired(long nowNanos, Collection<? super QueueEntry> target);
 
     /**
      * Removes every queued entry and hands them back.
