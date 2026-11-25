@@ -30,28 +30,21 @@ Rules that apply to the whole file:
 
 ## Reload semantics
 
-The loader (`TuffComputeConfig`) reads the file at startup through `load()` and can re-read it through
-`reload()`. Both publish an immutable `ComputeSettings` snapshot, log every problem, and compute a diff
-against the previously published snapshot, including which keys cannot be adopted by a running pool.
+`/tuff compute reload` (or `/tuff reload`) re-reads the file through `TuffComputeConfig#reload()`, which
+publishes an immutable snapshot and logs every problem. The command prints the same problems under
+`problems (N):`.
 
-A reload never applies the snapshot to a running engine by itself: applying is the job of the server
-bootstrap's `ComputeConfigApplyTarget`. Without that hook, a reload updates what the config layer reports
-and what a *new* scheduler would be built from, while the live pool keeps the settings it started with. In
-practice, restart after editing unless your build wires the hook. There is no console command for this in
-the current build; `reload()` is the API a command or the bootstrap calls.
+A live pool adopts very little. The bootstrap compares the previous and the updated effective policy of
+every consumer that is **already registered on the engine** and calls
+`AsyncComputeScheduler#updateConsumerPolicy` for the ones that differ. Everything else — `enabled`,
+`workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*`, `shutdown-grace-seconds` — is reported
+as `takes effect after a restart`. Consumer overrides for ids that are not registered yet are not applied
+either: dynamic registration reads the policy from the engine's startup snapshot, so a new consumer gets
+its new limits only after a restart. Such an override is not added to the deferred list either.
 
-Keys the diff always marks as restart-only:
-
-| Key |
-| --- |
-| `async-compute.enabled` |
-| `async-compute.queue.capacity` |
-| `async-compute.scheduling.*` (all six keys) |
-| `async-compute.consumers.allow-dynamic-registration` |
-| `async-compute.adaptive.enabled` |
-
-Everything else is live-capable in the diff: worker sizing, thread names, keep-alive, queue overflow, all
-consumer policies, all metrics keys, the adaptive tuning values and the shutdown grace period.
+The loader's `ConfigDiff` marks a narrower restart set (`enabled`, `queue.capacity`, `scheduling.*`,
+`allow-dynamic-registration`, `adaptive.enabled`), but the bootstrap is stricter. For a running server the
+deferred list printed by the command is the authoritative answer.
 
 Reload log lines:
 
@@ -59,6 +52,7 @@ Reload log lines:
 Compute configuration loaded from /srv/tuff/config/tuff.yml
 Compute configuration reloaded, 3 change(s): async-compute.consumers.default.max-concurrent, ...
 These compute settings take effect after a restart: async-compute.scheduling.strategy
+Tuff compute: applied new consumer policies to default, chunk-generation
 Compute configuration was not reloaded, the scheduler keeps its previous settings
 Compute config: async-compute.workers.threads: expected a whole number, got 'many'; using -1
 ```
@@ -67,20 +61,21 @@ Compute config: async-compute.workers.threads: expected a whole number, got 'man
 
 | Key | Type | Default | Allowed | Effect | Restart |
 | --- | --- | --- | --- | --- | --- |
-| `enabled` | boolean | `true` | `true`/`false` | Master switch. `false` registers consumers but starts no worker, no janitor, no adaptive timer. Submissions are refused with `SCHEDULER_DISABLED` | yes |
+| `enabled` | boolean | `true` | `true`/`false` | Master switch. `false` reads and validates the file but creates no engine: no worker, janitor, adaptive or sampler thread, nothing installed, `TuffCompute.scheduler()` empty, submissions unavailable. `/tuff` explains that the engine is disabled | yes |
 
-With `enabled: false` the scheduler still reaches `RUNNING`, so `isRunning()` is not a reliable "accepts
-work" check. Catch `ComputeRejectedException`.
+With `enabled: false` there is no scheduler object at all: `TuffCompute.scheduler()` is empty, no engine
+thread exists, and `/tuff` answers with the disabled explanation. The file is still read and validated, so
+problems appear in the log and in `problems()`.
 
 ## `async-compute.workers`
 
 | Key | Type | Unit | Default | Allowed | Effect | Restart |
 | --- | --- | --- | --- | --- | --- | --- |
-| `threads` | integer | threads | `-1` | `-1` or `>= 1` | Fixed worker count, or automatic sizing. Must not exceed `max-threads` when both are set | no |
-| `min-threads` | integer | threads | `2` | `>= 1` | Workers kept alive while idle; also the floor of automatic sizing and the static autoscaler | no |
-| `max-threads` | integer | threads | `-1` | `-1` or `>= min-threads` | Hard ceiling. `-1` resolves to the processor budget, never below `min-threads` | no |
-| `keep-alive-seconds` | number | seconds | `30` | `> 0` | How long an idle worker above the floor waits before it exits | no |
-| `thread-name-prefix` | string | — | `"Tuff Compute Worker"` | non-blank | Thread name prefix, used verbatim in dumps and profilers | no |
+| `threads` | integer | threads | `-1` | `-1` or `>= 1` | Fixed worker count, or automatic sizing. Must not exceed `max-threads` when both are set | yes |
+| `min-threads` | integer | threads | `2` | `>= 1` | Workers kept alive while idle; also the floor of automatic sizing and the static autoscaler | yes |
+| `max-threads` | integer | threads | `-1` | `-1` or `>= min-threads` | Hard ceiling. `-1` resolves to the processor budget, never below `min-threads` | yes |
+| `keep-alive-seconds` | number | seconds | `30` | `> 0` | How long an idle worker above the floor waits before it exits | yes |
+| `thread-name-prefix` | string | — | `"Tuff Compute Worker"` | non-blank | Thread name prefix, used verbatim in dumps and profilers | yes |
 
 ### Automatic sizing
 
@@ -124,7 +119,7 @@ adaptive controller.
 | Key | Type | Unit | Default | Allowed | Effect | Restart |
 | --- | --- | --- | --- | --- | --- | --- |
 | `capacity` | integer | tasks | `8192` | `>= 1` | Hard bound on all queued (not running) tasks | yes |
-| `overflow-policy` | enum | — | `reject` | `reject`, `drop-oldest` | Overflow default for the `default` consumer and for consumers registered on the fly; `consumers.<id>.overflow-policy` overrides it, and an explicit `registerConsumer` policy wins over both | no |
+| `overflow-policy` | enum | — | `reject` | `reject`, `drop-oldest` | Overflow default for the `default` consumer and for consumers registered on the fly; `consumers.<id>.overflow-policy` overrides it, and an explicit `registerConsumer` policy wins over both | yes |
 
 Capacity protects the heap from a submission burst. It does not slow the submitting thread down: at the
 bound the scheduler refuses or evicts, it never blocks. See
@@ -188,6 +183,10 @@ quarter of the pool. `4.0` is read as a fraction, fails validation, and falls ba
 A share is resolved against the **current pool-wide limit**, so it follows adaptive resizing, and it is
 always at least one task. It is a cap, not a reservation.
 
+These policy keys are the only configuration a live reload can change, and only for consumers that are
+already registered on the running engine. An override for an id that has not registered yet is read from
+the engine's startup snapshot, so it needs a restart.
+
 ### Shipped consumer sections
 
 The template ships three **example policies**: `chunk-generation` (`0.60`), `pathfinding` (`0.30`) and
@@ -203,11 +202,11 @@ to copy, rename or remove.
 
 | Key | Type | Unit | Default | Allowed | Effect | Restart |
 | --- | --- | --- | --- | --- | --- | --- |
-| `enabled` | boolean | — | `true` | `true`/`false` | Counters, gauges and histograms. When false, snapshots report zero counters and gauges, and no sampler thread runs | no |
-| `jfr` | boolean | — | `false` | `true`/`false` | Emit `tuff.compute.*` JFR events. Independent of `enabled` | no |
-| `throughput-window-seconds` | number | seconds | `10` | `> 0` | Window for `throughputPerSecond()`. Queue-wait and execution averages are lifetime averages, not windowed | no |
-| `sample-cpu` | boolean | — | `true` | `true`/`false` | Sample process CPU load for `cpuUtilization()`. Requires `enabled: true` | no |
-| `sample-interval-seconds` | number | seconds | `1` | `> 0` | Gauge sampling interval, and the base for the janitor tick (clamped to 10–100 ms), which sets expiry precision | no |
+| `enabled` | boolean | — | `true` | `true`/`false` | Counters, gauges and histograms. When false, snapshots report zero counters and gauges, and no sampler thread runs | yes |
+| `jfr` | boolean | — | `false` | `true`/`false` | Emit `tuff.compute.*` JFR events. Independent of `enabled` | yes |
+| `throughput-window-seconds` | number | seconds | `10` | `> 0` | Window for `throughputPerSecond()`. Queue-wait and execution averages are lifetime averages, not windowed | yes |
+| `sample-cpu` | boolean | — | `true` | `true`/`false` | Sample process CPU load for `cpuUtilization()`. Requires `enabled: true` | yes |
+| `sample-interval-seconds` | number | seconds | `1` | `> 0` | Gauge sampling interval, and the base for the janitor tick (clamped to 10–100 ms), which sets expiry precision | yes |
 
 `sample-cpu` is the **process** CPU load, not pool utilisation: tick threads, GC and JIT are included.
 `adaptive` uses the same probe for its CPU guard regardless of this key.
@@ -217,13 +216,13 @@ to copy, rename or remove.
 | Key | Type | Default | Allowed | Effect | Restart |
 | --- | --- | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | `true`/`false` | Let the controller move the concurrency limit. Requires `threads: -1`; an explicit worker count pins the limit | yes |
-| `min-concurrency` | integer | `1` | `>= 1` | Floor, raised to at least `min-threads` | no |
-| `max-concurrency` | integer | `-1` | `-1` or `>= min-concurrency` | Ceiling, capped by the worker ceiling. `-1` = worker ceiling | no |
-| `sample-window-seconds` | number | `5` | `> 0` | Aggregation window; the decision interval is `max(window, 1 s)` | no |
-| `min-samples` | integer | `20` | `>= 1` | Finished tasks needed in a window before the limit may move (an entirely idle pool is the exception) | no |
-| `increase-step` | number | `0.1` | `(0.0, 1.0]` | Additive growth: `round(limit * step)`, clamped to 1–4 workers | no |
-| `decrease-factor` | number | `0.5` | `(0.0, 1.0)` | Multiplicative shrink: `ceil(limit * (1 - factor))`, at least one slot | no |
-| `target-utilization` | number | `0.9` | `(0.0, 1.0]` | Estimated utilisation required before growth | no |
+| `min-concurrency` | integer | `1` | `>= 1` | Floor, raised to at least `min-threads` | yes |
+| `max-concurrency` | integer | `-1` | `-1` or `>= min-concurrency` | Ceiling, capped by the worker ceiling. `-1` = worker ceiling | yes |
+| `sample-window-seconds` | number | `5` | `> 0` | Aggregation window; the decision interval is `max(window, 1 s)` | yes |
+| `min-samples` | integer | `20` | `>= 1` | Finished tasks needed in a window before the limit may move (an entirely idle pool is the exception) | yes |
+| `increase-step` | number | `0.1` | `(0.0, 1.0]` | Additive growth: `round(limit * step)`, clamped to 1–4 workers | yes |
+| `decrease-factor` | number | `0.5` | `(0.0, 1.0)` | Multiplicative shrink: `ceil(limit * (1 - factor))`, at least one slot | yes |
+| `target-utilization` | number | `0.9` | `(0.0, 1.0]` | Estimated utilisation required before growth | yes |
 
 The controller treats failed tasks as non-samples, never grows when process CPU is at or above 90%, and
 shrinks on latency pressure or after three idle windows. Full decision logic is in
@@ -236,7 +235,8 @@ shrinks on latency pressure or after three idle windows. Full decision logic is 
 | `shutdown-grace-seconds` | number | seconds | `10` | `>= 0` | How long running tasks are given to finish. Queued work is cancelled immediately; when the grace period expires the scheduler terminates anyway, without interrupting running tasks, and their futures complete later |
 
 The `ComputeSettings` record default is 30 seconds; the server file ships 10 because the world save runs
-right after the pool stops. Running tasks are never interrupted, so this value does not kill anything.
+right after the pool stops. Running tasks are never interrupted, so this value does not kill anything. The
+running engine keeps the value it started with, so a change applies on the next restart.
 
 ## Reading validation errors
 
@@ -255,7 +255,7 @@ Every problem becomes one WARN line prefixed with `Compute config:` and is also 
 | `config/tuff.yml: is not valid YAML (...), keeping the previous settings` | Parse failure | Fix the YAML; the old snapshot stays live |
 
 A rejected section is replaced as a whole, so one bad key can reset its siblings. Read the warning, fix the
-key, and reload or restart.
+key, and reload (consumer policies) or restart (everything else).
 
 ## Presets
 

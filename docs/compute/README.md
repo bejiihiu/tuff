@@ -49,18 +49,17 @@ following are not:
 | Not included | What it means for you |
 | --- | --- |
 | Built-in consumers | No server subsystem submits to the pool. The `consumers.chunk-generation`, `consumers.pathfinding` and `consumers.ai-computation` sections are **examples** of policies for ids that a plugin or a future subsystem may use; nothing runs under those ids by default |
-| An admin command | There is no `/tuff` command yet. Metrics are read through the Java API (`TuffCompute.scheduler().metrics()`); JFR is recorded with the standard JDK tools |
 
-The rest of these pages describe the subsystem as implemented. The server bootstrap owns creating,
-starting and installing the engine; plugins only read it.
+The server bootstrap creates, starts and installs the engine before plugins are enabled; plugins only read
+it. `/tuff` reports it and controls JFR.
 
 ## Enable it
 
 1. `config/tuff.yml` is written from the bundled template the first time the configuration is loaded.
-2. Keep `async-compute.enabled: true` (the default) and adjust the sections you care about. `enabled`,
-   `queue.capacity`, `scheduling.*`, `adaptive.enabled` and dynamic consumer registration are baked into a
-   running pool and need a restart; everything else is adoptable at runtime when a config apply hook is
-   attached.
+2. Keep `async-compute.enabled: true` (the default) and adjust the sections you care about. A live reload
+   applies consumer policies only; `workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*` and
+   `shutdown-grace-seconds` need a restart. `/tuff compute reload` prints which changes were applied and
+   which were deferred.
 3. From a plugin, take the scheduler in `onEnable` and submit work:
 
 ```java
@@ -71,6 +70,21 @@ ComputeHandoff.toEntity(this, mob, route, mob.getPathfinder()::moveTo);
 
 `TuffCompute.require()` fails plugin enable with an actionable message when the engine is disabled or not
 installed. Plugins with a synchronous fallback should use `TuffCompute.scheduler()` instead.
+
+## Command
+
+`/tuff` is registered at startup and needs `tuff.command.compute` (granted to operators by default). It
+works from the console and from players.
+
+| Form | Shows |
+| --- | --- |
+| `/tuff`, `/tuff compute`, `/tuff status` | Engine summary: state, workers, queue, task counters, throughput, wait/execution averages, CPU, startup settings |
+| `/tuff compute consumers` | Per-consumer policy, active/queued tasks, counters and latency |
+| `/tuff compute reload`, `/tuff reload` | Re-reads `config/tuff.yml`, applies consumer policies, lists deferred keys and validation problems |
+| `/tuff compute jfr start\|stop\|dump` | Controls a JFR recording with the `tuff.compute` events |
+
+With `async-compute.enabled: false` the command answers that the engine is disabled and how to enable it.
+See [Operations § Command](operations.md#command) for output details and JFR limits.
 
 ## Concepts
 
@@ -89,4 +103,6 @@ installed. Plugins with a synchronous fallback should use `TuffCompute.scheduler
 - [Plugin API](plugin-api.md) — submit, cancel, register consumers, hand results back correctly, common
   mistakes.
 - [Configuration](configuration.md) — every key in `config/tuff.yml`, defaults, validation errors, presets.
-- [Operations](operations.md) — logs, metrics, JFR recordings, tuning, known limitations.
+- [Operations](operations.md) — command, logs, metrics, JFR recordings, benchmarks, tuning, known limitations.
+- [Benchmarks](benchmarks.md) — JMH numbers for the submission path, dispatch, strategies, cancellation,
+  lifecycle and idle latency, with the harness caveats.

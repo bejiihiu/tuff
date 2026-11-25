@@ -32,12 +32,12 @@ if (compute == null) {
 | `TuffCompute.executor(consumerId)` | `ComputeExecutor` shortcut for `new ComputeExecutor(require(), id)` |
 
 `isAvailable()` and a non-empty `scheduler()` do not prove that submissions will be accepted: a scheduler
-can be installed while the configuration disables the engine, and it can be shutting down. Always handle
-`ComputeRejectedException` and `ComputeShutdownException`.
+can be shutting down. Always handle `ComputeRejectedException` and `ComputeShutdownException`.
 
 The scheduler is process-wide and owned by the server. The server bootstrap creates it, starts it and
 installs it before plugins enable; plugins never call `start()`, `shutdown()` or `TuffCompute.install()`.
-If the configuration disables the engine, the bootstrap installs nothing and `scheduler()` is empty.
+If the configuration disables the engine, the bootstrap installs nothing and `scheduler()` is empty. The
+`/tuff` command reports the engine state and reloads the configuration.
 
 ## Submitting work
 
@@ -123,6 +123,11 @@ compute.registerConsumer(ComputeConsumer.of(
     ConsumerPolicy.relative(0.25)
 ));
 ```
+
+`allowedTaskTypes` must contain at least one type: it is the complete set the consumer may submit.
+`maxPriority` is the highest level it may submit. A submission is refused with `TASK_TYPE_NOT_ALLOWED` when
+the type is not in the set and with `PRIORITY_NOT_ALLOWED` when the priority outranks `maxPriority`;
+`ComputeConsumer.allows(taskType, priority)` evaluates the same rule.
 
 Policy helpers:
 
@@ -357,12 +362,13 @@ Queued tasks and futures survive a plugin disable. Cancel handles in `onDisable`
 
 ## When the engine is unavailable
 
-Two independent cases:
+On a server the engine is either installed and running or absent. `TuffCompute.scheduler()` is empty when
+`async-compute.enabled` is false (the bootstrap creates no engine at all), when startup failed, or before
+the bootstrap ran. Decide at `onEnable` whether the plugin can work without it. `/tuff` reports which of
+those states the server is in.
 
-1. `TuffCompute.scheduler()` is empty: the engine is not installed (disabled, failed to start, or not
-   installed yet). Decide at `onEnable` whether the plugin can work without it.
-2. The scheduler exists but rejects with `SCHEDULER_DISABLED`: `async-compute.enabled` is false, yet the
-   object is installed.
+If you construct a scheduler yourself (an embedder or a test), a scheduler created with `enabled: false`
+also refuses submissions with `ComputeRejectedException` `SCHEDULER_DISABLED`.
 
 Fallback pattern:
 

@@ -270,6 +270,26 @@ capacity. The floor is `max(min-concurrency, min-threads)`, the ceiling is `min(
 ceiling)` or the worker ceiling when `max-concurrency` is `-1`; the processor budget is a hard cap on top of
 that. An explicit worker count pins the limit and the controller reports `EXPLICIT_WORKER_COUNT`.
 
+## Server lifecycle
+
+The server owns the engine through `ComputeBootstrap`, which has three hooks:
+
+| When | What happens |
+| --- | --- |
+| End of the `CraftServer` constructor, before plugins are enabled | `ComputeBootstrap.start()` reads `config/tuff.yml`, creates the scheduler with a conservative processor budget, starts it and publishes it through `TuffCompute.install` |
+| Right after `RegionizedServer.init()` | `ComputeBootstrap.applyRegionBudget()` reads the region, chunk worker and IO thread counts, computes the real budget with `ComputeThreadBudget` and calls `applyProcessorBudget` |
+| During `MinecraftServer#stopServer()`, after plugins are disabled and their async tasks finished, before the world save | `ComputeBootstrap.stop()` stops an active JFR recording, uninstalls the scheduler, calls `shutdown(grace)` and waits up to `grace + 5 s` for `TERMINATED` |
+
+The startup budget cannot know the region threads yet, so it is `max(1, floor(cores * 0.8) - 4)`. Once
+the regions exist, the pool is resized against what the rest of the server actually owns. A fixed
+`workers.threads` count is never resized; the bootstrap logs that the budget was not applied. `/reload` does
+not rebuild the engine.
+
+With `async-compute.enabled: false` the engine is not created at all: no worker, janitor, adaptive or
+sampler thread exists, nothing is installed, and `TuffCompute.scheduler()` is empty. The configuration is
+still read and validated, and `/tuff` answers with the disabled explanation. A failure during startup is
+logged under `Tuff/Compute` and leaves the server running without an engine (`FAILED`).
+
 ## Shutdown
 
 `shutdown()` uses `shutdown-grace-seconds`. The engine:
@@ -298,10 +318,12 @@ includes tick threads, GC and JIT, and it is `NaN` when the runtime cannot provi
 
 JFR is independent of metrics collection: with `metrics.jfr: true` the scheduler emits events even when
 `metrics.enabled` is false. The recorder never fails a task; an event that cannot be emitted is dropped.
-See [Operations](operations.md#jfr) for the event list and recording recipes.
+See [Operations](operations.md#jfr) for the event list and recording recipes. Measured costs and scaling
+numbers are in [Benchmarks](benchmarks.md).
 
 ## Related pages
 
 - [Plugin API](plugin-api.md)
 - [Configuration](configuration.md)
 - [Operations](operations.md)
+- [Benchmarks](benchmarks.md)

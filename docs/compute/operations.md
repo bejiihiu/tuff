@@ -15,6 +15,17 @@ logger. There is no periodic "pool status" log line — use the metrics API or J
 | `Tuff/ComputeConfig` | WARN | `These compute settings take effect after a restart: …` | Changed keys the live pool cannot adopt |
 | `Tuff/ComputeConfig` | WARN | `Compute configuration was not reloaded, the scheduler keeps its previous settings` | The file could not be parsed at all |
 | `Tuff/ComputeConfig` | ERROR | `Failed to apply the compute configuration to the scheduler` | The apply hook threw; the snapshot stays published |
+| `Tuff/Compute` | INFO | `Tuff compute enabled: N worker(s) (processor budget B), queue capacity C, scheduling S` | Engine created and installed before plugins |
+| `Tuff/Compute` | INFO | `Tuff compute is disabled in <file> (async-compute.enabled: false)` | No engine, no threads; the command reports it |
+| `Tuff/Compute` | INFO | `Tuff compute: processor budget B of C (R region, K chunk, I IO threads)` | Real budget applied after region startup |
+| `Tuff/Compute` | INFO | `Tuff compute: fixed worker count N, the server processor budget of B is not applied` | Explicit `workers.threads`; the budget is ignored |
+| `Tuff/Compute` | INFO | `Tuff compute: applied new consumer policies to …` | Live reload changed registered consumers |
+| `Tuff/Compute` | INFO | `Tuff compute stopped in N ms` | Graceful stop completed before the world save |
+| `Tuff/Compute` | ERROR | `Could not initialise/failed to start the Tuff compute engine; the server runs without it` | Bootstrap failure; status becomes `FAILED` |
+| `Tuff/Compute` | ERROR | `The Tuff compute engine did not terminate within N ms; …` | Stop timeout; worker stacks are dumped, daemon threads end with the process |
+| `Tuff/Compute` | WARN | `Could not read the server thread counts; the compute pool keeps its startup size` | Budget not applied after region startup |
+| `Tuff/Compute` | WARN | `Could not apply the processor budget to the compute engine` | `applyProcessorBudget` failed; the pool keeps its size |
+| `Tuff/Compute` | INFO | `Stopped the compute JFR recording on shutdown, wrote …` | An active recording was written during stop |
 | `ComputeEngineImpl` | INFO | `compute processor budget changed from X to Y (target workers N, ceiling M)` | The platform applied a new CPU budget at runtime |
 | `ComputeEngineImpl` | WARN | `compute scheduler terminated with N task(s) still running after the grace period; …` | Running bodies outlived the grace period; they are not interrupted and complete after termination |
 | `DynamicWorkerPool` | ERROR | `could not create/start a worker thread` | Thread creation failed; the pool is short a worker |
@@ -28,13 +39,44 @@ Task failures are **not** logged. They go to the caller's future and are counted
 trace in the log for every failed computation would be unusable under load. If you need them, attach a
 logging failure handler in the plugin or record `tuff.compute.TaskFailed`.
 
+## Command
+
+`/tuff` is registered in the Paper command map at startup, survives `/reload`, and works from the console
+and from players. It requires `tuff.command.compute`, granted to operators by default. Tab completion covers
+the subcommands.
+
+| Invocation | Action |
+| --- | --- |
+| `/tuff`, `/tuff compute`, `/tuff status` | Summary |
+| `/tuff compute consumers` | Per-consumer breakdown |
+| `/tuff compute reload`, `/tuff reload` | Re-read `config/tuff.yml` |
+| `/tuff compute jfr start\|stop\|dump` | Flight Recorder control |
+
+The summary prints the scheduler state, live/busy/idle workers, concurrency limit and peak, queue depth and
+capacity, submitted/completed/failed/rejected/cancelled/expired counters, throughput, queue-wait and
+execution averages with their longest values, the process CPU estimate, and the startup worker/queue/
+scheduling settings. It reads the public `SchedulerMetrics` snapshot, which has no percentiles, so the
+command shows averages and longest values only.
+
+`consumers` prints, for every registered consumer, its policy (enabled, concurrency limit, weight, queue
+bound, overflow policy, max wait), active/limit and queued/bound, the same counters, and wait/execution
+averages.
+
+`reload` sends `Reloading the compute configuration...` and then runs on the global tick thread. It reports
+the number of changes, the consumer policies applied now, the keys that take effect after a restart and
+every validation problem from `problems()`.
+
+When the engine is not running, every subcommand answers with the reason instead of an error. For
+`async-compute.enabled: false` it prints `The Tuff compute engine is disabled in config/tuff.yml (async-compute.enabled: false).`
+followed by `Set it to true and restart the server to enable the shared worker pool.` A startup failure
+points at the `Tuff/Compute` log; very early in startup the state is "not initialized yet".
+
 ## Metrics
 
-Read a point-in-time snapshot with `scheduler.metrics()`. Counters are monotonic since the scheduler
-started; gauges describe the moment of capture; durations are averages over the scheduler's lifetime. There
-is no admin command in this build: the snapshot is read through the Java API from a plugin, and JFR through
-the standard JDK tools. If the engine is not installed (see the scope note on the overview page), neither is
-available.
+Read a point-in-time snapshot with `/tuff` or programmatically with `scheduler.metrics()`. Counters are
+monotonic since the scheduler started; gauges describe the moment of capture; durations are averages over
+the scheduler's lifetime. There is no metrics exporter: the command prints text and the Java API returns an
+immutable snapshot. If the engine is not running, neither is available.
 
 | Metric | Meaning | Watch for |
 | --- | --- | --- |
@@ -85,10 +127,20 @@ worker sits in the same plugin frame, the problem is the task body, not the queu
 
 ## JFR
 
-JFR emission is gated twice: `async-compute.metrics.jfr: true` in the configuration, and a recording that
-enables the event. With `jfr: false` the hooks are no-ops even while a recording runs.
+The scheduler emits `tuff.compute.*` events only with `async-compute.metrics.jfr: true`; with `jfr: false`
+the hooks are no-ops even while a recording runs. Changing the key needs a restart.
 
-Record and inspect:
+`/tuff compute jfr start` creates one named recording (`tuff-compute`) from the JVM `default` configuration
+with the `tuff.compute` category enabled. The recording is bounded to 30 minutes and 64 MB. It refuses when
+the engine is not running, when Flight Recorder is unavailable, when `metrics.jfr` is false (the file would be
+empty), or when another Tuff recording is already active.
+
+`dump` writes a copy of the running recording without stopping it, `stop` stops it and writes the file, and
+an active recording is written during server shutdown if nobody stopped it. Files go to
+`debug/tuff-compute-<UTC timestamp>.jfr` under the server working directory; the command prints the absolute
+path and size.
+
+The same data can be recorded with the JDK tools, as long as `metrics.jfr` is enabled:
 
 ```bash
 jcmd <pid> JFR.start name=tuff-compute settings=profile duration=120s filename=compute.jfr
@@ -120,6 +172,29 @@ There is no built-in per-task sampling or throttling on top of JFR's own setting
 a low threshold will produce a lot of events on a busy server; use a custom recording with `threshold` if
 size matters.
 
+## Reading benchmark numbers
+
+The JMH suite and its full tables are in [Benchmarks](benchmarks.md). Use the numbers for shape and
+regression tracking, not as server SLAs:
+
+- The wrapper costs roughly **0.4 µs per task** over a bare `execute(Runnable)`: 0.57 µs against 0.16 µs for
+  an empty task, but only about 8% on a 4–6 µs body. Priorities, quotas, fair share and metrics are what that
+  buys.
+- Submit-only is ~219 ns; submit + execute of an empty task is ~0.8 µs. Both are memory-latency bound and
+  degrade when another build shares the machine.
+- Throughput scaled almost linearly from 1 to 8 workers on the test laptop with a 4–6 µs body. That says the
+  pool does not serialise, not that eight workers fit your CPU budget.
+- Dispatch out of a deep queue costs ~0.8–1.3 µs per task; 16 consumers add ~0.4 µs because selection is
+  `O(consumers)` per poll.
+- `WEIGHTED_FAIR` costs ~0.2–0.35 µs per task over FIFO at four consumers; aging is not measurable.
+- A refused submission costs ~6 µs (the handle and entry are allocated before the refusal), and a queued
+  cancellation ~2.7 µs. Rejection-heavy or cancel-heavy designs pay this per call.
+- Idle latency is dominated by `scheduling.idle-wait-millis`: with the 50 ms default the p90 for one task on
+  an idle pool is ~50 ms. Lower it if a subsystem waits for results from an occasionally idle pool.
+
+The suite ran on one machine, one fork, one run per scenario; multi-threaded figures moved by 3–10x when
+another build was active. Re-run on a quiet machine before using absolute values.
+
 ## Tuning playbook
 
 | Symptom | First knob | Then | Caveat |
@@ -130,6 +205,7 @@ size matters.
 | One consumer monopolises turns | `weighted-fair` + weights | Per-consumer `max-concurrent` | Weights only order dispatch while both queues have work |
 | Rejections under bursts | `consumers.*.max-queued-tasks`, `queue.capacity` | Client-side shedding, `drop-oldest` for disposable work | Capacity is memory, not throughput; restart required to change it |
 | Stale work runs too late | `max-queue-wait-seconds` | `drop-oldest` for the consumer | Expiry granularity is the janitor tick, 10–100 ms |
+| First task after an idle period is slow | `scheduling.idle-wait-millis` | Consumer-side batching | This is the worker park interval; lowering it shortens the wait but polls more often |
 | Latency spikes at constant load | `adaptive.enabled` | `target-utilization`, `decrease-factor` | Adaptive needs `threads: -1` and only moves once per window |
 | Pool shrinks too aggressively | `adaptive.decrease-factor` | `min-concurrency` | The floor is `max(min-concurrency, min-threads)` |
 | Need per-task detail | `metrics.jfr: true` | A JFR recording around the incident | JFR adds allocation only while events are enabled |
@@ -152,14 +228,20 @@ These are deliberate, with the technical reason:
   not-started work is cancelled. A body that never checks the flag runs to completion.
 - **Queue capacity needs a restart.** The queue allocates its bound at construction; growing it live would
   require a different structure with the same ordering guarantees.
+- **Live reload is narrow.** Only the policies of consumers that are already registered change on a running
+  engine. `workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*` and `shutdown-grace-seconds`
+  need a restart, and an override for a consumer that has not registered yet is only read at startup.
 - **`queue.overflow-policy` is a default, not an override.** It applies to the `default` consumer and to
   consumers registered on the fly; `consumers.<id>.overflow-policy` and an explicit `registerConsumer`
   policy take precedence for their ids.
 - **No built-in consumers.** No server subsystem submits to the pool in this build. The three consumer
   sections in the template are example policies; a plugin must submit under its own id.
-- **No admin command and no metrics exporter.** There is no `/tuff` command yet; metrics are read through
-  `TuffCompute.scheduler().metrics()` and JFR through the standard tools. Pushing them anywhere is the job of
-  the consumer of that API.
+- **No metrics exporter.** `/tuff` prints text and `SchedulerMetrics` returns an immutable snapshot;
+  there is no Prometheus/OpenMetrics endpoint. Pushing the numbers anywhere is the job of the consumer of
+  that API.
+- **No percentiles in the public snapshot.** `SchedulerMetrics` exposes averages and longest values, and the
+  command prints those. Percentiles are not part of the public API and cannot be shown by `/tuff`; the
+  adaptive controller uses them internally for its window.
 - **The CPU figure is process-wide.** There is no cheap, honest pool-only CPU measurement on the JVM; a
   made-up number would be worse than `NaN`.
 - **Queue and worker gauges are sampled.** They can be one sample interval stale. Counters derived from
