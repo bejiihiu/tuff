@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: xs <bungeepithub@gmail.com>
+Date: Thu, 26 Nov 2026 02:35:03 +0500
+Subject: [PATCH] Tuff: drive the compute engine lifecycle
+
+
+diff --git a/net/minecraft/server/MinecraftServer.java b/net/minecraft/server/MinecraftServer.java
+index f1b703eb2dfdbd0a192a2e68ff479f9799e7f075..96994f8eca41d4f1591e0613a52d8fbc6cdc69c0 100644
+--- a/net/minecraft/server/MinecraftServer.java
++++ b/net/minecraft/server/MinecraftServer.java
+@@ -1075,6 +1075,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             this.server.spark.disable(); // Paper - spark
+             this.server.disablePlugins();
+             this.server.waitForAsyncTasksShutdown(); // Paper - Wait for Async Tasks during shutdown
++            kz.bejiihiu.tuff.compute.bootstrap.ComputeBootstrap.stop(); // Tuff - stop the compute engine before the world save starts
+         }
+         // CraftBukkit end
+         this.getConnection().stop();
+@@ -1337,6 +1338,7 @@ public abstract class MinecraftServer extends ReentrantBlockableEventLoop<TickTa
+             // Folia start - region threading
+             if (true) {
+                 io.papermc.paper.threadedregions.RegionizedServer.getInstance().init(); // Folia - region threading - only after loading worlds
++                kz.bejiihiu.tuff.compute.bootstrap.ComputeBootstrap.applyRegionBudget(); // Tuff - size the compute pool against the real server thread budget
+                 final long actualDoneTimeMs = System.currentTimeMillis() - org.bukkit.craftbukkit.Main.BOOT_TIME.toEpochMilli(); // Paper - Improve startup message
+                 LOGGER.info("Done ({})! For help, type \"help\"", String.format(java.util.Locale.ROOT, "%.3fs", actualDoneTimeMs / 1000.00D)); // Paper - Improve startup message
+                 for (;;) {
