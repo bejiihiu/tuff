@@ -1,3 +1,3 @@
 @echo off
-REM rebuild all patch sets from the applied sources, see notes/upstream.md
+REM rebuild all patch sets from the applied sources
 gradlew rebuildPaperApiPatches rebuildPaperCheckstylePatches rebuildPaperCheckstyleConfigPatches :tuff-server:rebuildAllServerPatches
