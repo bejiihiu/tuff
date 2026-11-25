@@ -68,6 +68,10 @@ final class EngineTestSupport {
         return new ComputeEngineImpl(settings, clock, PROCESSORS);
     }
 
+    static ComputeEngineImpl engine(final ComputeSettings settings, final ComputeClock clock, final int processorBudget) {
+        return new ComputeEngineImpl(settings, clock, processorBudget);
+    }
+
     static AsyncComputeScheduler startedScheduler(final ComputeSettings settings, final ComputeClock clock) {
         final AsyncComputeScheduler scheduler = new AsyncComputeSchedulerImpl(engine(settings, clock));
         scheduler.start();

@@ -1,6 +1,5 @@
 package kz.bejiihiu.tuff.compute.internal.engine.impl;
 
-import java.time.Duration;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -16,7 +15,6 @@ import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.assertEventually;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.cancellationOf;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.settings;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.startedScheduler;
@@ -79,8 +77,7 @@ class EngineConsumerTest {
             );
 
             release.countDown();
-            final ComputeCancelledException cancelledBlocker = cancellationOf(blocker);
-            assertEquals(ComputeCancelledException.Reason.CONSUMER_DISABLED, cancelledBlocker.reason());
+            assertEquals("blocked", blocker.get(10L, TimeUnit.SECONDS));
             assertFalse(compute.unregisterConsumer("doomed"));
 
             final ComputeRejectedException unknown = assertThrows(
@@ -98,7 +95,7 @@ class EngineConsumerTest {
     }
 
     @Test
-    void unregisteringFlagsRunningWorkCooperatively() throws Exception {
+    void unregisteringLetsRunningWorkFinishAndCancelsOnlyQueuedWork() throws Exception {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AsyncComputeScheduler compute = startedScheduler(
@@ -113,11 +110,29 @@ class EngineConsumerTest {
                 return "late result";
             });
             assertTrue(running.await(10L, TimeUnit.SECONDS));
+            final CompletableFuture<String> queued = compute.submit(
+                "running",
+                ComputeTaskType.GENERAL,
+                ComputePriority.NORMAL,
+                () -> "queued"
+            );
+
             assertTrue(compute.unregisterConsumer("running"));
-            release.countDown();
-            final ComputeCancelledException cancelled = cancellationOf(handle);
+
+            final ComputeCancelledException cancelled = cancellationOf(queued);
             assertEquals(ComputeCancelledException.Reason.CONSUMER_DISABLED, cancelled.reason());
-            assertEventually("running work terminalizes after the flag", Duration.ofSeconds(2), handle::isDone);
+            final ComputeRejectedException unknown = assertThrows(
+                ComputeRejectedException.class,
+                () -> compute.submit("running", ComputeTaskType.GENERAL, ComputePriority.NORMAL, () -> "late")
+            );
+            assertEquals(ComputeRejectedException.Reason.CONSUMER_UNKNOWN, unknown.reason());
+
+            release.countDown();
+            assertEquals("late result", handle.get(10L, TimeUnit.SECONDS));
+            assertTrue(handle.isDone());
+            assertFalse(handle.isCancelled());
+            assertEquals(1L, compute.metrics().completedTasks());
+            assertEquals(1L, compute.metrics().cancelledTasks());
         } finally {
             release.countDown();
             compute.shutdown();

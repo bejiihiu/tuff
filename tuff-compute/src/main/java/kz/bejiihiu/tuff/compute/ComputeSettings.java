@@ -13,7 +13,9 @@ import java.util.Objects;
  * {@link AsyncComputeScheduler} without further checking.
  *
  * <p>Sizing values use {@code -1} for "let the scheduler decide", which is resolved against the
- * available processors when the scheduler starts.
+ * processor budget when the scheduler starts (and again whenever the platform applies a new budget at
+ * runtime). The budget is what is left after the server reserved its own region, chunk and IO
+ * threads; it is not the raw core count.
  *
  * @param enabled              whether the scheduler runs at all; a disabled scheduler rejects every
  *                             submission and starts no worker threads
@@ -146,12 +148,15 @@ public record ComputeSettings(
         }
 
         /**
-         * Resolves the initial worker count against the available processors.
+         * Resolves the initial worker count against the processor budget.
          *
-         * <p>Automatic sizing reserves one processor for the server's own threads, honours
-         * {@link #minThreads()} as a floor and {@link #maxThreads()} as a ceiling.
+         * <p>Automatic sizing keeps one processor as headroom, honours
+         * {@link #minThreads()} as a floor and {@link #maxThreads()} as a ceiling. The argument is a
+         * <b>budget</b>, not the raw core count: the platform has already subtracted its region tick
+         * threads, chunk workers, IO threads and headroom, so the scheduler must not subtract them
+         * again.
          *
-         * @param availableProcessors processors reported by the JVM, at least {@code 1}
+         * @param availableProcessors processors available to the scheduler (the engine budget), at least {@code 1}
          * @return the initial number of workers, always between {@code 1} and the resolved maximum
          * @throws IllegalArgumentException if {@code availableProcessors} is not positive
          */
@@ -170,9 +175,9 @@ public record ComputeSettings(
         }
 
         /**
-         * Resolves the maximum worker count against the available processors.
+         * Resolves the maximum worker count against the processor budget.
          *
-         * @param availableProcessors processors reported by the JVM, at least {@code 1}
+         * @param availableProcessors processors available to the scheduler (the engine budget), at least {@code 1}
          * @return the hard ceiling for the pool, never below {@link #minThreads()}
          * @throws IllegalArgumentException if {@code availableProcessors} is not positive
          */
@@ -192,8 +197,14 @@ public record ComputeSettings(
      * submissions can never grow heap without limit; when it is reached the scheduler refuses rather
      * than blocks the submitting thread.
      *
-     * @param capacity        maximum number of queued tasks in the whole scheduler, at least {@code 1}
-     * @param overflowPolicy  what happens when the global capacity is exhausted; DROP_OLDEST still only evicts the oldest queued task of the submitting consumer, so a consumer with nothing queued is refused exactly like with REJECT
+     * <p>The overflow policy is the default for consumers the scheduler creates on its own: the
+     * {@link AsyncComputeScheduler#DEFAULT_CONSUMER_ID default consumer} and consumers registered on
+     * the fly by {@link Consumers#allowDynamicRegistration() dynamic registration}. A policy supplied
+     * explicitly through {@link AsyncComputeScheduler#registerConsumer(ComputeConsumer)} or through a
+     * {@link Consumers#overrides() per consumer override} wins over this default.
+     *
+     * @param capacity       maximum number of queued tasks in the whole scheduler, at least {@code 1}
+     * @param overflowPolicy default overflow behaviour for consumers the scheduler registers itself; DROP_OLDEST still only evicts the oldest queued task of the submitting consumer, so a consumer with nothing queued is refused exactly like with REJECT
      */
     public record QueueSettings(int capacity, OverflowPolicy overflowPolicy) {
 
@@ -306,11 +317,18 @@ public record ComputeSettings(
      * consumers that are auto registered when dynamic registration is allowed. Overrides are keyed by
      * consumer id and replace the whole policy for that consumer.
      *
+     * <p>Consumers created by the scheduler itself (the
+     * {@link AsyncComputeScheduler#DEFAULT_CONSUMER_ID default consumer} and dynamic registrations
+     * without an override) combine this default policy with
+     * {@link QueueSettings#overflowPolicy()}: the queue overflow default wins unless the overrides map
+     * or an explicit registration provides a policy for that id.
+     *
      * @param defaultPolicy             policy for consumers that have no explicit one
      * @param overrides                 per consumer id policy overrides, may be empty
      * @param allowDynamicRegistration  whether submitting under an unknown consumer id registers it
-     *                                  on the fly with {@code defaultPolicy}; when {@code false} such
-     *                                  a submission is rejected with
+     *                                  on the fly with {@code defaultPolicy} (its overflow policy
+     *                                  comes from {@link QueueSettings#overflowPolicy()}); when
+     *                                  {@code false} such a submission is rejected with
      *                                  {@link ComputeRejectedException.Reason#CONSUMER_UNKNOWN}
      */
     public record Consumers(

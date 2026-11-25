@@ -172,6 +172,41 @@ class EngineLifecycleTest {
         assertTrue(assertAwait(compute, Duration.ofSeconds(10)));
     }
 
+    @Test
+    void graceExpiryTerminatesAndLetsTheRunningTaskFinishLater() throws Exception {
+        final CountDownLatch running = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(1).grace(millis(10L));
+        final String prefix = builder.prefix();
+        final AsyncComputeScheduler compute = startedScheduler(builder.build(), new EngineTestSupport.FakeClock());
+        try {
+            final CompletableFuture<String> future = compute.submit(() -> {
+                running.countDown();
+                release.await();
+                return "finished";
+            });
+            assertTrue(running.await(10L, TimeUnit.SECONDS));
+
+            final long startNanos = System.nanoTime();
+            compute.shutdown(millis(10L));
+            assertTrue(assertAwait(compute, Duration.ofSeconds(5)), "termination must not wait for the body");
+            assertTrue(System.nanoTime() - startNanos < TimeUnit.SECONDS.toNanos(5L));
+            assertEquals(SchedulerState.TERMINATED, compute.state());
+            assertFalse(future.isDone(), "an abandoned task must not be completed falsely");
+
+            release.countDown();
+            assertEquals("finished", future.get(10L, TimeUnit.SECONDS));
+            assertEquals(1L, compute.metrics().submittedTasks());
+            assertEquals(1L, compute.metrics().completedTasks());
+            assertEquals(0L, compute.metrics().cancelledTasks());
+            assertEquals(0L, compute.metrics().failedTasks());
+            awaitNoEngineThreads(prefix, Duration.ofSeconds(5));
+        } finally {
+            release.countDown();
+            compute.shutdown();
+        }
+    }
+
     private static boolean assertAwait(final AsyncComputeScheduler compute, final Duration timeout) {
         try {
             return compute.awaitTermination(timeout);

@@ -46,7 +46,7 @@ class EngineAdaptiveTest {
             final int shrunk = compute.totalLimit();
             assertTrue(shrunk < initial, "latency pressure must shrink the limit, was " + initial + " now " + shrunk);
             assertEquals(controller.currentLimit(), shrunk);
-            assertEquals(2, shrunk, "four slots halved is two");
+            assertEquals(Math.max(1, initial - (int) Math.ceil(initial * 0.5d)), shrunk);
         } finally {
             compute.shutdown(Duration.ofSeconds(1));
         }

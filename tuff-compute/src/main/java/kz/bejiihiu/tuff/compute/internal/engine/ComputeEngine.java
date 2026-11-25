@@ -50,6 +50,16 @@ public interface ComputeEngine {
     void shutdownNow();
 
     /**
+     * Applies a new processor budget to an automatically sized pool.
+     *
+     * <p>No-op for a fixed worker count or when the engine is not running. Never interrupts running
+     * tasks and never touches the queue.
+     *
+     * @param processors processors available to the engine, at least {@code 1}
+     */
+    void applyProcessorBudget(int processors);
+
+    /**
      * Waits until the engine reaches the terminated state.
      *
      * @param timeout maximum time to wait, must not be negative

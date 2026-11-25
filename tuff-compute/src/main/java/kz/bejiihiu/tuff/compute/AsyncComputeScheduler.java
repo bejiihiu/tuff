@@ -24,8 +24,10 @@ import java.util.concurrent.CompletableFuture;
  *
  * <p>Lifecycle: a fresh scheduler is in {@link SchedulerState#NEW} and accepts no work until
  * {@link #start()} is called. After {@link #shutdown()} the scheduler stops claiming new tasks,
- * finishes or cancels what is queued depending on the grace period, and moves to
- * {@link SchedulerState#TERMINATED}. Terminated schedulers stay terminated.
+ * cancels what is still queued and moves to {@link SchedulerState#TERMINATED}. Tasks that were
+ * already running get the configured grace period; after it expires the scheduler terminates anyway,
+ * without interrupting them, and their futures complete normally when the task body returns. A
+ * terminated scheduler never goes back to {@code RUNNING}.
  */
 public interface AsyncComputeScheduler {
 
@@ -33,7 +35,9 @@ public interface AsyncComputeScheduler {
      * Id of the consumer that receives submissions which do not name one.
      *
      * <p>The scheduler registers this consumer on start with the default policy from
-     * {@link ComputeSettings.Consumers#defaultPolicy()}.
+     * {@link ComputeSettings.Consumers#defaultPolicy()} and the overflow policy from
+     * {@link ComputeSettings.QueueSettings#overflowPolicy()}, unless a
+     * {@link ComputeSettings.Consumers#overrides() override} for this id is configured.
      */
     String DEFAULT_CONSUMER_ID = "default";
 
@@ -142,9 +146,10 @@ public interface AsyncComputeScheduler {
      * Unregisters a consumer.
      *
      * <p>Queued tasks of that consumer are cancelled with
-     * {@link ComputeCancelledException.Reason#CONSUMER_DISABLED}; tasks that are already running are
-     * only flagged as cancellation requested and are allowed to finish, because workers are never
-     * interrupted. New submissions for the id are handled as if the consumer had never existed.
+     * {@link ComputeCancelledException.Reason#CONSUMER_DISABLED}. Tasks that already started are not
+     * cancelled: workers are never interrupted, the task runs to completion and its future completes
+     * normally with the produced value. New submissions for the id are handled as if the consumer
+     * had never existed.
      *
      * @param consumerId consumer to unregister
      * @return {@code true} if a consumer with that id was registered
@@ -235,9 +240,16 @@ public interface AsyncComputeScheduler {
      * Shuts the scheduler down gracefully, allowing running tasks to finish.
      *
      * <p>New submissions are refused with {@link ComputeShutdownException}, no new task is claimed
-     * from the queue, and running tasks are given at most {@code gracePeriod} to finish. Queued tasks
-     * that did not start within the grace period are cancelled with
-     * {@link ComputeCancelledException.Reason#SHUTDOWN}, then the workers are stopped. Calling this
+     * from the queue, and queued tasks are cancelled with
+     * {@link ComputeCancelledException.Reason#SHUTDOWN}. Running tasks get at most
+     * {@code gracePeriod} to finish.
+     *
+     * <p>When the grace period expires the scheduler moves to {@link SchedulerState#TERMINATED}
+     * anyway. Tasks that are still running are <b>not</b> interrupted: their bodies finish on their
+     * own and their futures complete normally (or with the failure the body throws) after the
+     * scheduler is already terminated. The abandonment is logged as a warning with the number of
+     * affected consumers. Callers can therefore rely on {@link #awaitTermination(Duration)}
+     * returning {@code true} within roughly the grace period even when a task hangs. Calling this
      * while the scheduler is in {@link SchedulerState#NEW} moves it straight to
      * {@link SchedulerState#TERMINATED} without starting anything.
      *
@@ -257,6 +269,35 @@ public interface AsyncComputeScheduler {
      * @throws IllegalArgumentException if {@code timeout} is negative
      */
     boolean awaitTermination(Duration timeout) throws InterruptedException;
+
+    /**
+     * Applies a new processor budget to an automatically sized pool.
+     *
+     * <p>The budget is the number of processors the compute engine may use after the server has
+     * reserved its region tick threads, chunk workers, IO threads and a small headroom for GC/JIT. It
+     * is not the raw core count: the engine never subtracts those threads itself, it only clamps the
+     * pool into the configured {@code minThreads}/{@code maxThreads} window around the budget.
+     *
+     * <p>The new target is {@link ComputeSettings.Workers#resolveThreadCount(int)} of the budget: the
+     * pool is resized, its pool-wide concurrency limit and the quota controller's total limit follow,
+     * and queued work is untouched. Running tasks are never interrupted; a shrink retires idle
+     * workers between tasks. Values below {@code 1} are rejected.
+     *
+     * <p>With adaptive concurrency enabled the budget is a hard ceiling for the controller's
+     * decisions: the controller still owns the short-term limit inside its window, but the engine
+     * never applies more tasks than the budget allows. Without adaptive concurrency the budget is the
+     * ordinary autoscaler ceiling.
+     *
+     * <p>This method is a no-op when the pool size is fixed ({@code workers.threads > 0}) or when
+     * the scheduler is not {@link SchedulerState#RUNNING} (before {@link #start()} or after
+     * {@link #shutdown}). It is safe to call from any thread at any time after start.
+     *
+     * @param processors processors available to the engine, at least {@code 1}
+     * @throws IllegalArgumentException if {@code processors} is below {@code 1}
+     */
+    default void applyProcessorBudget(final int processors) {
+        // a scheduler that does not own a dynamically sized pool has nothing to apply
+    }
 
     /**
      * Lifecycle state of a scheduler.
@@ -279,7 +320,9 @@ public interface AsyncComputeScheduler {
         SHUTTING_DOWN,
 
         /**
-         * Stopped for good. Nothing is accepted and no worker exists.
+         * Stopped for good. Nothing is accepted anymore. Workers exit as soon as the tasks that were
+         * still running when the grace period expired return; those tasks keep running and their
+         * futures complete normally after termination.
          */
         TERMINATED
     }

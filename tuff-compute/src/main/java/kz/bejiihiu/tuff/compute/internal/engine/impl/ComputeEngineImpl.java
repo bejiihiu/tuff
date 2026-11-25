@@ -2,6 +2,7 @@ package kz.bejiihiu.tuff.compute.internal.engine.impl;
 
 import java.time.Duration;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -24,6 +25,7 @@ import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ComputeShutdownException;
 import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
+import kz.bejiihiu.tuff.compute.OverflowPolicy;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.internal.adaptive.AdaptiveConcurrencyController;
 import kz.bejiihiu.tuff.compute.internal.adaptive.impl.AimdAdaptiveConcurrencyController;
@@ -80,13 +82,6 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     private static final System.Logger LOG = System.getLogger(ComputeEngineImpl.class.getName());
 
     /**
-     * Poll slice used while waiting for running tasks during shutdown. Running tasks are never
-     * interrupted, so a task that never returns can delay termination; waiting in slices keeps the
-     * shutdown thread responsive to spurious interrupts.
-     */
-    private static final Duration SHUTDOWN_POLL = Duration.ofMillis(100);
-
-    /**
      * Janitor tick. Kept small so queue expiry is real even without adaptive concurrency; the gauge
      * sampling cadence is the configured metrics sample interval, not this value.
      */
@@ -94,8 +89,25 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
 
     private final ComputeSettings settings;
     private final ComputeClock clock;
-    private final int availableProcessors;
+
+    /**
+     * Processors the engine may use. The platform budget (not the raw core count) is applied here;
+     * {@link #applyProcessorBudget(int)} updates it at runtime.
+     */
+    private volatile int processorBudget;
+
+    /**
+     * Hard ceiling of the pool when it was created. The pool implementation owns this number and it
+     * never grows, so a budget above the construction-time ceiling is clamped to it.
+     */
     private final int workerCeiling;
+
+    /**
+     * Worker ceiling implied by the current processor budget ({@code resolveMaxThreads(budget)}),
+     * already clamped to {@link #workerCeiling}. Autoscaling and adaptive concurrency use it so a
+     * budget shrink is not immediately undone by the next growth step.
+     */
+    private volatile int budgetCeiling;
 
     private final ComputeQueue queue;
     private final QuotaController quota;
@@ -132,24 +144,29 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     }
 
     /**
-     * Creates an engine with an explicit processor count.
+     * Creates an engine with an explicit processor budget.
      *
-     * <p>Tests use this overload to make worker sizing and adaptive bounds deterministic.
+     * <p>The value is a budget, not the raw core count: the platform already subtracted its region
+     * tick threads, chunk workers, IO threads and headroom. Tests use this overload to make worker
+     * sizing and adaptive bounds deterministic; the server passes the resolved budget (or the JVM
+     * processor count before the real budget is known, then calls
+     * {@link #applyProcessorBudget(int)}).
      *
-     * @param settings            scheduler configuration
-     * @param clock               clock used by every component
-     * @param availableProcessors processors available to the JVM, at least {@code 1}
+     * @param settings        scheduler configuration
+     * @param clock           clock used by every component
+     * @param processorBudget processors available to the engine, at least {@code 1}
      */
-    ComputeEngineImpl(final ComputeSettings settings, final ComputeClock clock, final int availableProcessors) {
+    ComputeEngineImpl(final ComputeSettings settings, final ComputeClock clock, final int processorBudget) {
         this.settings = Preconditions.requireNonNull(settings, "settings");
         this.clock = Preconditions.requireNonNull(clock, "clock");
-        Preconditions.checkAtLeast(availableProcessors, 1, "availableProcessors");
-        this.availableProcessors = availableProcessors;
+        Preconditions.checkAtLeast(processorBudget, 1, "processorBudget");
+        this.processorBudget = processorBudget;
         this.workerCeiling = Math.max(
             1,
-            Math.max(settings.workers().minThreads(), settings.workers().resolveMaxThreads(availableProcessors))
+            Math.max(settings.workers().minThreads(), settings.workers().resolveMaxThreads(processorBudget))
         );
-        final int initialConcurrency = Math.max(1, settings.workers().resolveThreadCount(availableProcessors));
+        this.budgetCeiling = this.workerCeiling;
+        final int initialConcurrency = Math.max(1, settings.workers().resolveThreadCount(processorBudget));
         this.queue = new BoundedComputeQueue(settings, clock);
         this.quota = new AtomicQuotaController(initialConcurrency);
         this.queue.setEvictionListener(this::onEvicted);
@@ -271,11 +288,8 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (removed.isEmpty()) {
             return false;
         }
-        for (final TaskHandle<?> handle : this.handles.values()) {
-            if (handle.consumerId().equals(consumerId)) {
-                handle.requestCooperativeCancel(ComputeCancelledException.Reason.CONSUMER_DISABLED);
-            }
-        }
+        // queued work has not started, so it can still be cancelled; work that is already running is
+        // deliberately left alone and completes with its result (workers are never interrupted)
         for (final QueueEntry entry : this.queue.unregisterConsumer(consumerId)) {
             this.cancelQueued(entry, ComputeCancelledException.Reason.CONSUMER_DISABLED);
         }
@@ -419,7 +433,11 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (controller == null || currentPool == null) {
             return;
         }
-        final int limit = controller.evaluate();
+        final int requested = controller.evaluate();
+        // the processor budget is a hard ceiling for the controller's decisions; the controller still
+        // owns the short-term limit inside that ceiling
+        final int budgetTarget = this.settings.workers().resolveThreadCount(this.processorBudget);
+        final int limit = Math.min(requested, budgetTarget);
         if (limit == this.appliedLimit.get()) {
             return;
         }
@@ -427,6 +445,55 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         currentPool.resize(limit);
         currentPool.setConcurrencyLimit(limit);
         this.quota.updateTotalLimit(limit);
+    }
+
+    @Override
+    public void applyProcessorBudget(final int processors) {
+        Preconditions.checkPositive(processors, "processors");
+        final DynamicWorkerPool currentPool = this.pool;
+        if (currentPool == null
+            || this.state.get() != AsyncComputeScheduler.SchedulerState.RUNNING
+            || !this.settings.workers().automaticThreadCount()) {
+            // fixed pool or not running: documented no-op, the budget cannot change anything
+            return;
+        }
+        final int previousBudget = this.processorBudget;
+        final int target = this.settings.workers().resolveThreadCount(processors);
+        this.processorBudget = processors;
+        this.budgetCeiling = Math.min(
+            this.workerCeiling,
+            Math.max(1, this.settings.workers().resolveMaxThreads(processors))
+        );
+        final AdaptiveConcurrencyController controller = this.adaptive;
+        if (controller != null && controller.enabled()) {
+            final int applied = Math.min(this.appliedLimit.get(), target);
+            this.appliedLimit.set(applied);
+            currentPool.resize(applied);
+            currentPool.setConcurrencyLimit(applied);
+            this.quota.updateTotalLimit(applied);
+        } else {
+            // resize carries the gate and the quota limit along; there is no adaptive writer here
+            currentPool.resize(target);
+            final int applied = currentPool.concurrencyLimit();
+            this.appliedLimit.set(applied);
+            this.quota.updateTotalLimit(applied);
+        }
+        LOG.log(System.Logger.Level.INFO,
+            "compute processor budget changed from " + previousBudget + " to " + processors
+                + " (target workers " + target + ", ceiling " + this.budgetCeiling + ')');
+    }
+
+    /**
+     * Returns the current desired worker count.
+     *
+     * <p>Diagnostics and tests use it; it is the value the pool is currently aiming for, before its
+     * own keep-alive retirement.
+     *
+     * @return desired workers, or {@code 0} when the pool does not exist
+     */
+    int desiredWorkers() {
+        final DynamicWorkerPool currentPool = this.pool;
+        return currentPool == null ? 0 : currentPool.desiredWorkers();
     }
 
     /**
@@ -458,7 +525,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         final DynamicWorkerPool newPool = new DynamicWorkerPool(
             this.settings.workers(),
             this.settings.scheduling(),
-            this.availableProcessors,
+            this.processorBudget,
             newLoop,
             this.clock,
             ThreadFactories.platform(this.settings.workers().threadNamePrefix(), true)
@@ -470,7 +537,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this.settings,
             this.clock,
             newPool.concurrencyLimit(),
-            this.availableProcessors,
+            this.processorBudget,
             newPool::activeWorkers,
             CpuUtilizationProbe::sample
         );
@@ -537,12 +604,46 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
 
     private void registerConfiguredConsumers() {
         final ComputeSettings.Consumers consumers = this.settings.consumers();
-        this.registerIfAbsent(AsyncComputeScheduler.DEFAULT_CONSUMER_ID, consumers.policyFor(AsyncComputeScheduler.DEFAULT_CONSUMER_ID));
+        this.registerIfAbsent(
+            AsyncComputeScheduler.DEFAULT_CONSUMER_ID,
+            this.inheritedPolicy(AsyncComputeScheduler.DEFAULT_CONSUMER_ID)
+        );
         for (final Map.Entry<String, ConsumerPolicy> override : consumers.overrides().entrySet()) {
             if (!AsyncComputeScheduler.DEFAULT_CONSUMER_ID.equals(override.getKey())) {
-                this.registerIfAbsent(override.getKey(), override.getValue());
+                this.registerIfAbsent(override.getKey(), this.inheritedPolicy(override.getKey()));
             }
         }
+    }
+
+    /**
+     * Returns the policy the scheduler uses when it registers a consumer itself.
+     *
+     * <p>An explicit {@code consumers.<id>} override wins. Otherwise the default policy is used, with
+     * its overflow behaviour replaced by {@link ComputeSettings.QueueSettings#overflowPolicy()}: that
+     * key is the default for the built-in default consumer and for dynamic registrations, so a
+     * globally configured REJECT/DROP_OLDEST actually has an effect.
+     *
+     * @param consumerId consumer that is about to be registered
+     * @return the inherited policy
+     */
+    private ConsumerPolicy inheritedPolicy(final String consumerId) {
+        final ConsumerPolicy explicit = this.settings.consumers().overrides().get(consumerId);
+        if (explicit != null) {
+            return explicit;
+        }
+        final ConsumerPolicy base = this.settings.consumers().defaultPolicy();
+        final OverflowPolicy queueOverflow = this.settings.queue().overflowPolicy();
+        if (base.overflowPolicy() == queueOverflow) {
+            return base;
+        }
+        return new ConsumerPolicy(
+            base.enabled(),
+            base.concurrencyLimit(),
+            base.maxQueuedTasks(),
+            base.fairShareWeight(),
+            queueOverflow,
+            base.maxQueueWait()
+        );
     }
 
     private void registerIfAbsent(final String consumerId, final ConsumerPolicy policy) {
@@ -575,7 +676,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
                 ComputeRejectedException.Reason.CONSUMER_UNKNOWN,
                 "consumer " + consumerId + " is not registered and dynamic registration is disabled");
         }
-        return this.registerConsumer(ComputeConsumer.of(consumerId, this.settings.consumers().policyFor(consumerId)));
+        return this.registerConsumer(ComputeConsumer.of(consumerId, this.inheritedPolicy(consumerId)));
     }
 
     private <T> ComputeTaskHandle<T> accept(final String consumerId, final ComputeRequest<T> request) {
@@ -658,15 +759,16 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (currentPool == null || !this.isClaiming()) {
             return;
         }
+        final int ceiling = Math.min(this.workerCeiling, this.budgetCeiling);
         final int desired = currentPool.desiredWorkers();
-        if (desired >= this.workerCeiling || currentPool.idleWorkers() > 0 || this.queue.size() <= 0) {
+        if (desired >= ceiling || currentPool.idleWorkers() > 0 || this.queue.size() <= 0) {
             return;
         }
         if (!this.growInFlight.compareAndSet(false, true)) {
             return;
         }
         try {
-            if (currentPool.desiredWorkers() < this.workerCeiling
+            if (currentPool.desiredWorkers() < ceiling
                 && currentPool.idleWorkers() == 0
                 && this.queue.size() > 0) {
                 currentPool.resize(currentPool.desiredWorkers() + 1);
@@ -690,14 +792,15 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (currentPool == null) {
             return;
         }
-        final int minimum = Math.min(this.settings.workers().minThreads(), this.workerCeiling);
+        final int ceiling = Math.min(this.workerCeiling, this.budgetCeiling);
+        final int minimum = Math.min(this.settings.workers().minThreads(), ceiling);
         final int backlog = this.queue.size() + (currentDispatcher == null ? 0 : currentDispatcher.carriedEntries());
         final int target;
         if (backlog <= 0) {
             target = minimum;
         } else {
             final long wanted = (long) currentPool.activeWorkers() + backlog;
-            target = (int) Math.min(this.workerCeiling, Math.max(minimum, wanted));
+            target = (int) Math.min(ceiling, Math.max(minimum, wanted));
         }
         if (target != currentPool.desiredWorkers()) {
             currentPool.resize(target);
@@ -729,6 +832,12 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this.state.set(AsyncComputeScheduler.SchedulerState.SHUTTING_DOWN);
             this.queue.close();
             this.cancelAllQueued(ComputeCancelledException.Reason.SHUTDOWN);
+            final DispatcherImpl pendingDispatcher = this.dispatcher;
+            if (pendingDispatcher != null) {
+                // carried entries have not started either; make sure they are cancelled even if their
+                // worker never asks for work again
+                pendingDispatcher.cancelAllCarried(ComputeCancelledException.Reason.SHUTDOWN);
+            }
             final DynamicWorkerPool currentPool = this.pool;
             if (currentPool == null) {
                 this.state.set(AsyncComputeScheduler.SchedulerState.TERMINATED);
@@ -762,12 +871,9 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
                 final long deadline = System.nanoTime() + graceNanos;
                 final long graceLeft = Math.max(0L, deadline - System.nanoTime());
                 if (!currentPool.awaitTermination(Duration.ofNanos(graceLeft))) {
-                    // running tasks are never interrupted, so the grace period is an upper bound on
-                    // waiting for them, not a way to kill them; keep waiting in slices.
-                    boolean stopped = currentPool.awaitTermination(SHUTDOWN_POLL);
-                    while (!stopped) {
-                        stopped = currentPool.awaitTermination(SHUTDOWN_POLL);
-                    }
+                    // the grace period is over: abandon the running bodies instead of blocking
+                    // shutdown forever; they are never interrupted and complete after termination
+                    this.logAbandonedTasks();
                 }
             }
             // safety net: nothing may remain outside the queue after the workers stopped
@@ -778,16 +884,41 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             }
             final MetricsCollector collector = this.metricsCollector;
             if (collector != null) {
+                // stops the sampler; hooks stay valid so an abandoned task can still finish its
+                // counters when its body returns
                 collector.close();
             }
             this.quota.reset();
         } catch (InterruptedException _) {
             Thread.currentThread().interrupt();
-            LOG.log(System.Logger.Level.WARNING, "compute shutdown was interrupted");
+            LOG.log(System.Logger.Level.WARNING, "compute shutdown was interrupted while waiting for the grace period");
         } finally {
             this.state.set(AsyncComputeScheduler.SchedulerState.TERMINATED);
             this.terminated.countDown();
         }
+    }
+
+    /**
+     * Logs the tasks that are still running when the grace period expires.
+     *
+     * <p>They are not cancelled: the worker keeps executing the body and the handle is completed
+     * normally when it returns, even though the scheduler is already terminated.
+     */
+    private void logAbandonedTasks() {
+        final Map<String, Integer> perConsumer = new HashMap<>();
+        int total = 0;
+        for (final TaskHandle<?> handle : this.handles.values()) {
+            if (handle.state() == ComputeTaskHandle.State.RUNNING) {
+                perConsumer.merge(handle.consumerId(), 1, Integer::sum);
+                total++;
+            }
+        }
+        if (total == 0) {
+            return;
+        }
+        LOG.log(System.Logger.Level.WARNING,
+            "compute scheduler terminated with " + total + " task(s) still running after the grace period; "
+                + "they are not interrupted and their futures complete after termination: " + perConsumer);
     }
 
     private void stopJanitor() {

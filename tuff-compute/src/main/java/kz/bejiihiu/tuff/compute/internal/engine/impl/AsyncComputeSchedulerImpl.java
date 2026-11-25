@@ -131,6 +131,11 @@ public final class AsyncComputeSchedulerImpl implements AsyncComputeScheduler {
     }
 
     @Override
+    public void applyProcessorBudget(final int processors) {
+        this.engine.applyProcessorBudget(processors);
+    }
+
+    @Override
     public boolean awaitTermination(final Duration timeout) throws InterruptedException {
         return this.engine.awaitTermination(timeout);
     }
