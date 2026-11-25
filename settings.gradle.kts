@@ -16,6 +16,7 @@ include("tuff-api")
 include("tuff-server")
 include("tuff-checkstyle")
 include("tuff-compute")
+include("tuff-benchmarks")
 
 gradle.lifecycle.beforeProject {
     val mcVersion = providers.gradleProperty("mcVersion").get().trim()
