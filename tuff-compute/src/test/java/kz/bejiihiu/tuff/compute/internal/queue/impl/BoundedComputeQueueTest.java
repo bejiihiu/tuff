@@ -69,6 +69,8 @@ class BoundedComputeQueueTest {
     void dropOldestEvictsOnlyTheOwnOldestEntry() {
         final BoundedComputeQueue queue = this.queue(8, TestSupport.policy(2, 1.0d, OverflowPolicy.DROP_OLDEST));
         queue.registerConsumer("b", TestSupport.policy(2, 1.0d, OverflowPolicy.DROP_OLDEST));
+        final List<QueueEntry> evictions = new ArrayList<>();
+        queue.setEvictionListener(evictions::add);
 
         final QueueEntry aNormal = this.entry("a", ComputePriority.NORMAL);
         final QueueEntry aHigh = this.entry("a", ComputePriority.HIGH);
@@ -86,6 +88,7 @@ class BoundedComputeQueueTest {
         assertEquals(2, queue.size("a"));
         assertEquals(2, queue.size("b"));
         assertEquals(1L, queue.snapshot().evicted());
+        assertEquals(List.of(aNormal), evictions);
 
         final List<QueueEntry> remaining = new ArrayList<>();
         assertEquals(4, queue.drainTo(remaining, 10));
@@ -98,6 +101,8 @@ class BoundedComputeQueueTest {
     void dropOldestAtGlobalCapacityEvictsOnlyItsOwnEntry() {
         final BoundedComputeQueue queue = this.queue(2, TestSupport.policy(-1, 1.0d, OverflowPolicy.REJECT));
         queue.registerConsumer("b", TestSupport.policy(-1, 1.0d, OverflowPolicy.DROP_OLDEST));
+        final List<QueueEntry> evictions = new ArrayList<>();
+        queue.setEvictionListener(evictions::add);
 
         final QueueEntry a = this.entry("a", ComputePriority.NORMAL);
         final QueueEntry bOld = this.entry("b", ComputePriority.NORMAL);
@@ -111,6 +116,7 @@ class BoundedComputeQueueTest {
         assertEquals(1, queue.size("a"));
         assertEquals(1, queue.size("b"));
         assertEquals(1L, queue.snapshot().evicted());
+        assertEquals(List.of(bOld), evictions);
 
         assertEquals(a, queue.poll(admitted -> true));
         assertEquals(bNew, queue.poll(admitted -> true));
@@ -121,12 +127,15 @@ class BoundedComputeQueueTest {
     void dropOldestWithoutOwnEntryIsRejected() {
         final BoundedComputeQueue queue = this.queue(1, TestSupport.policy(-1, 1.0d, OverflowPolicy.DROP_OLDEST));
         queue.registerConsumer("b", TestSupport.policy(-1, 1.0d, OverflowPolicy.DROP_OLDEST));
+        final List<QueueEntry> evictions = new ArrayList<>();
+        queue.setEvictionListener(evictions::add);
 
         assertEquals(OfferResult.ACCEPTED, queue.offer(this.entry("a", ComputePriority.NORMAL)));
         assertEquals(OfferResult.QUEUE_FULL, queue.offer(this.entry("b", ComputePriority.NORMAL)));
         assertEquals(1, queue.size());
         assertEquals(0, queue.size("b"));
         assertEquals(1L, queue.snapshot().rejectedQueueFull());
+        assertTrue(evictions.isEmpty());
     }
 
     @Test
@@ -206,11 +215,14 @@ class BoundedComputeQueueTest {
     @Test
     void clearRemovesEverythingWithoutResettingLifetimeCounters() {
         final BoundedComputeQueue queue = this.queue(8, TestSupport.policy(-1, 1.0d, OverflowPolicy.REJECT));
-        queue.offer(this.entry("a", ComputePriority.NORMAL));
-        queue.offer(this.entry("b", ComputePriority.HIGH));
+        final QueueEntry aNormal = this.entry("a", ComputePriority.NORMAL);
+        final QueueEntry bHigh = this.entry("b", ComputePriority.HIGH);
+        queue.offer(aNormal);
+        queue.offer(bHigh);
 
-        queue.clear();
+        final Collection<QueueEntry> cleared = queue.clear();
 
+        assertEquals(List.of(bHigh, aNormal), List.copyOf(cleared));
         assertTrue(queue.isEmpty());
         assertEquals(0, queue.size());
         assertNull(queue.poll(admitted -> true));
@@ -219,6 +231,7 @@ class BoundedComputeQueueTest {
         assertTrue(snapshot.perConsumerSize().isEmpty());
         assertEquals(2L, snapshot.accepted());
         assertEquals(0L, snapshot.oldestWaitNanos());
+        assertTrue(queue.clear().isEmpty());
     }
 
     @Test

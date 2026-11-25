@@ -1,5 +1,6 @@
 package kz.bejiihiu.tuff.compute.internal.queue.impl;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -12,6 +13,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import kz.bejiihiu.tuff.compute.ComputePriority;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
+import kz.bejiihiu.tuff.compute.OverflowPolicy;
 import kz.bejiihiu.tuff.compute.internal.queue.ComputeQueue.OfferResult;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
@@ -256,6 +258,182 @@ class BoundedComputeQueueConcurrencyTest {
         assertNotNull(queue.snapshot().perConsumerSize());
     }
 
+    @Test
+    @Timeout(180)
+    void dropOldestReportsEveryEvictionExactlyOnce() throws Exception {
+        final int producers = 8;
+        final int perProducer = 2_000;
+        final int total = producers * perProducer;
+        final BoundedComputeQueue queue = new BoundedComputeQueue(
+            64,
+            TestSupport.scheduling(ComputeSettings.Scheduling.Strategy.WEIGHTED_FAIR, false, 1, false),
+            TestSupport.policy(32, 1.0d, OverflowPolicy.DROP_OLDEST),
+            ComputeClock.system()
+        );
+        final AtomicIntegerArray seen = new AtomicIntegerArray(total);
+        final AtomicInteger callbacks = new AtomicInteger();
+        final AtomicInteger producersLeft = new AtomicInteger(producers);
+        final CyclicBarrier start = new CyclicBarrier(producers + 2);
+        final List<Thread> workers = new ArrayList<>();
+        queue.setEvictionListener(evicted -> {
+            seen.incrementAndGet((int) evicted.taskId());
+            callbacks.incrementAndGet();
+        });
+
+        for (int producer = 0; producer < producers; producer++) {
+            final int producerIndex = producer;
+            final Thread thread = daemon("evict-producer-" + producer, () -> {
+                await(start);
+                for (int index = 0; index < perProducer; index++) {
+                    final long taskId = (long) producerIndex * perProducer + index;
+                    offerUntilAccepted(queue, newEntry(taskId, "c0"));
+                }
+                producersLeft.decrementAndGet();
+            });
+            workers.add(thread);
+            thread.start();
+        }
+        for (int consumer = 0; consumer < 2; consumer++) {
+            final Thread thread = daemon("evict-consumer-" + consumer, () -> {
+                await(start);
+                while (true) {
+                    final QueueEntry entry = queue.poll(consumerId -> true);
+                    if (entry != null) {
+                        seen.incrementAndGet((int) entry.taskId());
+                        continue;
+                    }
+                    if (producersLeft.get() == 0 && queue.isEmpty()) {
+                        break;
+                    }
+                    Thread.onSpinWait();
+                }
+            });
+            workers.add(thread);
+            thread.start();
+        }
+
+        joinAll(workers);
+
+        assertEquals(total, countSeen(seen, total));
+        for (int index = 0; index < total; index++) {
+            assertEquals(1, seen.get(index), "task " + index + " was delivered " + seen.get(index) + " times");
+        }
+        assertEquals(queue.snapshot().evicted(), callbacks.get());
+        assertEquals(total, queue.snapshot().accepted());
+        assertTrue(queue.isEmpty());
+    }
+
+    @Test
+    @Timeout(180)
+    void expirySweepRacesWithPollAndRemove() throws Exception {
+        final int producers = 4;
+        final int perProducer = 3_000;
+        final int total = producers * perProducer;
+        final long staleStamp = System.nanoTime() - Duration.ofHours(1).toNanos();
+        final BoundedComputeQueue queue = new BoundedComputeQueue(
+            4096,
+            TestSupport.scheduling(ComputeSettings.Scheduling.Strategy.WEIGHTED_FAIR, false, 1, false),
+            TestSupport.policy(-1, 1.0d, OverflowPolicy.REJECT, Duration.ofSeconds(1)),
+            ComputeClock.system()
+        );
+        final AtomicIntegerArray seen = new AtomicIntegerArray(total);
+        final AtomicInteger evictionCallbacks = new AtomicInteger();
+        final AtomicInteger producersLeft = new AtomicInteger(producers);
+        final CyclicBarrier start = new CyclicBarrier(producers + 3);
+        final ConcurrentLinkedQueue<QueueEntry> cancellable = new ConcurrentLinkedQueue<>();
+        final List<Thread> workers = new ArrayList<>();
+        queue.setEvictionListener(evicted -> evictionCallbacks.incrementAndGet());
+
+        for (int producer = 0; producer < producers; producer++) {
+            final int producerIndex = producer;
+            final Thread thread = daemon("expiry-producer-" + producer, () -> {
+                await(start);
+                for (int index = 0; index < perProducer; index++) {
+                    final long taskId = (long) producerIndex * perProducer + index;
+                    final QueueEntry entry = TestSupport.entry(
+                        taskId,
+                        "c0",
+                        ComputePriority.values()[(int) (taskId % 4)],
+                        taskId,
+                        staleStamp
+                    );
+                    offerUntilAccepted(queue, entry);
+                    cancellable.add(entry);
+                }
+                producersLeft.decrementAndGet();
+            });
+            workers.add(thread);
+            thread.start();
+        }
+
+        final Thread poller = daemon("expiry-poller", () -> {
+            await(start);
+            while (true) {
+                final QueueEntry entry = queue.poll(consumerId -> true);
+                if (entry != null) {
+                    seen.incrementAndGet((int) entry.taskId());
+                    continue;
+                }
+                if (producersLeft.get() == 0 && queue.isEmpty()) {
+                    break;
+                }
+                Thread.onSpinWait();
+            }
+        });
+        workers.add(poller);
+        poller.start();
+
+        final Thread janitor = daemon("expiry-janitor", () -> {
+            await(start);
+            final List<QueueEntry> batch = new ArrayList<>();
+            while (true) {
+                final long now = System.nanoTime();
+                if (queue.hasExpired(now)) {
+                    batch.clear();
+                    queue.drainExpired(now, batch);
+                    for (final QueueEntry entry : batch) {
+                        seen.incrementAndGet((int) entry.taskId());
+                    }
+                }
+                if (producersLeft.get() == 0 && queue.isEmpty()) {
+                    break;
+                }
+                Thread.onSpinWait();
+            }
+        });
+        workers.add(janitor);
+        janitor.start();
+
+        final Thread remover = daemon("expiry-remover", () -> {
+            await(start);
+            while (true) {
+                final QueueEntry candidate = cancellable.poll();
+                if (candidate != null) {
+                    if (queue.remove(candidate)) {
+                        seen.incrementAndGet((int) candidate.taskId());
+                    }
+                    continue;
+                }
+                if (producersLeft.get() == 0 && queue.isEmpty()) {
+                    break;
+                }
+                Thread.onSpinWait();
+            }
+        });
+        workers.add(remover);
+        remover.start();
+
+        joinAll(workers);
+
+        assertEquals(total, countSeen(seen, total));
+        for (int index = 0; index < total; index++) {
+            assertEquals(1, seen.get(index), "task " + index + " was delivered " + seen.get(index) + " times");
+        }
+        assertEquals(total, queue.snapshot().accepted());
+        assertEquals(0, evictionCallbacks.get());
+        assertTrue(queue.isEmpty());
+    }
+
     /**
      * Creates an entry whose consumer and priority vary with the task id.
      *
@@ -263,9 +441,20 @@ class BoundedComputeQueueConcurrencyTest {
      * @return the entry
      */
     private static QueueEntry newEntry(final long taskId) {
+        return newEntry(taskId, "c" + (taskId % 4));
+    }
+
+    /**
+     * Creates an entry for one consumer at the current clock reading.
+     *
+     * @param taskId     globally unique task id
+     * @param consumerId consumer of the entry
+     * @return the entry
+     */
+    private static QueueEntry newEntry(final long taskId, final String consumerId) {
         return TestSupport.entry(
             taskId,
-            "c" + (taskId % 4),
+            consumerId,
             PRIORITIES[(int) (taskId % PRIORITIES.length)],
             taskId,
             System.nanoTime()

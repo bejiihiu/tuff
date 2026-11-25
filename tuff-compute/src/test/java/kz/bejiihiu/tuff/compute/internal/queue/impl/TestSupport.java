@@ -57,13 +57,31 @@ final class TestSupport {
      * @return the policy
      */
     static ConsumerPolicy policy(final int maxQueuedTasks, final double weight, final OverflowPolicy overflow) {
+        return policy(maxQueuedTasks, weight, overflow, Duration.ZERO);
+    }
+
+    /**
+     * Creates a consumer policy with an explicit queue wait limit.
+     *
+     * @param maxQueuedTasks per consumer bound, or {@code -1}
+     * @param weight         fair share weight
+     * @param overflow       overflow policy
+     * @param maxQueueWait   queue wait limit, {@link Duration#ZERO} to disable expiry
+     * @return the policy
+     */
+    static ConsumerPolicy policy(
+        final int maxQueuedTasks,
+        final double weight,
+        final OverflowPolicy overflow,
+        final Duration maxQueueWait
+    ) {
         return new ConsumerPolicy(
             true,
             ConsumerPolicy.ConcurrencyLimit.automatic(),
             maxQueuedTasks,
             weight,
             overflow,
-            Duration.ZERO
+            maxQueueWait
         );
     }
 

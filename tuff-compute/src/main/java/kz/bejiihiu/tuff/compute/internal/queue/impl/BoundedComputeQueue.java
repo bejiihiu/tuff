@@ -52,6 +52,14 @@ import org.jspecify.annotations.Nullable;
  * timestamp grow with the submission order; a nanosecond scale inversion around an aging boundary can
  * only move one entry by one level, and the sequence tie break keeps the result deterministic.
  *
+ * <p>Nothing leaves the queue unnoticed. Every path that removes an entry hands it back to the
+ * scheduler: {@link #poll(ConsumerAdmission)} and {@link #steal(int, ConsumerAdmission)} return it,
+ * {@link #remove(QueueEntry)} reports it, {@link #drainTo(Collection, int)},
+ * {@link #drainExpired(long, Collection)}, {@link #clear()} and {@link #unregisterConsumer(String)}
+ * return collections, and a {@link OverflowPolicy#DROP_OLDEST} eviction reports the entry to the
+ * installed {@link EvictionListener} on the offering thread before {@code offer} returns. The queue
+ * never completes a handle, because only the scheduler owns the futures.
+ *
  * <p>The hot path takes no locks. Producers and consumers only use compare and set on counters,
  * {@link java.util.concurrent.ConcurrentSkipListMap} operations and a volatile snapshot of the
  * consumer array; the only mutex is a short one for consumer registration and removal, which is
@@ -137,6 +145,12 @@ public final class BoundedComputeQueue implements ComputeQueue {
     private final LongAdder rejectedConsumerFull = new LongAdder();
     private final LongAdder evicted = new LongAdder();
     private final AtomicBoolean rebasing = new AtomicBoolean();
+
+    /**
+     * Sink for DROP_OLDEST evictions. Volatile because the engine installs it at startup and tests
+     * replace it; the offer path reads it once per overflow.
+     */
+    private volatile @Nullable EvictionListener evictionListener;
 
     private volatile boolean closed;
 
@@ -241,6 +255,11 @@ public final class BoundedComputeQueue implements ComputeQueue {
             this.accepted.increment();
             return OfferResult.ACCEPTED;
         }
+    }
+
+    @Override
+    public void setEvictionListener(final EvictionListener listener) {
+        this.evictionListener = Objects.requireNonNull(listener, "listener");
     }
 
     @Override
@@ -361,19 +380,85 @@ public final class BoundedComputeQueue implements ComputeQueue {
     }
 
     @Override
-    public void clear() {
+    public boolean hasExpired(final long nowNanos) {
         for (final ConsumerState state : this.streams) {
-            while (true) {
-                final Node candidate = this.nextFrom(state, this.clock.nanoTime());
-                if (candidate == null) {
-                    break;
-                }
-                if (!candidate.claim()) {
-                    continue;
-                }
-                this.unlink(candidate);
+            if (state.queued.get() == 0) {
+                continue;
+            }
+            final ConsumerPolicy policy = state.policy;
+            if (policy.maxQueueWait().isZero()) {
+                continue;
+            }
+            final Node oldest = this.oldestHead(state);
+            if (oldest != null && isExpired(oldest, nowNanos, toNanosSaturated(policy.maxQueueWait()))) {
+                return true;
             }
         }
+        return false;
+    }
+
+    @Override
+    public int drainExpired(final long nowNanos, final Collection<? super QueueEntry> target) {
+        Objects.requireNonNull(target, "target");
+        final ConsumerState[] snapshot = this.streams;
+        final List<Node> expired = new ArrayList<>();
+        for (final ConsumerState state : snapshot) {
+            if (state.queued.get() == 0) {
+                continue;
+            }
+            final ConsumerPolicy policy = state.policy;
+            if (policy.maxQueueWait().isZero()) {
+                continue;
+            }
+            final long limitNanos = toNanosSaturated(policy.maxQueueWait());
+            for (int level = 0; level < LEVELS; level++) {
+                final ConcurrentSkipListMap<Node, Node> bucket = state.bucket(level);
+                Node node = bucket.ceilingKey(LOOKUP_MIN);
+                // every bucket is ordered by sequence and the clock advances with the sequence, so
+                // the expired entries are a prefix: stop at the first one that is still alive. the
+                // walk costs one extra look per bucket, not one per queued entry.
+                while (node != null && isExpired(node, nowNanos, limitNanos)) {
+                    expired.add(node);
+                    node = bucket.higherKey(node);
+                }
+            }
+        }
+        if (expired.isEmpty()) {
+            return 0;
+        }
+        expired.sort((left, right) -> this.compareDispatchOrder(left, right, nowNanos));
+        int moved = 0;
+        for (final Node node : expired) {
+            if (!node.claim()) {
+                // a worker or a cancel got it first; it is accounted for there, never twice here
+                continue;
+            }
+            this.unlink(node);
+            target.add(node.entry());
+            moved++;
+        }
+        return moved;
+    }
+
+    @Override
+    public Collection<QueueEntry> clear() {
+        final List<QueueEntry> removed = new ArrayList<>(this.queued.get());
+        while (true) {
+            final long now = this.clock.nanoTime();
+            final Node candidate = this.select(ALWAYS_ADMIT, now);
+            if (candidate == null) {
+                break;
+            }
+            if (!candidate.claim()) {
+                continue;
+            }
+            this.unlink(candidate);
+            // clear is the bulk form of poll, so it follows the same dispatch order, which includes
+            // charging the fairness turn of the consumer it just took an entry from.
+            this.charge(candidate.owner);
+            removed.add(candidate.entry());
+        }
+        return removed;
     }
 
     @Override
@@ -502,14 +587,33 @@ public final class BoundedComputeQueue implements ComputeQueue {
      * @param refusal result to report if nothing can be evicted
      * @return {@code null} if an entry was evicted and the offer can be retried, otherwise the
      *     refusal result, already counted
+     * @throws IllegalStateException if {@link OverflowPolicy#DROP_OLDEST} needs to evict an entry but
+     *     no eviction listener is installed
      */
     private @Nullable OfferResult handleOverflow(
         final ConsumerState state,
         final ConsumerPolicy policy,
         final OfferResult refusal
     ) {
-        if (policy.overflowPolicy() == OverflowPolicy.DROP_OLDEST && this.evictOldest(state)) {
-            return null;
+        if (policy.overflowPolicy() == OverflowPolicy.DROP_OLDEST) {
+            final EvictionListener listener = this.evictionListener;
+            if (listener == null) {
+                if (this.oldestHead(state) != null) {
+                    // dropping the entry without reporting it would leave its future pending forever.
+                    throw new IllegalStateException(
+                        "consumer " + state.id + " uses DROP_OLDEST but no eviction listener is installed"
+                    );
+                }
+            } else {
+                final QueueEntry evictedEntry = this.evictOldest(state);
+                if (evictedEntry != null) {
+                    // the node is already unlinked and both depth counters are updated, so the
+                    // listener can inspect the queue; it runs on this thread, before the offer
+                    // returns, and outside every lock.
+                    listener.onEvicted(evictedEntry);
+                    return null;
+                }
+            }
         }
         if (refusal == OfferResult.CONSUMER_QUEUE_FULL) {
             this.rejectedConsumerFull.increment();
@@ -522,14 +626,17 @@ public final class BoundedComputeQueue implements ComputeQueue {
     /**
      * Evicts the oldest queued entry of one consumer.
      *
+     * <p>Claiming the node is atomic, so two concurrent offers can never evict and report the same
+     * entry; the loser recomputes the head and either evicts another entry or finds nothing left.
+     *
      * @param state consumer to evict from
-     * @return {@code true} if an entry was evicted
+     * @return the evicted entry, already unlinked, or {@code null} if the stream is empty
      */
-    private boolean evictOldest(final ConsumerState state) {
+    private @Nullable QueueEntry evictOldest(final ConsumerState state) {
         while (true) {
             final Node oldest = this.oldestHead(state);
             if (oldest == null) {
-                return false;
+                return null;
             }
             if (!oldest.claim()) {
                 // somebody else took it; every failed claim means the stream shrank
@@ -537,7 +644,7 @@ public final class BoundedComputeQueue implements ComputeQueue {
             }
             this.unlink(oldest);
             this.evicted.increment();
-            return true;
+            return oldest.entry();
         }
     }
 
@@ -697,6 +804,44 @@ public final class BoundedComputeQueue implements ComputeQueue {
         final long steps = Math.min(waited / this.agingIntervalNanos, this.maxAgingBoost);
         final long boosted = base + steps;
         return (int) Math.min(ComputePriority.CRITICAL.level(), boosted);
+    }
+
+    /**
+     * Checks whether an entry outlived a queue wait limit.
+     *
+     * @param node       queued node
+     * @param nowNanos   current clock reading
+     * @param limitNanos wait limit in nanoseconds, strictly positive
+     * @return {@code true} when the entry reached or passed the limit
+     */
+    private static boolean isExpired(final Node node, final long nowNanos, final long limitNanos) {
+        return nowNanos - node.submittedAtNanos() >= limitNanos;
+    }
+
+    /**
+     * Orders two nodes the way a sweep hands them back: highest effective priority, then least served
+     * consumer, then submission order.
+     *
+     * <p>Expiry is not a dispatch, so this never charges virtual service time; it only reads it to
+     * keep the order consistent with the queue's own ordering inputs.
+     *
+     * @param left     first node
+     * @param right    second node
+     * @param nowNanos instant used to compute aging
+     * @return negative when {@code left} comes first
+     */
+    private int compareDispatchOrder(final Node left, final Node right, final long nowNanos) {
+        final int leftLevel = this.effectiveLevel(left, nowNanos);
+        final int rightLevel = this.effectiveLevel(right, nowNanos);
+        if (leftLevel != rightLevel) {
+            return Integer.compare(rightLevel, leftLevel);
+        }
+        final long leftService = left.owner().virtualService.get();
+        final long rightService = right.owner().virtualService.get();
+        if (leftService != rightService) {
+            return Long.compare(leftService, rightService);
+        }
+        return Long.compare(left.sequence, right.sequence);
     }
 
     /**
