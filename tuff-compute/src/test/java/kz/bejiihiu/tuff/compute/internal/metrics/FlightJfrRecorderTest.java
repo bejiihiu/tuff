@@ -31,7 +31,6 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class FlightJfrRecorderTest {
@@ -188,7 +187,6 @@ class FlightJfrRecorderTest {
 
     private static RecordedEvent single(final List<RecordedEvent> events, final String name) {
         final RecordedEvent event = first(events, name);
-        assertNotNull(event, name);
         final long count = events.stream().filter(candidate -> name.equals(candidate.getEventType().getName())).count();
         assertEquals(1L, count, name);
         return event;
