@@ -18,8 +18,5 @@ build
 
 .idea/
 
-# local scratch dir, never part of the repo
-notes/
-
 # jvm crash dumps
 *.hprof
