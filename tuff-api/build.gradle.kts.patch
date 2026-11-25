@@ -19,6 +19,9 @@
      // checkstyle
 -    checkstyle(project(":paper-checkstyle"))
 +    checkstyle(project(":tuff-checkstyle"))
++
++    // tuff modules
++    api(project(":tuff-compute"))
  }
  
 -val generatedDir: java.nio.file.Path = layout.projectDirectory.dir("src/generated/java").asFile.toPath()
