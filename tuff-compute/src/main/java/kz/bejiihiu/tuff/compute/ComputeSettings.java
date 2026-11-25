@@ -25,6 +25,7 @@ import java.util.Objects;
  * @param consumers            default consumer limits and per consumer overrides
  * @param metrics              metrics and profiling options
  * @param adaptive             adaptive concurrency options
+ * @param lanes                execution lane options (platform workers and virtual threads)
  * @param shutdownGracePeriod  how long a graceful shutdown waits for running tasks before it stops
  *                             claiming new work; queued tasks that did not start are cancelled
  */
@@ -36,6 +37,7 @@ public record ComputeSettings(
     Consumers consumers,
     Metrics metrics,
     Adaptive adaptive,
+    Lanes lanes,
     Duration shutdownGracePeriod
 ) {
 
@@ -52,10 +54,39 @@ public record ComputeSettings(
         Objects.requireNonNull(consumers, "consumers");
         Objects.requireNonNull(metrics, "metrics");
         Objects.requireNonNull(adaptive, "adaptive");
+        Objects.requireNonNull(lanes, "lanes");
         Objects.requireNonNull(shutdownGracePeriod, "shutdownGracePeriod");
         if (shutdownGracePeriod.isNegative()) {
             throw new IllegalArgumentException("shutdownGracePeriod must not be negative, got " + shutdownGracePeriod);
         }
+    }
+
+    /**
+     * Creates settings with the default execution lanes.
+     *
+     * <p>Kept so code that predates the lane model keeps compiling: it is equivalent to the full
+     * constructor with {@link Lanes#defaults()}.
+     *
+     * @param enabled             whether the scheduler runs at all
+     * @param workers             worker pool sizing
+     * @param queue               queue sizing
+     * @param scheduling          dispatch strategy
+     * @param consumers           consumer policies
+     * @param metrics             metrics options
+     * @param adaptive            adaptive concurrency options
+     * @param shutdownGracePeriod shutdown grace period
+     */
+    public ComputeSettings(
+        final boolean enabled,
+        final Workers workers,
+        final QueueSettings queue,
+        final Scheduling scheduling,
+        final Consumers consumers,
+        final Metrics metrics,
+        final Adaptive adaptive,
+        final Duration shutdownGracePeriod
+    ) {
+        this(enabled, workers, queue, scheduling, consumers, metrics, adaptive, Lanes.defaults(), shutdownGracePeriod);
     }
 
     /**
@@ -72,6 +103,7 @@ public record ComputeSettings(
             Consumers.defaults(),
             Metrics.defaults(),
             Adaptive.defaults(),
+            Lanes.defaults(),
             Duration.ofSeconds(30)
         );
     }
@@ -490,6 +522,144 @@ public record ComputeSettings(
          */
         public static Adaptive defaults() {
             return new Adaptive(false, 1, -1, Duration.ofSeconds(5), 20, 0.1d, 0.5d, 0.9d);
+        }
+    }
+
+    /**
+     * Execution lane options.
+     *
+     * <p>A task runs on one of two lanes. The <b>platform lane</b> is the fixed pool of platform
+     * workers described by {@link Workers}. The <b>virtual lane</b> runs work on
+     * {@link Thread#ofVirtual() virtual threads} and has its own hard limit of concurrent tasks.
+     *
+     * <p>The lane a task uses is decided by its priority:
+     * <ul>
+     *     <li>{@link ComputePriority#LOW} always runs on the virtual lane, and never occupies a
+     *     platform worker;</li>
+     *     <li>{@link ComputePriority#NORMAL} runs on the platform lane and may spill to the virtual
+     *     lane only while the pool is saturated and the spill thresholds are met;</li>
+     *     <li>{@link ComputePriority#HIGH} and {@link ComputePriority#CRITICAL} never spill.</li>
+     * </ul>
+     *
+     * <p>Virtual threads add no CPU parallelism. The lane exists for blocking or IO bound work and
+     * as a deadlock breaker; it never changes the platform pool size, the processor budget or the
+     * adaptive concurrency limit.
+     *
+     * @param virtual virtual lane options
+     */
+    public record Lanes(Virtual virtual) {
+
+        /**
+         * Validates the lane tree.
+         *
+         * @throws NullPointerException if {@code virtual} is {@code null}
+         */
+        public Lanes {
+            Objects.requireNonNull(virtual, "virtual");
+        }
+
+        /**
+         * Returns the default lanes: the virtual lane is enabled.
+         *
+         * @return the default lanes
+         */
+        public static Lanes defaults() {
+            return new Lanes(Virtual.defaults());
+        }
+
+        /**
+         * Returns lanes with the virtual lane turned off.
+         *
+         * <p>LOW tasks then fall back to the platform lane, which is the pre-lane behaviour.
+         *
+         * @return lanes without a virtual lane
+         */
+        public static Lanes withoutVirtual() {
+            return new Lanes(Virtual.withoutVirtual());
+        }
+
+        /**
+         * Virtual lane options.
+         *
+         * @param enabled         whether the virtual lane exists at all; when off, LOW work falls back
+         *                        to the platform lane
+         * @param lowPriority     whether {@link ComputePriority#LOW} tasks are routed to the virtual
+         *                        lane; when off, LOW work falls back to the platform lane
+         * @param normalSpill     whether saturated {@link ComputePriority#NORMAL} work may spill to the
+         *                        virtual lane
+         * @param maxConcurrent   hard limit of virtual tasks executing at the same time, at least
+         *                        {@code 1}
+         * @param spillWait       how long a NORMAL task must have waited before it becomes eligible to
+         *                        spill, not negative
+         * @param spillQueueDepth NORMAL queue depth at which spill becomes eligible regardless of the
+         *                        wait, not negative; {@code 0} disables the depth trigger
+         */
+        public record Virtual(
+            boolean enabled,
+            boolean lowPriority,
+            boolean normalSpill,
+            int maxConcurrent,
+            Duration spillWait,
+            int spillQueueDepth
+        ) {
+
+            /**
+             * Validates the virtual lane options.
+             *
+             * @throws NullPointerException     if {@code spillWait} is {@code null}
+             * @throws IllegalArgumentException if the limit is not positive, a duration is negative or
+             *     the queue depth is negative
+             */
+            public Virtual {
+                Objects.requireNonNull(spillWait, "spillWait");
+                if (maxConcurrent < 1) {
+                    throw new IllegalArgumentException("maxConcurrent must be at least 1, got " + maxConcurrent);
+                }
+                if (spillWait.isNegative()) {
+                    throw new IllegalArgumentException("spillWait must not be negative, got " + spillWait);
+                }
+                if (spillQueueDepth < 0) {
+                    throw new IllegalArgumentException("spillQueueDepth must not be negative, got " + spillQueueDepth);
+                }
+            }
+
+            /**
+             * Returns the default virtual lane: enabled, LOW routed to it, NORMAL may spill, sixty
+             * four concurrent tasks, fifty millisecond spill wait and a sixty four deep NORMAL queue
+             * trigger.
+             *
+             * @return the default virtual lane
+             */
+            public static Virtual defaults() {
+                return new Virtual(true, true, true, 64, Duration.ofMillis(50L), 64);
+            }
+
+            /**
+             * Returns a virtual lane that is switched off.
+             *
+             * @return the lane options in their disabled shape
+             */
+            public static Virtual withoutVirtual() {
+                return new Virtual(false, false, false, 1, Duration.ZERO, 0);
+            }
+
+            /**
+             * Checks whether the lane is allowed to take {@link ComputePriority#LOW} work.
+             *
+             * @return {@code true} when the lane exists and routes LOW tasks
+             */
+            public boolean servesLow() {
+                return this.enabled && this.lowPriority;
+            }
+
+            /**
+             * Checks whether NORMAL work may spill onto the lane.
+             *
+             * @return {@code true} when the lane exists and spilling is enabled
+             */
+            public boolean allowsSpill() {
+                return this.enabled && this.normalSpill;
+            }
         }
     }
 }

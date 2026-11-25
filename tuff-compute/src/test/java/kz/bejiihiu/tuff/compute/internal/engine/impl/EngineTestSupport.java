@@ -197,6 +197,7 @@ final class EngineTestSupport {
             Duration.ofMillis(20)
         );
         private ComputeSettings.Adaptive adaptive = ComputeSettings.Adaptive.defaults();
+        private ComputeSettings.Lanes lanes = ComputeSettings.Lanes.defaults();
         private Duration grace = Duration.ofSeconds(3);
 
         private SettingsBuilder() {
@@ -261,6 +262,29 @@ final class EngineTestSupport {
             return this;
         }
 
+        SettingsBuilder lanes(final ComputeSettings.Lanes value) {
+            this.lanes = value;
+            return this;
+        }
+
+        SettingsBuilder virtualLane(
+            final boolean lowPriority,
+            final boolean normalSpill,
+            final int maxConcurrent,
+            final Duration spillWait,
+            final int spillQueueDepth
+        ) {
+            this.lanes = new ComputeSettings.Lanes(
+                new ComputeSettings.Lanes.Virtual(true, lowPriority, normalSpill, maxConcurrent, spillWait, spillQueueDepth)
+            );
+            return this;
+        }
+
+        SettingsBuilder noVirtualLane() {
+            this.lanes = ComputeSettings.Lanes.withoutVirtual();
+            return this;
+        }
+
         SettingsBuilder grace(final Duration value) {
             this.grace = value;
             return this;
@@ -280,6 +304,7 @@ final class EngineTestSupport {
                 this.consumers,
                 this.metrics,
                 this.adaptive,
+                this.lanes,
                 this.grace
             );
         }

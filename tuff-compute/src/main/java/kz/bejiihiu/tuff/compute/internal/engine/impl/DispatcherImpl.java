@@ -6,6 +6,7 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.function.BooleanSupplier;
 import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.ComputeConsumer;
+import kz.bejiihiu.tuff.compute.ComputePriority;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
@@ -13,6 +14,7 @@ import kz.bejiihiu.tuff.compute.internal.engine.ConsumerRegistry;
 import kz.bejiihiu.tuff.compute.internal.engine.Dispatcher;
 import kz.bejiihiu.tuff.compute.internal.metrics.MetricsCollector;
 import kz.bejiihiu.tuff.compute.internal.queue.ComputeQueue;
+import kz.bejiihiu.tuff.compute.internal.queue.LaneAwareQueue;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.queue.QuotaController;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
@@ -73,21 +75,57 @@ final class DispatcherImpl implements Dispatcher {
     private final AdaptiveSampleSink adaptiveSink;
     private final boolean workStealing;
 
+    /**
+     * Lane-aware view of the queue, or {@code null} for a plain {@link ComputeQueue}. The engine
+     * always installs the lane-aware implementation; the fallback keeps the dispatcher usable with a
+     * queue that only implements the base contract.
+     */
+    private final @Nullable LaneAwareQueue laneQueue;
+
+    /**
+     * Priority levels a platform worker may take.
+     */
+    private final int platformMask;
+
+    /**
+     * LOW bit when the virtual lane owns LOW work, otherwise {@code 0}.
+     */
+    private final int virtualLowMask;
+
+    /**
+     * Whether NORMAL work may spill onto the virtual lane.
+     */
+    private final boolean spillEnabled;
+
+    /**
+     * Carry slot index of the virtual pump, or {@code -1} when there is no virtual lane.
+     */
+    private final int virtualIndex;
+
+    /**
+     * Number of carry slots that belong to platform workers.
+     */
+    private final int platformSlots;
+
     private final AtomicReferenceArray<QueueEntry> carried;
     private final ConcurrentLinkedQueue<QueueEntry> orphans = new ConcurrentLinkedQueue<>();
 
     /**
      * Creates a dispatcher.
      *
-     * @param settings      scheduler settings, used for the work stealing flag
-     * @param queue         the scheduling queue
-     * @param quota         consumer quota controller
-     * @param metrics       metrics collector
-     * @param registry      consumer registry
-     * @param clock         clock used for expiry checks on carried entries
-     * @param accepting     predicate that answers whether the engine still claims new work
-     * @param adaptiveSink  sink fed with every finished task
-     * @param workerCeiling maximum worker index plus one, used to size the carry slots
+     * @param settings        scheduler settings, used for the work stealing flag
+     * @param queue           the scheduling queue
+     * @param quota           consumer quota controller
+     * @param metrics         metrics collector
+     * @param registry        consumer registry
+     * @param clock           clock used for expiry checks on carried entries
+     * @param accepting       predicate that answers whether the engine still claims new work
+     * @param adaptiveSink    sink fed with every finished task
+     * @param workerCeiling   maximum worker index plus one, used to size the carry slots
+     * @param platformMask    priority levels a platform worker may take
+     * @param virtualLowMask  LOW bit when the virtual lane owns LOW work, otherwise {@code 0}
+     * @param spillEnabled    whether NORMAL work may spill onto the virtual lane
+     * @param virtualSlots    carry slots reserved for the virtual pump, {@code 0} without a lane
      */
     DispatcherImpl(
         final ComputeSettings settings,
@@ -98,7 +136,11 @@ final class DispatcherImpl implements Dispatcher {
         final ComputeClock clock,
         final BooleanSupplier accepting,
         final AdaptiveSampleSink adaptiveSink,
-        final int workerCeiling
+        final int workerCeiling,
+        final int platformMask,
+        final int virtualLowMask,
+        final boolean spillEnabled,
+        final int virtualSlots
     ) {
         Preconditions.requireNonNull(settings, "settings");
         this.queue = Preconditions.requireNonNull(queue, "queue");
@@ -109,20 +151,68 @@ final class DispatcherImpl implements Dispatcher {
         this.accepting = Preconditions.requireNonNull(accepting, "accepting");
         this.adaptiveSink = Preconditions.requireNonNull(adaptiveSink, "adaptiveSink");
         this.workStealing = settings.scheduling().workStealing();
-        this.carried = new AtomicReferenceArray<>(Preconditions.checkPositive(workerCeiling, "workerCeiling"));
+        this.laneQueue = queue instanceof LaneAwareQueue aware ? aware : null;
+        this.platformMask = platformMask;
+        this.virtualLowMask = virtualLowMask;
+        this.spillEnabled = spillEnabled;
+        final int ceiling = Preconditions.checkPositive(workerCeiling, "workerCeiling");
+        Preconditions.checkAtLeast(virtualSlots, 0, "virtualSlots");
+        this.virtualIndex = virtualSlots > 0 ? ceiling : -1;
+        this.platformSlots = ceiling;
+        this.carried = new AtomicReferenceArray<>(ceiling + virtualSlots);
     }
 
     @Override
     public @Nullable QueueEntry next(final int workerIndex) {
         Preconditions.checkAtLeast(workerIndex, 0, "workerIndex");
+        return this.claim(workerIndex, LaneAwareQueue.Lane.PLATFORM, this.platformMask);
+    }
+
+    /**
+     * Claims the next entry the virtual lane may run.
+     *
+     * <p>Uses the same carry slot, admission and quota dance as {@link #next(int)}, so a virtual
+     * task holds a consumer quota slot exactly like a platform worker. The lane mask is LOW when the
+     * lane owns LOW work, plus NORMAL when {@code spillOpen} is true.
+     *
+     * @param spillOpen whether NORMAL work is currently allowed to spill onto the virtual lane
+     * @return the claimed entry with its consumer slot already reserved, or {@code null}
+     */
+    @Nullable QueueEntry nextVirtual(final boolean spillOpen) {
+        if (this.virtualIndex < 0) {
+            return null;
+        }
+        int mask = this.virtualLowMask;
+        if (spillOpen && this.spillEnabled) {
+            mask |= 1 << ComputePriority.NORMAL.level();
+        }
+        if (mask == 0) {
+            return null;
+        }
+        return this.claim(this.virtualIndex, LaneAwareQueue.Lane.VIRTUAL, mask);
+    }
+
+    /**
+     * Releases the virtual carry slot when the pump goes away.
+     *
+     * <p>A carried entry has already left the queue, so it moves to the orphan pool where the janitor
+     * and the next lane pump can terminalize or run it.
+     */
+    void workerStoppedVirtual() {
+        if (this.virtualIndex >= 0) {
+            this.workerStopped(this.virtualIndex);
+        }
+    }
+
+    private @Nullable QueueEntry claim(final int index, final LaneAwareQueue.Lane lane, final int levelMask) {
         if (!this.accepting.getAsBoolean()) {
             return null;
         }
-        final QueueEntry carriedEntry = this.carried.getAndSet(workerIndex, null);
+        final QueueEntry carriedEntry = this.carried.getAndSet(index, null);
         if (carriedEntry != null) {
-            return this.tryStart(carriedEntry, workerIndex);
+            return this.tryStart(carriedEntry, index, levelMask);
         }
-        final QueueEntry orphan = this.drainOrphan();
+        final QueueEntry orphan = this.drainOrphan(index, levelMask);
         if (orphan != null) {
             return orphan;
         }
@@ -130,9 +220,9 @@ final class DispatcherImpl implements Dispatcher {
             if (!this.accepting.getAsBoolean()) {
                 return null;
             }
-            QueueEntry entry = this.queue.poll(this.quota);
+            QueueEntry entry = this.poll(lane, levelMask);
             if (entry == null && this.workStealing) {
-                entry = this.queue.steal(workerIndex, this.quota);
+                entry = this.steal(index, lane, levelMask);
             }
             if (entry == null) {
                 return null;
@@ -157,10 +247,20 @@ final class DispatcherImpl implements Dispatcher {
                 return entry;
             }
             // lost the quota race: keep ownership in this worker's carry slot and retry next time
-            this.carry(workerIndex, entry);
+            this.carry(index, entry);
             return null;
         }
         return null;
+    }
+
+    private @Nullable QueueEntry poll(final LaneAwareQueue.Lane lane, final int levelMask) {
+        final LaneAwareQueue aware = this.laneQueue;
+        return aware == null ? this.queue.poll(this.quota) : aware.poll(lane, levelMask, this.quota);
+    }
+
+    private @Nullable QueueEntry steal(final int index, final LaneAwareQueue.Lane lane, final int levelMask) {
+        final LaneAwareQueue aware = this.laneQueue;
+        return aware == null ? this.queue.steal(index, this.quota) : aware.steal(index, lane, levelMask, this.quota);
     }
 
     @Override
@@ -170,11 +270,33 @@ final class DispatcherImpl implements Dispatcher {
         final long executionNanos,
         final @Nullable Throwable failure
     ) {
+        this.taskFinished(entry, queueWaitNanos, executionNanos, failure, true);
+    }
+
+    /**
+     * Completes a task that ran to an end and optionally feeds the adaptive controller.
+     *
+     * <p>Virtual lane tasks call this with {@code feedAdaptive = false}: their execution time is
+     * dominated by blocking and would distort the platform pool's capacity model.
+     *
+     * @param entry          the finished entry
+     * @param queueWaitNanos how long it waited before starting
+     * @param executionNanos how long the task body ran
+     * @param failure        throwable thrown by the task, or {@code null} on success
+     * @param feedAdaptive   whether the sample may influence the adaptive controller
+     */
+    void taskFinished(
+        final QueueEntry entry,
+        final long queueWaitNanos,
+        final long executionNanos,
+        final @Nullable Throwable failure,
+        final boolean feedAdaptive
+    ) {
         final TaskHandle<?> handle = handleOf(entry);
         handle.recordExecution(executionNanos);
         this.quota.release(entry.consumerId());
         if (failure == null) {
-            this.accountSuccess(entry, handle, queueWaitNanos, executionNanos);
+            this.accountSuccess(entry, handle, queueWaitNanos, executionNanos, feedAdaptive);
             return;
         }
         final TaskHandle.Completion outcome = handle.finish(null, failure);
@@ -185,7 +307,7 @@ final class DispatcherImpl implements Dispatcher {
             }
             return;
         }
-        this.accountOutcome(entry, handle, queueWaitNanos, executionNanos, outcome);
+        this.accountOutcome(entry, handle, queueWaitNanos, executionNanos, outcome, feedAdaptive);
     }
 
     /**
@@ -206,10 +328,29 @@ final class DispatcherImpl implements Dispatcher {
         final long executionNanos,
         final TaskHandle.Completion outcome
     ) {
+        this.taskCompleted(entry, queueWaitNanos, executionNanos, outcome, true);
+    }
+
+    /**
+     * Accounts a task whose handle was already completed and optionally feeds the adaptive controller.
+     *
+     * @param entry          finished entry
+     * @param queueWaitNanos how long it waited
+     * @param executionNanos how long the body ran
+     * @param outcome        how the handle ended
+     * @param feedAdaptive   whether the sample may influence the adaptive controller
+     */
+    void taskCompleted(
+        final QueueEntry entry,
+        final long queueWaitNanos,
+        final long executionNanos,
+        final TaskHandle.Completion outcome,
+        final boolean feedAdaptive
+    ) {
         final TaskHandle<?> handle = handleOf(entry);
         handle.recordExecution(executionNanos);
         this.quota.release(entry.consumerId());
-        this.accountOutcome(entry, handle, queueWaitNanos, executionNanos, outcome);
+        this.accountOutcome(entry, handle, queueWaitNanos, executionNanos, outcome, feedAdaptive);
     }
 
     @Override
@@ -356,16 +497,35 @@ final class DispatcherImpl implements Dispatcher {
         return total;
     }
 
+    /**
+     * Returns how many entries platform workers currently carry.
+     *
+     * <p>The virtual carry slot is excluded, so platform autoscaling never reacts to work the pool
+     * cannot run.
+     *
+     * @return platform-owned entries that have not started
+     */
+    int platformCarriedEntries() {
+        int total = 0;
+        for (int index = 0; index < this.platformSlots; index++) {
+            if (this.carried.get(index) != null) {
+                total++;
+            }
+        }
+        return total;
+    }
+
     private void accountSuccess(
         final QueueEntry entry,
         final TaskHandle<?> handle,
         final long queueWaitNanos,
-        final long executionNanos
+        final long executionNanos,
+        final boolean feedAdaptive
     ) {
         final ComputeTaskHandle.State state = handle.state();
         if (state == ComputeTaskHandle.State.COMPLETED) {
             this.emitCompleted(entry, executionNanos);
-            this.emitSample(queueWaitNanos, executionNanos, false);
+            this.emitSample(queueWaitNanos, executionNanos, false, feedAdaptive);
             return;
         }
         if (state == ComputeTaskHandle.State.CANCELLED) {
@@ -382,7 +542,7 @@ final class DispatcherImpl implements Dispatcher {
             }
             return;
         }
-        this.accountOutcome(entry, handle, queueWaitNanos, executionNanos, outcome);
+        this.accountOutcome(entry, handle, queueWaitNanos, executionNanos, outcome, feedAdaptive);
     }
 
     private void accountOutcome(
@@ -390,18 +550,19 @@ final class DispatcherImpl implements Dispatcher {
         final TaskHandle<?> handle,
         final long queueWaitNanos,
         final long executionNanos,
-        final TaskHandle.Completion outcome
+        final TaskHandle.Completion outcome,
+        final boolean feedAdaptive
     ) {
         switch (outcome) {
             case COMPLETED -> {
                 this.emitCompleted(entry, executionNanos);
-                this.emitSample(queueWaitNanos, executionNanos, false);
+                this.emitSample(queueWaitNanos, executionNanos, false, feedAdaptive);
             }
             case FAILED -> {
                 final Throwable failure = handle.failure();
                 this.emitFailed(entry, executionNanos,
                     failure == null ? new IllegalStateException("task failed without a cause") : failure);
-                this.emitSample(queueWaitNanos, executionNanos, true);
+                this.emitSample(queueWaitNanos, executionNanos, true, feedAdaptive);
             }
             case CANCELLED -> this.emitCancelled(entry, handle.cancelReason());
         }
@@ -431,7 +592,15 @@ final class DispatcherImpl implements Dispatcher {
         }
     }
 
-    private void emitSample(final long queueWaitNanos, final long executionNanos, final boolean failed) {
+    private void emitSample(
+        final long queueWaitNanos,
+        final long executionNanos,
+        final boolean failed,
+        final boolean feedAdaptive
+    ) {
+        if (!feedAdaptive) {
+            return;
+        }
         try {
             this.adaptiveSink.onSample(queueWaitNanos, executionNanos, failed);
         } catch (Throwable failure) {
@@ -439,9 +608,15 @@ final class DispatcherImpl implements Dispatcher {
         }
     }
 
-    private @Nullable QueueEntry tryStart(final QueueEntry entry, final int workerIndex) {
+    private @Nullable QueueEntry tryStart(final QueueEntry entry, final int workerIndex, final int levelMask) {
         if (!this.accepting.getAsBoolean()) {
             this.cancelQueued(entry, ComputeCancelledException.Reason.SHUTDOWN);
+            return null;
+        }
+        if (!laneAllows(entry, levelMask)) {
+            // a carried entry never changes priority, so this can only happen after a topology change;
+            // hand it to the lane that owns it instead of running it on the wrong one
+            this.orphans.add(entry);
             return null;
         }
         final TaskHandle<?> handle = handleOf(entry);
@@ -460,7 +635,7 @@ final class DispatcherImpl implements Dispatcher {
         return null;
     }
 
-    private @Nullable QueueEntry drainOrphan() {
+    private @Nullable QueueEntry drainOrphan(final int workerIndex, final int levelMask) {
         for (int remaining = this.orphans.size(); remaining > 0; remaining--) {
             final QueueEntry entry = this.orphans.poll();
             if (entry == null) {
@@ -468,6 +643,11 @@ final class DispatcherImpl implements Dispatcher {
             }
             if (!this.accepting.getAsBoolean()) {
                 this.cancelQueued(entry, ComputeCancelledException.Reason.SHUTDOWN);
+                continue;
+            }
+            if (!laneAllows(entry, levelMask)) {
+                // leave it for the lane that owns its priority; the bounded loop prevents a spin
+                this.orphans.add(entry);
                 continue;
             }
             final TaskHandle<?> handle = handleOf(entry);
@@ -485,6 +665,10 @@ final class DispatcherImpl implements Dispatcher {
             this.orphans.add(entry);
         }
         return null;
+    }
+
+    private static boolean laneAllows(final QueueEntry entry, final int levelMask) {
+        return (levelMask & (1 << entry.priority().level())) != 0;
     }
 
     private void carry(final int workerIndex, final QueueEntry entry) {

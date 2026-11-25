@@ -1,6 +1,7 @@
 package kz.bejiihiu.tuff.compute;
 
 import java.time.Instant;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import org.jspecify.annotations.Nullable;
 
@@ -27,6 +28,19 @@ public interface ComputeTaskHandle<T> {
      * @return the task id, always positive
      */
     long taskId();
+
+    /**
+     * Returns the optional human readable label supplied with the submission.
+     *
+     * <p>The label is diagnostic only: it never participates in scheduling, ordering, quotas or
+     * identity. A handle created by an implementation that predates labels simply reports
+     * {@link Optional#empty()}.
+     *
+     * @return the label, or an empty optional when the submission had none
+     */
+    default Optional<String> label() {
+        return Optional.empty();
+    }
 
     /**
      * Returns the id of the consumer this task was submitted for.

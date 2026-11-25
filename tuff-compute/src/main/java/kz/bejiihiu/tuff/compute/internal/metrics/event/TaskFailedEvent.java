@@ -62,4 +62,10 @@ public final class TaskFailedEvent extends Event {
      */
     @Label("Failure Message")
     public String failureMessage;
+
+    /**
+     * Human readable task label, empty when the submission had none.
+     */
+    @Label("Task Label")
+    public String taskLabel;
 }

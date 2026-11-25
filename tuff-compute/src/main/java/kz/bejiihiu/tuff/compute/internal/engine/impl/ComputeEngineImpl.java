@@ -38,6 +38,7 @@ import kz.bejiihiu.tuff.compute.internal.metrics.impl.FlightJfrRecorder;
 import kz.bejiihiu.tuff.compute.internal.metrics.impl.LatencyStats;
 import kz.bejiihiu.tuff.compute.internal.metrics.impl.SchedulerMetricsSnapshot;
 import kz.bejiihiu.tuff.compute.internal.queue.ComputeQueue;
+import kz.bejiihiu.tuff.compute.internal.queue.LaneAwareQueue;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.queue.QuotaController;
 import kz.bejiihiu.tuff.compute.internal.queue.impl.AtomicQuotaController;
@@ -111,6 +112,12 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
 
     private final ComputeQueue queue;
     private final QuotaController quota;
+
+    /**
+     * Priority levels the platform pool may take. LOW is excluded while the virtual lane owns it, so
+     * platform sizing and adaptive signals are never driven by work the pool cannot run.
+     */
+    private final int platformLevelMask;
     private final ConsumerRegistryImpl registry = new ConsumerRegistryImpl();
     private final Map<Long, TaskHandle<?>> handles = new ConcurrentHashMap<>();
     private final Set<String> unregisteredConsumers = ConcurrentHashMap.newKeySet();
@@ -128,6 +135,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     private volatile @Nullable MetricsCollector metricsCollector;
     private volatile @Nullable DispatcherImpl dispatcher;
     private volatile @Nullable DynamicWorkerPool pool;
+    private volatile @Nullable VirtualLane virtualLane;
     private volatile @Nullable QueueJanitor janitor;
     private volatile @Nullable AdaptiveConcurrencyController adaptive;
     private volatile @Nullable ScheduledExecutorService adaptiveTimer;
@@ -167,6 +175,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         );
         this.budgetCeiling = this.workerCeiling;
         final int initialConcurrency = Math.max(1, settings.workers().resolveThreadCount(processorBudget));
+        this.platformLevelMask = settings.lanes().virtual().servesLow() ? 0b1110 : 0b1111;
         this.queue = new BoundedComputeQueue(settings, clock);
         this.quota = new AtomicQuotaController(initialConcurrency);
         this.queue.setEvictionListener(this::onEvicted);
@@ -383,9 +392,15 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             ? "none"
             : currentPool.workerCount() + "/" + currentPool.desiredWorkers() + " live/desired, limit "
                 + currentPool.concurrencyLimit();
+        final VirtualLane lane = this.virtualLane;
+        final SchedulerMetrics.VirtualLane laneMetrics = lane == null ? null : lane.snapshot().virtual();
+        final String virtual = laneMetrics == null
+            ? "off"
+            : laneMetrics.running() + "/" + laneMetrics.limit();
         return "AsyncComputeScheduler[state=" + this.state.get()
             + ", enabled=" + this.settings.enabled()
             + ", workers=" + workers
+            + ", virtual=" + virtual
             + ", queued=" + this.queue.size() + '/' + this.queue.capacity()
             + ", consumers=" + this.registry.size()
             + ", metrics=" + (collector != null && collector.enabled()) + ']';
@@ -420,6 +435,17 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
      */
     @Nullable AdaptiveConcurrencyController adaptiveController() {
         return this.adaptive;
+    }
+
+    /**
+     * Returns the virtual lane, or {@code null} when it is disabled.
+     *
+     * <p>Diagnostics and leak tests use it to inspect the lane's own thread bookkeeping.
+     *
+     * @return the lane of this engine
+     */
+    @Nullable VirtualLane virtualLane() {
+        return this.virtualLane;
     }
 
     /**
@@ -507,7 +533,16 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
 
     private void wireRuntime() {
         final JfrRecorder recorder = new FlightJfrRecorder();
-        final MetricsCollector collector = new ComputeMetricsCollector(this.settings, this.clock, recorder);
+        final ComputeSettings.Lanes.Virtual laneConfig = this.settings.lanes().virtual();
+        final boolean virtualOwnsLow = laneConfig.servesLow();
+        final int virtualLowMask = virtualOwnsLow ? 1 : 0;
+        final int virtualSlots = laneConfig.enabled() ? 1 : 0;
+        final MetricsCollector collector = new ComputeMetricsCollector(
+            this.settings,
+            this.clock,
+            recorder,
+            this::laneSnapshot
+        );
         this.metricsCollector = collector;
         final DispatcherImpl newDispatcher = new DispatcherImpl(
             this.settings,
@@ -518,10 +553,15 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this.clock,
             this::isClaiming,
             this::recordAdaptiveSample,
-            this.workerCeiling
+            this.workerCeiling,
+            this.platformLevelMask,
+            virtualLowMask,
+            laneConfig.allowsSpill(),
+            virtualSlots
         );
         this.dispatcher = newDispatcher;
-        final EngineWorkerLoop newLoop = new EngineWorkerLoop(newDispatcher, collector, this.clock);
+        final EngineTaskRunner runner = new EngineTaskRunner(newDispatcher, collector, this.clock);
+        final EngineWorkerLoop newLoop = new EngineWorkerLoop(newDispatcher, runner);
         final DynamicWorkerPool newPool = new DynamicWorkerPool(
             this.settings.workers(),
             this.settings.scheduling(),
@@ -531,6 +571,23 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             ThreadFactories.platform(this.settings.workers().threadNamePrefix(), true)
         );
         this.pool = newPool;
+        if (laneConfig.enabled()) {
+            if (!(this.queue instanceof LaneAwareQueue laneQueue)) {
+                throw new IllegalStateException("virtual lane requires a lane aware queue, got " + this.queue.getClass());
+            }
+            this.virtualLane = new VirtualLane(
+                laneConfig,
+                laneQueue,
+                newDispatcher,
+                runner,
+                newPool,
+                this.clock,
+                recorder,
+                this.settings.metrics().jfrEnabled(),
+                this::isClaiming,
+                this.settings.workers().threadNamePrefix()
+            );
+        }
         this.quota.updateTotalLimit(newPool.concurrencyLimit());
         this.appliedLimit.set(newPool.concurrencyLimit());
         final AdaptiveConcurrencyController controller = new AimdAdaptiveConcurrencyController(
@@ -545,6 +602,11 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         this.replayConsumers();
     }
 
+    private SchedulerMetrics.LaneMetrics laneSnapshot() {
+        final VirtualLane lane = this.virtualLane;
+        return lane == null ? SchedulerMetrics.LaneMetrics.disabled() : lane.snapshot();
+    }
+
     private void startRuntime() {
         final DynamicWorkerPool newPool = this.pool;
         final DispatcherImpl newDispatcher = this.dispatcher;
@@ -554,6 +616,10 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             throw new IllegalStateException("compute runtime was not wired");
         }
         newPool.start();
+        final VirtualLane lane = this.virtualLane;
+        if (lane != null) {
+            lane.start();
+        }
         final QueueJanitor newJanitor = new QueueJanitor(
             this.queue,
             newDispatcher,
@@ -562,6 +628,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this.clock,
             controller.enabled() ? controller : null,
             controller.enabled() ? null : this::autoscale,
+            this::platformBacklog,
             this.janitorTickMillis(),
             this.settings.metrics().sampleInterval().toNanos()
         );
@@ -690,6 +757,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             request.priority(),
             this.clock.instant(),
             submittedAtNanos,
+            request.label(),
             this
         );
         final QueueEntry entry = new QueueEntry(
@@ -710,6 +778,10 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
                 final MetricsCollector collector = this.metricsCollector;
                 if (collector != null) {
                     collector.onSubmitted(entry);
+                }
+                final VirtualLane lane = this.virtualLane;
+                if (lane != null) {
+                    lane.onSubmission(request.priority());
                 }
                 this.maybeGrow();
                 yield handle;
@@ -761,7 +833,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         }
         final int ceiling = Math.min(this.workerCeiling, this.budgetCeiling);
         final int desired = currentPool.desiredWorkers();
-        if (desired >= ceiling || currentPool.idleWorkers() > 0 || this.queue.size() <= 0) {
+        if (desired >= ceiling || currentPool.idleWorkers() > 0 || this.platformBacklog() <= 0) {
             return;
         }
         if (!this.growInFlight.compareAndSet(false, true)) {
@@ -770,7 +842,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         try {
             if (currentPool.desiredWorkers() < ceiling
                 && currentPool.idleWorkers() == 0
-                && this.queue.size() > 0) {
+                && this.platformBacklog() > 0) {
                 currentPool.resize(currentPool.desiredWorkers() + 1);
             }
         } finally {
@@ -794,7 +866,8 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         }
         final int ceiling = Math.min(this.workerCeiling, this.budgetCeiling);
         final int minimum = Math.min(this.settings.workers().minThreads(), ceiling);
-        final int backlog = this.queue.size() + (currentDispatcher == null ? 0 : currentDispatcher.carriedEntries());
+        final int backlog = this.platformBacklog()
+            + (currentDispatcher == null ? 0 : currentDispatcher.platformCarriedEntries());
         final int target;
         if (backlog <= 0) {
             target = minimum;
@@ -812,6 +885,21 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (controller != null) {
             controller.recordSample(queueWaitNanos, executionNanos, failed);
         }
+    }
+
+    /**
+     * Returns the queue depth the platform pool can actually act on.
+     *
+     * <p>LOW work belongs to the virtual lane when that lane owns it, so it must not make the
+     * platform pool grow or count as backlog in the adaptive signal.
+     *
+     * @return queued entries eligible for the platform lane
+     */
+    int platformBacklog() {
+        if (this.queue instanceof LaneAwareQueue aware) {
+            return aware.queuedInLane(LaneAwareQueue.Lane.PLATFORM, this.platformLevelMask);
+        }
+        return this.queue.size();
     }
 
     private boolean isClaiming() {
@@ -837,6 +925,14 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
                 // carried entries have not started either; make sure they are cancelled even if their
                 // worker never asks for work again
                 pendingDispatcher.cancelAllCarried(ComputeCancelledException.Reason.SHUTDOWN);
+            }
+            final VirtualLane lane = this.virtualLane;
+            if (lane != null) {
+                if (immediate) {
+                    lane.shutdownNow();
+                } else {
+                    lane.shutdown();
+                }
             }
             final DynamicWorkerPool currentPool = this.pool;
             if (currentPool == null) {
@@ -866,15 +962,22 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         try {
             this.stopJanitor();
             this.stopAdaptiveTimer();
+            final long deadline = System.nanoTime() + graceNanos;
+            boolean abandoned = false;
             final DynamicWorkerPool currentPool = this.pool;
             if (currentPool != null) {
-                final long deadline = System.nanoTime() + graceNanos;
                 final long graceLeft = Math.max(0L, deadline - System.nanoTime());
-                if (!currentPool.awaitTermination(Duration.ofNanos(graceLeft))) {
-                    // the grace period is over: abandon the running bodies instead of blocking
-                    // shutdown forever; they are never interrupted and complete after termination
-                    this.logAbandonedTasks();
-                }
+                abandoned |= !currentPool.awaitTermination(Duration.ofNanos(graceLeft));
+            }
+            final VirtualLane lane = this.virtualLane;
+            if (lane != null) {
+                final long graceLeft = Math.max(0L, deadline - System.nanoTime());
+                abandoned |= !lane.awaitTermination(Duration.ofNanos(graceLeft));
+            }
+            if (abandoned) {
+                // the grace period is over: abandon the running bodies instead of blocking shutdown
+                // forever; they are never interrupted and complete after termination
+                this.logAbandonedTasks();
             }
             // safety net: nothing may remain outside the queue after the workers stopped
             this.cancelAllQueued(ComputeCancelledException.Reason.SHUTDOWN);
@@ -948,6 +1051,10 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     private void abortStart() {
         this.stopAdaptiveTimer();
         this.stopJanitor();
+        final VirtualLane lane = this.virtualLane;
+        if (lane != null) {
+            lane.shutdownNow();
+        }
         final DynamicWorkerPool currentPool = this.pool;
         if (currentPool != null) {
             currentPool.shutdownNow();
@@ -1043,7 +1150,8 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             Map.of(),
             Map.of(),
             LatencyStats.empty(),
-            LatencyStats.empty()
+            LatencyStats.empty(),
+            this.laneSnapshot()
         );
     }
 }

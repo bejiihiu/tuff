@@ -11,9 +11,10 @@ import java.util.Objects;
  * stored policy atomically; already queued tasks are kept and are re-evaluated against the new
  * policy from then on.
  *
- * <p>The relative concurrency limit is a share of the pool, not a CPU reservation. It only caps how
- * many tasks of one consumer may run at the same time, it never guarantees that those slots are
- * actually available.
+ * <p>The relative concurrency limit is a share of the platform worker pool, not a CPU reservation.
+ * The same limit is enforced across both execution lanes, so a virtual task holds a slot exactly like
+ * a worker task. It only caps how many tasks of one consumer may run at the same time, it never
+ * guarantees that those slots are actually available.
  *
  * <p>The queue wait limit is enforced by the queue itself with a periodic sweep, not only when a
  * worker picks a task up, so expired work never stays in the bounded queue just because higher
@@ -106,7 +107,7 @@ public record ConsumerPolicy(
      * enabled consumer is never silently starved by rounding.
      *
      * @param availableWorkers number of workers currently in the pool, at least {@code 1}
-     * @return number of tasks of this consumer that may run concurrently
+     * @return number of tasks of this consumer that may run concurrently across both lanes
      * @throws IllegalArgumentException if {@code availableWorkers} is not positive
      */
     public int resolveConcurrencyLimit(final int availableWorkers) {

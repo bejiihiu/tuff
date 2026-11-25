@@ -55,4 +55,10 @@ public final class TaskStartedEvent extends Event {
      */
     @Label("Active Tasks Of Consumer")
     public int activeTasks;
+
+    /**
+     * Human readable task label, empty when the submission had none.
+     */
+    @Label("Task Label")
+    public String taskLabel;
 }

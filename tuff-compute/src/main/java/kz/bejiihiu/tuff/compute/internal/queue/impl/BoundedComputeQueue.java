@@ -19,7 +19,7 @@ import kz.bejiihiu.tuff.compute.ComputePriority;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.OverflowPolicy;
-import kz.bejiihiu.tuff.compute.internal.queue.ComputeQueue;
+import kz.bejiihiu.tuff.compute.internal.queue.LaneAwareQueue;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueSnapshot;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
@@ -72,12 +72,17 @@ import org.jspecify.annotations.Nullable;
  * service time, so every missing feature would have to be rebuilt next to it. It is also not
  * reachable from this module, which must stay free of server dependencies.
  */
-public final class BoundedComputeQueue implements ComputeQueue {
+public final class BoundedComputeQueue implements LaneAwareQueue {
 
     /**
      * Number of priority levels; must match {@link ComputePriority}.
      */
     private static final int LEVELS = 4;
+
+    /**
+     * Mask that includes every priority level.
+     */
+    private static final int ALL_LEVELS = (1 << LEVELS) - 1;
 
     /**
      * Fixed point scale of one dispatch turn in virtual service time. One point is one millionth of
@@ -140,6 +145,13 @@ public final class BoundedComputeQueue implements ComputeQueue {
     private volatile ConsumerState[] streams = new ConsumerState[0];
 
     private final AtomicInteger queued = new AtomicInteger();
+
+    /**
+     * Queued entries per priority level. Maintained on offer and unlink so lane dispatch and the
+     * virtual lane gauges never have to walk the consumers.
+     */
+    private final AtomicInteger[] levelCounts = new AtomicInteger[LEVELS];
+
     private final LongAdder accepted = new LongAdder();
     private final LongAdder rejectedQueueFull = new LongAdder();
     private final LongAdder rejectedConsumerFull = new LongAdder();
@@ -197,6 +209,9 @@ public final class BoundedComputeQueue implements ComputeQueue {
         this.agingIntervalNanos = toNanosSaturated(scheduling.agingInterval());
         this.maxAgingBoost = scheduling.maxAgingBoost();
         this.workStealing = scheduling.workStealing();
+        for (int level = 0; level < LEVELS; level++) {
+            this.levelCounts[level] = new AtomicInteger();
+        }
     }
 
     @Override
@@ -241,6 +256,7 @@ public final class BoundedComputeQueue implements ComputeQueue {
             final Node node = new Node(entry, state);
             // putIfAbsent is not needed: sequences are monotone, so the comparator cannot collide.
             state.bucket(node.level).put(node, node);
+            this.levelCounts[node.level].incrementAndGet();
             if (state.retired && node.claim()) {
                 // the consumer was unregistered while we were inserting; drop the entry and retry
                 // against whatever registration exists now.
@@ -264,10 +280,16 @@ public final class BoundedComputeQueue implements ComputeQueue {
 
     @Override
     public @Nullable QueueEntry poll(final ConsumerAdmission admission) {
+        return this.poll(Lane.PLATFORM, ALL_LEVELS, admission);
+    }
+
+    @Override
+    public @Nullable QueueEntry poll(final Lane lane, final int levelMask, final ConsumerAdmission admission) {
+        Objects.requireNonNull(lane, "lane");
         Objects.requireNonNull(admission, "admission");
         while (true) {
             final long now = this.clock.nanoTime();
-            final Node candidate = this.select(admission, now);
+            final Node candidate = this.select(admission, now, levelMask);
             if (candidate == null) {
                 return null;
             }
@@ -283,6 +305,17 @@ public final class BoundedComputeQueue implements ComputeQueue {
 
     @Override
     public @Nullable QueueEntry steal(final int thiefIndex, final ConsumerAdmission admission) {
+        return this.steal(thiefIndex, Lane.PLATFORM, ALL_LEVELS, admission);
+    }
+
+    @Override
+    public @Nullable QueueEntry steal(
+        final int thiefIndex,
+        final Lane lane,
+        final int levelMask,
+        final ConsumerAdmission admission
+    ) {
+        Objects.requireNonNull(lane, "lane");
         Objects.requireNonNull(admission, "admission");
         if (!this.workStealing) {
             return null;
@@ -300,7 +333,7 @@ public final class BoundedComputeQueue implements ComputeQueue {
             if (state.queued.get() == 0 || !admission.admits(state.id)) {
                 continue;
             }
-            final Node candidate = this.nextFrom(state, this.clock.nanoTime());
+            final Node candidate = this.nextFrom(state, this.clock.nanoTime(), levelMask);
             if (candidate == null || !candidate.claim()) {
                 continue;
             }
@@ -309,6 +342,43 @@ public final class BoundedComputeQueue implements ComputeQueue {
             return candidate.entry();
         }
         return null;
+    }
+
+    @Override
+    public int queuedAtLevel(final int level) {
+        Preconditions.checkAtLeast(level, 0, "level");
+        if (level >= LEVELS) {
+            throw new IllegalArgumentException("level must be below " + LEVELS + ", got " + level);
+        }
+        return Math.max(0, this.levelCounts[level].get());
+    }
+
+    @Override
+    public int queuedInLane(final Lane lane, final int levelMask) {
+        Objects.requireNonNull(lane, "lane");
+        int total = 0;
+        for (int level = 0; level < LEVELS; level++) {
+            if ((levelMask & (1 << level)) != 0) {
+                total += Math.max(0, this.levelCounts[level].get());
+            }
+        }
+        return total;
+    }
+
+    @Override
+    public long oldestWaitNanos(final int level, final long nowNanos) {
+        Preconditions.checkAtLeast(level, 0, "level");
+        if (level >= LEVELS) {
+            throw new IllegalArgumentException("level must be below " + LEVELS + ", got " + level);
+        }
+        long oldest = Long.MAX_VALUE;
+        for (final ConsumerState state : this.streams) {
+            final Node head = state.headOf(level);
+            if (head != null) {
+                oldest = Math.min(oldest, head.submittedAtNanos());
+            }
+        }
+        return oldest == Long.MAX_VALUE ? 0L : Math.max(0L, nowNanos - oldest);
     }
 
     @Override
@@ -657,6 +727,7 @@ public final class BoundedComputeQueue implements ComputeQueue {
         final ConsumerState owner = node.owner();
         owner.bucket(node.level).remove(node);
         owner.queued.decrementAndGet();
+        this.levelCounts[node.level].decrementAndGet();
         this.queued.decrementAndGet();
     }
 
@@ -668,6 +739,18 @@ public final class BoundedComputeQueue implements ComputeQueue {
      * @return the best node, or {@code null} if nothing is admitted right now
      */
     private @Nullable Node select(final ConsumerAdmission admission, final long nowNanos) {
+        return this.select(admission, nowNanos, ALL_LEVELS);
+    }
+
+    /**
+     * Returns the best candidate of one strategy aware selection pass restricted to a level mask.
+     *
+     * @param admission admission check, applied per consumer
+     * @param nowNanos  current clock reading
+     * @param levelMask bit set of priority levels this pass may pick
+     * @return the best node, or {@code null} if nothing is admitted right now
+     */
+    private @Nullable Node select(final ConsumerAdmission admission, final long nowNanos, final int levelMask) {
         final ConsumerState[] snapshot = this.streams;
         Node best = null;
         int bestLevel = Integer.MIN_VALUE;
@@ -676,7 +759,7 @@ public final class BoundedComputeQueue implements ComputeQueue {
             if (state.queued.get() == 0 || !admission.admits(state.id)) {
                 continue;
             }
-            final Node head = this.nextFrom(state, nowNanos);
+            final Node head = this.nextFrom(state, nowNanos, levelMask);
             if (head == null) {
                 continue;
             }
@@ -738,10 +821,22 @@ public final class BoundedComputeQueue implements ComputeQueue {
      * @return the entry that would be dispatched first, or {@code null} if the stream is empty
      */
     private @Nullable Node nextFrom(final ConsumerState state, final long nowNanos) {
+        return this.nextFrom(state, nowNanos, ALL_LEVELS);
+    }
+
+    /**
+     * Returns the next entry of one consumer in dispatch order, restricted to a level mask.
+     *
+     * @param state     consumer to inspect
+     * @param nowNanos  current clock reading
+     * @param levelMask bit set of priority levels this lane may pick
+     * @return the entry that would be dispatched first, or {@code null} if nothing is eligible
+     */
+    private @Nullable Node nextFrom(final ConsumerState state, final long nowNanos, final int levelMask) {
         if (this.strategy == ComputeSettings.Scheduling.Strategy.FIFO) {
-            return this.oldestHead(state);
+            return this.oldestHead(state, levelMask);
         }
-        return this.bestHead(state, nowNanos);
+        return this.bestHead(state, nowNanos, levelMask);
     }
 
     /**
@@ -752,9 +847,24 @@ public final class BoundedComputeQueue implements ComputeQueue {
      * @return the best bucket head, or {@code null} if the stream is empty
      */
     private @Nullable Node bestHead(final ConsumerState state, final long nowNanos) {
+        return this.bestHead(state, nowNanos, ALL_LEVELS);
+    }
+
+    /**
+     * Returns the highest effective head of one consumer among the levels a lane may pick.
+     *
+     * @param state     consumer to inspect
+     * @param nowNanos  current clock reading
+     * @param levelMask bit set of priority levels this pass may pick
+     * @return the best eligible bucket head, or {@code null} if nothing is eligible
+     */
+    private @Nullable Node bestHead(final ConsumerState state, final long nowNanos, final int levelMask) {
         Node best = null;
         int bestLevel = Integer.MIN_VALUE;
         for (int level = LEVELS - 1; level >= 0; level--) {
+            if ((levelMask & (1 << level)) == 0) {
+                continue;
+            }
             final Node head = state.headOf(level);
             if (head == null) {
                 continue;
@@ -775,8 +885,22 @@ public final class BoundedComputeQueue implements ComputeQueue {
      * @return the entry with the lowest submission sequence, or {@code null} if the stream is empty
      */
     private @Nullable Node oldestHead(final ConsumerState state) {
+        return this.oldestHead(state, ALL_LEVELS);
+    }
+
+    /**
+     * Returns the oldest entry of one consumer among the levels a lane may pick.
+     *
+     * @param state     consumer to inspect
+     * @param levelMask bit set of priority levels this pass may pick
+     * @return the oldest eligible head, or {@code null} if nothing is eligible
+     */
+    private @Nullable Node oldestHead(final ConsumerState state, final int levelMask) {
         Node oldest = null;
         for (int level = 0; level < LEVELS; level++) {
+            if ((levelMask & (1 << level)) == 0) {
+                continue;
+            }
             final Node head = state.headOf(level);
             if (head != null && (oldest == null || head.sequence < oldest.sequence)) {
                 oldest = head;

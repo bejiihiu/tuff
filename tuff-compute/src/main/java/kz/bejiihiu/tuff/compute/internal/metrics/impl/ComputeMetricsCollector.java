@@ -11,6 +11,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.Supplier;
 import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.ComputeConsumer;
 import kz.bejiihiu.tuff.compute.ComputePriority;
@@ -66,6 +67,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
     private final boolean cpuSampling;
     private final int configuredCapacity;
     private final Duration throughputWindow;
+    private final Supplier<SchedulerMetrics.LaneMetrics> lanes;
     private final ConcurrentHashMap<String, ConsumerState> consumers = new ConcurrentHashMap<>();
     private final ThreadLocal<StartedMark> startedMark = ThreadLocal.withInitial(StartedMark::new);
     private final @Nullable ScheduledExecutorService sampler;
@@ -89,9 +91,28 @@ public final class ComputeMetricsCollector implements MetricsCollector {
      * @throws NullPointerException if an argument is {@code null}
      */
     public ComputeMetricsCollector(final ComputeSettings settings, final ComputeClock clock, final JfrRecorder recorder) {
+        this(settings, clock, recorder, SchedulerMetrics.LaneMetrics::disabled);
+    }
+
+    /**
+     * Creates a collector that also reports the execution lane snapshot.
+     *
+     * @param settings scheduler settings, the metrics section drives what is collected
+     * @param clock    clock used for snapshot timestamps and throughput sampling
+     * @param recorder flight recorder bridge, never {@code null}
+     * @param lanes    supplier of the lane snapshot, called once per snapshot, never {@code null}
+     * @throws NullPointerException if an argument is {@code null}
+     */
+    public ComputeMetricsCollector(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final JfrRecorder recorder,
+        final Supplier<SchedulerMetrics.LaneMetrics> lanes
+    ) {
         Objects.requireNonNull(settings, "settings");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.recorder = Objects.requireNonNull(recorder, "recorder");
+        this.lanes = Objects.requireNonNull(lanes, "lanes");
         final ComputeSettings.Metrics metrics = settings.metrics();
         this.metricsEnabled = metrics.enabled();
         this.jfrEnabled = metrics.jfrEnabled();
@@ -128,7 +149,8 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             entry.consumerId(),
             entry.taskType(),
             entry.priority(),
-            this.currentQueuedDepth()
+            this.currentQueuedDepth(),
+            labelOf(entry)
         );
     }
 
@@ -177,7 +199,8 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             entry.taskType(),
             entry.priority(),
             queueWaitNanos,
-            activeTasks
+            activeTasks,
+            labelOf(entry)
         );
     }
 
@@ -202,7 +225,8 @@ public final class ComputeMetricsCollector implements MetricsCollector {
                 entry.taskType(),
                 entry.priority(),
                 executionNanos,
-                null
+                null,
+                labelOf(entry)
             );
         }
     }
@@ -228,7 +252,8 @@ public final class ComputeMetricsCollector implements MetricsCollector {
                 entry.taskType(),
                 entry.priority(),
                 executionNanos,
-                failure
+                failure,
+                labelOf(entry)
             );
         }
     }
@@ -270,7 +295,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             }
         }
         if (this.jfrEnabled) {
-            this.recorder.taskCancelled(entry.taskId(), entry.consumerId(), reason);
+            this.recorder.taskCancelled(entry.taskId(), entry.consumerId(), reason, labelOf(entry));
         }
     }
 
@@ -371,7 +396,8 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             this.cancelledReasonMap(current.cancelledByReason),
             this.priorityMap(current),
             queueWaitStats,
-            executionStats
+            executionStats,
+            this.lanes.get()
         );
     }
 
@@ -488,6 +514,16 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         if (mark.taskId == taskId) {
             mark.taskId = -1L;
         }
+    }
+
+    /**
+     * Returns the diagnostic label of an entry, or the empty string when it has none.
+     *
+     * @param entry entry to inspect
+     * @return the label, never {@code null}
+     */
+    private static String labelOf(final QueueEntry entry) {
+        return entry.handle().label().orElse("");
     }
 
     /**
@@ -616,7 +652,8 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             Map.of(),
             Map.of(),
             LatencyStats.empty(),
-            LatencyStats.empty()
+            LatencyStats.empty(),
+            this.lanes.get()
         );
     }
 

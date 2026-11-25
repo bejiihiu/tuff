@@ -34,4 +34,10 @@ public final class TaskCancelledEvent extends Event {
      */
     @Label("Reason")
     public String reason;
+
+    /**
+     * Human readable task label, empty when the submission had none.
+     */
+    @Label("Task Label")
+    public String taskLabel;
 }

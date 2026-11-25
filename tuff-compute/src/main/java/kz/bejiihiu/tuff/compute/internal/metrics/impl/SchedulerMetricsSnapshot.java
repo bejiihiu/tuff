@@ -10,6 +10,7 @@ import kz.bejiihiu.tuff.compute.ComputePriority;
 import kz.bejiihiu.tuff.compute.ComputeRejectedException;
 import kz.bejiihiu.tuff.compute.ConsumerMetrics;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
+import kz.bejiihiu.tuff.compute.SchedulerMetrics.LaneMetrics;
 
 /**
  * Immutable scheduler snapshot produced by {@link ComputeMetricsCollector}.
@@ -48,6 +49,7 @@ import kz.bejiihiu.tuff.compute.SchedulerMetrics;
  * @param queuedByPriority          queue depth per submitted priority
  * @param queueWaitStats            full queue wait distribution
  * @param executionStats            full execution time distribution
+ * @param lanes                     execution lane snapshot
  */
 public record SchedulerMetricsSnapshot(
     Instant capturedAt,
@@ -78,7 +80,8 @@ public record SchedulerMetricsSnapshot(
     Map<ComputeCancelledException.Reason, Long> cancelledByReason,
     Map<ComputePriority, Integer> queuedByPriority,
     LatencyStats queueWaitStats,
-    LatencyStats executionStats
+    LatencyStats executionStats,
+    LaneMetrics lanes
 ) implements SchedulerMetrics {
 
     /**
@@ -92,6 +95,7 @@ public record SchedulerMetricsSnapshot(
         Objects.requireNonNull(longestExecutionTime, "longestExecutionTime");
         Objects.requireNonNull(queueWaitStats, "queueWaitStats");
         Objects.requireNonNull(executionStats, "executionStats");
+        Objects.requireNonNull(lanes, "lanes");
         consumers = Map.copyOf(consumers);
         rejectedByReason = Map.copyOf(rejectedByReason);
         cancelledByReason = Map.copyOf(cancelledByReason);

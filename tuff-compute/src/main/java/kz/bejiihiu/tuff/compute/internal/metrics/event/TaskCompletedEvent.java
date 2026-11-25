@@ -46,4 +46,10 @@ public final class TaskCompletedEvent extends Event {
      */
     @Label("Execution Time")
     public long executionNanos;
+
+    /**
+     * Human readable task label, empty when the submission had none.
+     */
+    @Label("Task Label")
+    public String taskLabel;
 }

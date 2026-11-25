@@ -3,6 +3,7 @@ package kz.bejiihiu.tuff.compute;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -195,4 +196,172 @@ public interface SchedulerMetrics {
      * @return the consumer metrics, or an empty optional if no consumer with that id exists
      */
     Optional<ConsumerMetrics> consumer(String consumerId);
+
+    /**
+     * Returns the execution lane snapshot.
+     *
+     * <p>The platform lane has no dedicated numbers here: its counters are the scheduler wide
+     * counters of this snapshot. This accessor adds the virtual lane, which runs tasks that are not
+     * platform workers and therefore are not visible in {@link #activeWorkers()} or
+     * {@link #totalWorkers()}.
+     *
+     * @return the lane snapshot, never {@code null}
+     */
+    default LaneMetrics lanes() {
+        return LaneMetrics.disabled();
+    }
+
+    /**
+     * Virtual lane counters and gauges.
+     *
+     * <p>{@code submitted} counts tasks that were <b>dispatched</b> to the lane, so the invariant
+     * {@code submitted == completed + failed + cancelled + running} holds at every snapshot.
+     * Tasks cancelled while still queued never entered a lane and are only visible in the scheduler
+     * wide counters. {@code spilled} is the subset of {@code submitted} that was NORMAL work spilled
+     * from the platform lane.
+     */
+    interface VirtualLane {
+
+        /**
+         * Checks whether the virtual lane exists.
+         *
+         * @return {@code true} when the lane was configured and started
+         */
+        boolean enabled();
+
+        /**
+         * Returns the number of virtual tasks executing right now.
+         *
+         * @return in flight virtual tasks
+         */
+        int running();
+
+        /**
+         * Returns the hard concurrency limit of the lane.
+         *
+         * @return {@code maxConcurrent}, or {@code 0} when the lane is disabled
+         */
+        int limit();
+
+        /**
+         * Returns how much work is waiting for the lane.
+         *
+         * <p>This is a gauge, not part of the lane invariant: it counts LOW entries plus NORMAL
+         * entries that are currently spill eligible. NORMAL work that the platform lane may still
+         * take is not included.
+         *
+         * @return queued entries the lane may claim
+         */
+        int queued();
+
+        /**
+         * Returns how many tasks were dispatched to the lane.
+         *
+         * @return started virtual tasks since the scheduler started
+         */
+        long submitted();
+
+        /**
+         * Returns how many virtual tasks finished successfully.
+         *
+         * @return completed virtual tasks
+         */
+        long completed();
+
+        /**
+         * Returns how many virtual tasks failed.
+         *
+         * @return failed virtual tasks
+         */
+        long failed();
+
+        /**
+         * Returns how many virtual tasks were cancelled after they started.
+         *
+         * @return cancelled virtual tasks
+         */
+        long cancelled();
+
+        /**
+         * Returns how many NORMAL tasks were spilled from the platform lane.
+         *
+         * @return spilled tasks, a subset of {@link #submitted()}
+         */
+        long spilled();
+    }
+
+    /**
+     * Immutable {@link VirtualLane} snapshot.
+     *
+     * @param enabled   whether the lane exists
+     * @param running   in flight virtual tasks
+     * @param limit     hard concurrency limit
+     * @param queued    work waiting for the lane
+     * @param submitted tasks dispatched to the lane
+     * @param completed tasks completed on the lane
+     * @param failed    tasks failed on the lane
+     * @param cancelled started tasks cancelled on the lane
+     * @param spilled   NORMAL tasks spilled from the platform lane
+     */
+    record VirtualLaneMetrics(
+        boolean enabled,
+        int running,
+        int limit,
+        int queued,
+        long submitted,
+        long completed,
+        long failed,
+        long cancelled,
+        long spilled
+    ) implements VirtualLane {
+
+        /**
+         * Returns an all zero snapshot of a lane that does not exist.
+         *
+         * @return the disabled snapshot
+         */
+        public static VirtualLaneMetrics disabled() {
+            return new VirtualLaneMetrics(false, 0, 0, 0, 0L, 0L, 0L, 0L, 0L);
+        }
+    }
+
+    /**
+     * Execution lane snapshot.
+     */
+    interface LaneMetrics {
+
+        /**
+         * Returns the virtual lane snapshot.
+         *
+         * @return the virtual lane
+         */
+        VirtualLane virtual();
+
+        /**
+         * Returns a snapshot with a disabled virtual lane.
+         *
+         * @return the disabled snapshot
+         */
+        static LaneMetrics disabled() {
+            return new LaneMetricsSnapshot(VirtualLaneMetrics.disabled());
+        }
+    }
+
+    /**
+     * Immutable {@link LaneMetrics} snapshot.
+     *
+     * @param virtual virtual lane snapshot
+     */
+    record LaneMetricsSnapshot(VirtualLane virtual) implements LaneMetrics {
+
+        /**
+         * Validates the snapshot.
+         *
+         * @param virtual virtual lane snapshot
+         * @throws NullPointerException if {@code virtual} is {@code null}
+         */
+        public LaneMetricsSnapshot {
+            Objects.requireNonNull(virtual, "virtual");
+        }
+    }
 }

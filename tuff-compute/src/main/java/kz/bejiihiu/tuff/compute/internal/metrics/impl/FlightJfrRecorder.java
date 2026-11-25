@@ -16,6 +16,7 @@ import kz.bejiihiu.tuff.compute.internal.metrics.event.TaskQueueExpiredEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.TaskRejectedEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.TaskStartedEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.TaskSubmittedEvent;
+import kz.bejiihiu.tuff.compute.internal.metrics.event.VirtualTaskEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.WorkerPoolResizedEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.WorkerPoolStateEvent;
 import org.jspecify.annotations.Nullable;
@@ -59,6 +60,18 @@ public final class FlightJfrRecorder implements JfrRecorder {
         final ComputePriority priority,
         final int queueDepth
     ) {
+        this.taskQueued(taskId, consumerId, taskType, priority, queueDepth, "");
+    }
+
+    @Override
+    public void taskQueued(
+        final long taskId,
+        final String consumerId,
+        final ComputeTaskType taskType,
+        final ComputePriority priority,
+        final int queueDepth,
+        final String label
+    ) {
         if (this.types == null || !Types.SUBMITTED.isEnabled()) {
             return;
         }
@@ -69,6 +82,7 @@ public final class FlightJfrRecorder implements JfrRecorder {
             event.taskType = taskType.name();
             event.priority = priority.name();
             event.queueDepth = queueDepth;
+            event.taskLabel = label;
             event.commit();
         } catch (Throwable _) {
             // profiling must never break a task
@@ -84,6 +98,19 @@ public final class FlightJfrRecorder implements JfrRecorder {
         final long queueWaitNanos,
         final int activeTasks
     ) {
+        this.taskStarted(taskId, consumerId, taskType, priority, queueWaitNanos, activeTasks, "");
+    }
+
+    @Override
+    public void taskStarted(
+        final long taskId,
+        final String consumerId,
+        final ComputeTaskType taskType,
+        final ComputePriority priority,
+        final long queueWaitNanos,
+        final int activeTasks,
+        final String label
+    ) {
         if (this.types == null || !Types.STARTED.isEnabled()) {
             return;
         }
@@ -95,6 +122,7 @@ public final class FlightJfrRecorder implements JfrRecorder {
             event.priority = priority.name();
             event.queueWaitNanos = queueWaitNanos;
             event.activeTasks = activeTasks;
+            event.taskLabel = label;
             event.commit();
         } catch (Throwable _) {
             // profiling must never break a task
@@ -110,6 +138,19 @@ public final class FlightJfrRecorder implements JfrRecorder {
         final long executionNanos,
         final @Nullable Throwable failure
     ) {
+        this.taskFinished(taskId, consumerId, taskType, priority, executionNanos, failure, "");
+    }
+
+    @Override
+    public void taskFinished(
+        final long taskId,
+        final String consumerId,
+        final ComputeTaskType taskType,
+        final ComputePriority priority,
+        final long executionNanos,
+        final @Nullable Throwable failure,
+        final String label
+    ) {
         if (this.types == null) {
             return;
         }
@@ -124,6 +165,7 @@ public final class FlightJfrRecorder implements JfrRecorder {
                 event.taskType = taskType.name();
                 event.priority = priority.name();
                 event.executionNanos = executionNanos;
+                event.taskLabel = label;
                 event.commit();
             } catch (Throwable _) {
                 // profiling must never break a task
@@ -142,6 +184,7 @@ public final class FlightJfrRecorder implements JfrRecorder {
             event.executionNanos = executionNanos;
             event.failureType = failure.getClass().getName();
             event.failureMessage = failure.getMessage();
+            event.taskLabel = label;
             event.commit();
         } catch (Throwable _) {
             // profiling must never break a task
@@ -150,6 +193,16 @@ public final class FlightJfrRecorder implements JfrRecorder {
 
     @Override
     public void taskCancelled(final long taskId, final String consumerId, final ComputeCancelledException.Reason reason) {
+        this.taskCancelled(taskId, consumerId, reason, "");
+    }
+
+    @Override
+    public void taskCancelled(
+        final long taskId,
+        final String consumerId,
+        final ComputeCancelledException.Reason reason,
+        final String label
+    ) {
         if (this.types == null) {
             return;
         }
@@ -161,6 +214,7 @@ public final class FlightJfrRecorder implements JfrRecorder {
                 final TaskQueueExpiredEvent event = new TaskQueueExpiredEvent();
                 event.taskId = taskId;
                 event.consumerId = consumerId;
+                event.taskLabel = label;
                 event.commit();
             } catch (Throwable _) {
                 // profiling must never break a task
@@ -175,6 +229,7 @@ public final class FlightJfrRecorder implements JfrRecorder {
             event.taskId = taskId;
             event.consumerId = consumerId;
             event.reason = reason.name();
+            event.taskLabel = label;
             event.commit();
         } catch (Throwable _) {
             // profiling must never break a task
@@ -223,6 +278,36 @@ public final class FlightJfrRecorder implements JfrRecorder {
             final WorkerPoolResizedEvent event = new WorkerPoolResizedEvent();
             event.totalWorkers = totalWorkers;
             event.concurrencyLimit = concurrencyLimit;
+            event.commit();
+        } catch (Throwable _) {
+            // profiling must never break a task
+        }
+    }
+
+    @Override
+    public void virtualTask(
+        final long taskId,
+        final String consumerId,
+        final ComputePriority priority,
+        final long queueWaitNanos,
+        final boolean spilled,
+        final int running,
+        final int limit,
+        final String label
+    ) {
+        if (this.types == null || !Types.VIRTUAL_TASK.isEnabled()) {
+            return;
+        }
+        try {
+            final VirtualTaskEvent event = new VirtualTaskEvent();
+            event.taskId = taskId;
+            event.consumerId = consumerId;
+            event.priority = priority.name();
+            event.queueWaitNanos = queueWaitNanos;
+            event.spilled = spilled;
+            event.running = running;
+            event.limit = limit;
+            event.taskLabel = label;
             event.commit();
         } catch (Throwable _) {
             // profiling must never break a task
@@ -304,6 +389,7 @@ public final class FlightJfrRecorder implements JfrRecorder {
         static final EventType WORKER_SAMPLE = EventType.getEventType(WorkerPoolStateEvent.class);
         static final EventType WORKER_RESIZED = EventType.getEventType(WorkerPoolResizedEvent.class);
         static final EventType AGING = EventType.getEventType(AgingActivatedEvent.class);
+        static final EventType VIRTUAL_TASK = EventType.getEventType(VirtualTaskEvent.class);
 
         private Types() {
         }

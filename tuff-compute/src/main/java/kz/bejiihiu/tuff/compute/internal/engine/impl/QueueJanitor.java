@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
+import java.util.function.IntSupplier;
 import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.internal.adaptive.AdaptiveConcurrencyController;
 import kz.bejiihiu.tuff.compute.internal.metrics.MetricsCollector;
@@ -45,6 +46,7 @@ final class QueueJanitor implements Runnable {
     private final ComputeClock clock;
     private final @Nullable AdaptiveConcurrencyController adaptive;
     private final @Nullable Runnable autoscale;
+    private final IntSupplier platformDepth;
     private final long tickMillis;
     private final long sampleIntervalNanos;
 
@@ -64,6 +66,7 @@ final class QueueJanitor implements Runnable {
      * @param clock               scheduler clock used for expiry and adaptive queue state
      * @param adaptive            adaptive controller, or {@code null} when disabled
      * @param autoscale           static autoscaler reconciliation callback, or {@code null}
+     * @param platformDepth       queue depth the platform pool can act on
      * @param tickMillis          how often the sweep runs, at least {@code 1}
      * @param sampleIntervalNanos how often gauges are sampled, at least {@code 1}
      */
@@ -75,6 +78,7 @@ final class QueueJanitor implements Runnable {
         final ComputeClock clock,
         final @Nullable AdaptiveConcurrencyController adaptive,
         final @Nullable Runnable autoscale,
+        final IntSupplier platformDepth,
         final long tickMillis,
         final long sampleIntervalNanos
     ) {
@@ -85,6 +89,7 @@ final class QueueJanitor implements Runnable {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.adaptive = adaptive;
         this.autoscale = autoscale;
+        this.platformDepth = Objects.requireNonNull(platformDepth, "platformDepth");
         this.tickMillis = Math.max(1L, tickMillis);
         this.sampleIntervalNanos = Math.max(1L, sampleIntervalNanos);
     }
@@ -178,7 +183,9 @@ final class QueueJanitor implements Runnable {
         this.dispatcher.sweepCarried(now);
         final AdaptiveConcurrencyController controller = this.adaptive;
         if (controller != null) {
-            controller.onQueueState(this.queue.size(), this.queue.capacity());
+            // the adaptive controller models the platform pool only; virtual lane backlog must not
+            // make it grow
+            controller.onQueueState(this.platformDepth.getAsInt(), this.queue.capacity());
         }
         final Runnable scaler = this.autoscale;
         if (scaler != null) {

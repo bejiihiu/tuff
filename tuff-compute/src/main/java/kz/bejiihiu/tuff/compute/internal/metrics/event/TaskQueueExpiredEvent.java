@@ -32,4 +32,10 @@ public final class TaskQueueExpiredEvent extends Event {
      */
     @Label("Consumer")
     public String consumerId;
+
+    /**
+     * Human readable task label, empty when the submission had none.
+     */
+    @Label("Task Label")
+    public String taskLabel;
 }

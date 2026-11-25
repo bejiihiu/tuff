@@ -49,4 +49,10 @@ public final class TaskSubmittedEvent extends Event {
      */
     @Label("Queue Depth")
     public int queueDepth;
+
+    /**
+     * Human readable task label, empty when the submission had none.
+     */
+    @Label("Task Label")
+    public String taskLabel;
 }

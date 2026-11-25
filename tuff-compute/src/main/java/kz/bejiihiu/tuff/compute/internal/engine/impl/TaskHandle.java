@@ -1,6 +1,8 @@
 package kz.bejiihiu.tuff.compute.internal.engine.impl;
 
 import java.time.Instant;
+import java.util.Locale;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -65,6 +67,7 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
     private final ComputePriority priority;
     private final Instant submittedAt;
     private final long submittedAtNanos;
+    private final String label;
     private final CompletableFuture<T> future;
     private final Owner owner;
 
@@ -72,6 +75,7 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
     private final AtomicBoolean cancelRequested = new AtomicBoolean();
     private final AtomicBoolean terminalSignalled = new AtomicBoolean();
 
+    private volatile @Nullable String laneName;
     private volatile @Nullable QueueEntry entry;
     private volatile ComputeCancelledException.@Nullable Reason cancelReason;
     private volatile @Nullable Throwable failure;
@@ -87,6 +91,7 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
      * @param priority         submitted priority
      * @param submittedAt      wall clock instant of acceptance
      * @param submittedAtNanos monotonic acceptance timestamp
+     * @param label            normalized task label, may be empty
      * @param owner            engine side of the handle
      */
     TaskHandle(
@@ -96,6 +101,7 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
         final ComputePriority priority,
         final Instant submittedAt,
         final long submittedAtNanos,
+        final String label,
         final Owner owner
     ) {
         this.taskId = taskId;
@@ -104,8 +110,20 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
         this.priority = priority;
         this.submittedAt = submittedAt;
         this.submittedAtNanos = submittedAtNanos;
+        this.label = label;
         this.owner = owner;
         this.future = new HandleFuture();
+    }
+
+    /**
+     * Records the execution lane the task started on.
+     *
+     * <p>Diagnostic only; it is shown by {@link #toString()} and never used for scheduling.
+     *
+     * @param lane lane name, normally {@code platform} or {@code virtual}
+     */
+    void recordLane(final String lane) {
+        this.laneName = lane;
     }
 
     /**
@@ -315,6 +333,11 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
     }
 
     @Override
+    public Optional<String> label() {
+        return this.label.isEmpty() ? Optional.empty() : Optional.of(this.label);
+    }
+
+    @Override
     public String consumerId() {
         return this.consumerId;
     }
@@ -393,11 +416,59 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
 
     @Override
     public String toString() {
-        return "ComputeTaskHandle[task=" + this.taskId
-            + ", consumer=" + this.consumerId
-            + ", type=" + this.taskType
-            + ", priority=" + this.priority
-            + ", state=" + this.state.get() + ']';
+        final State current = this.state.get();
+        final StringBuilder out = new StringBuilder(96);
+        out.append("tuff-task#").append(this.taskId)
+            .append(" [consumer=").append(this.consumerId)
+            .append(" type=").append(this.taskType)
+            .append(" prio=").append(this.priority)
+            .append(" state=").append(current);
+        final String lane = this.laneName;
+        if (lane != null && current != State.QUEUED) {
+            out.append(" lane=").append(lane);
+        }
+        if (!this.label.isEmpty()) {
+            out.append(" label=").append(quote(this.label));
+        }
+        if (this.queueWaitNanos >= 0L) {
+            out.append(" wait=").append(formatNanos(this.queueWaitNanos));
+        }
+        if (current.isTerminal() && this.executionNanos >= 0L) {
+            out.append(" exec=").append(formatNanos(this.executionNanos));
+        }
+        return out.append(']').toString();
+    }
+
+    /**
+     * Quotes a label so {@link #toString()} stays one line even for odd input.
+     *
+     * @param value label to quote
+     * @return the quoted label
+     */
+    private static String quote(final String value) {
+        final String safe = value.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ');
+        return '"' + safe.replace("\\", "\\\\").replace("\"", "\\\"") + '"';
+    }
+
+    /**
+     * Formats a duration for {@link #toString()} without allocating a formatter per call site.
+     *
+     * @param nanos duration in nanoseconds
+     * @return a short human readable duration
+     */
+    private static String formatNanos(final long nanos) {
+        if (nanos < 1_000L) {
+            return nanos + "ns";
+        }
+        if (nanos < 1_000_000L) {
+            final long micros = nanos / 1_000L;
+            return nanos % 1_000L == 0L ? micros + "us" : String.format(Locale.ROOT, "%.1fus", nanos / 1_000.0d);
+        }
+        if (nanos < 1_000_000_000L) {
+            final long millis = nanos / 1_000_000L;
+            return nanos % 1_000_000L == 0L ? millis + "ms" : String.format(Locale.ROOT, "%.1fms", nanos / 1_000_000.0d);
+        }
+        return String.format(Locale.ROOT, "%.2fs", nanos / 1_000_000_000.0d);
     }
 
     /**
