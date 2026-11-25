@@ -1,7 +1,8 @@
 # Configuration
 
 The compute scheduler reads `config/tuff.yml` from the server directory. The file is UTF-8, is created from
-the bundled template on first start, and its `async-compute` section maps one-to-one onto `ComputeSettings`.
+the bundled template the first time the configuration is loaded, and its `async-compute` section maps
+one-to-one onto `ComputeSettings`.
 
 ```yaml
 async-compute:
@@ -36,7 +37,8 @@ against the previously published snapshot, including which keys cannot be adopte
 A reload never applies the snapshot to a running engine by itself: applying is the job of the server
 bootstrap's `ComputeConfigApplyTarget`. Without that hook, a reload updates what the config layer reports
 and what a *new* scheduler would be built from, while the live pool keeps the settings it started with. In
-practice, restart after editing unless your build wires the hook.
+practice, restart after editing unless your build wires the hook. There is no console command for this in
+the current build; `reload()` is the API a command or the bootstrap calls.
 
 Keys the diff always marks as restart-only:
 
@@ -76,35 +78,41 @@ work" check. Catch `ComputeRejectedException`.
 | --- | --- | --- | --- | --- | --- | --- |
 | `threads` | integer | threads | `-1` | `-1` or `>= 1` | Fixed worker count, or automatic sizing. Must not exceed `max-threads` when both are set | no |
 | `min-threads` | integer | threads | `2` | `>= 1` | Workers kept alive while idle; also the floor of automatic sizing and the static autoscaler | no |
-| `max-threads` | integer | threads | `-1` | `-1` or `>= min-threads` | Hard ceiling. `-1` resolves to the processor count, never below `min-threads` | no |
+| `max-threads` | integer | threads | `-1` | `-1` or `>= min-threads` | Hard ceiling. `-1` resolves to the processor budget, never below `min-threads` | no |
 | `keep-alive-seconds` | number | seconds | `30` | `> 0` | How long an idle worker above the floor waits before it exits | no |
 | `thread-name-prefix` | string | — | `"Tuff Compute Worker"` | non-blank | Thread name prefix, used verbatim in dumps and profilers | no |
 
 ### Automatic sizing
 
-With `threads: -1`, the initial worker count is derived from `Runtime.availableProcessors()`:
+With `threads: -1`, the worker count comes from the processor **budget** the platform grants the pool:
 
 ```
-tick      = cores <= 8 ? 1 : cores / 8        // assumes one tick thread per eight cores, plus global
-reserve   = max(2, ceil(cores / 8))           // GC, JIT, network, watchdog
-target    = cores - tick - 1 - reserve
-workers   = clamp(target, min-threads, max-threads)
+workers = clamp(max(min-threads, budget - 1), 1, ceiling)
+ceiling = max-threads when set, otherwise max(min-threads, budget)
+```
+
+The engine applies exactly this formula (`ComputeSettings.Workers#resolveThreadCount(budget)`) and never
+subtracts region, chunk or IO threads itself. The budget is computed on the server side by
+`ComputeThreadBudget`:
+
+```
+budget = max(1, floor(cores * 0.8) - regionThreads - chunkWorkers - ioThreads - 4)
 ```
 
 Examples with `min-threads: 2`, `max-threads: -1`:
 
-| Cores | Automatic workers | Ceiling |
+| Budget | Workers | Ceiling |
 | --- | --- | --- |
-| 4 | 2 (target is 0, floor wins) | 4 |
-| 8 | 4 | 8 |
-| 16 | 11 | 16 |
-| 32 | 23 | 32 |
-| 64 | 47 | 64 |
+| 2 | 2 (the floor wins) | 2 |
+| 4 | 3 | 4 |
+| 8 | 7 | 8 |
+| 16 | 15 | 16 |
+| 32 | 31 | 32 |
 
-This is the sizing the pool actually uses. It does **not** subtract the live region and chunk thread counts;
-reserve only approximates them. On a server with many regions or a large chunk worker pool, set `threads` or
-`max-threads` explicitly — automatic sizing can otherwise hand the compute pool cores the regioniser is
-already using.
+The budget is normally well below the core count, because the regioniser, chunk workers, IO threads and a
+network reserve already own part of the machine. The server resolves it with `ComputeThreadBudget` and
+applies it through `AsyncComputeScheduler#applyProcessorBudget(int)`; until that call, an engine uses
+`Runtime.availableProcessors()` as the budget. Do not read the table above as "cores"; it is the budget.
 
 When workers are automatic and adaptive concurrency is off, the pool grows on demand (one worker per
 submission that finds a backlog and no idle worker, plus a janitor reconciliation every tick) and shrinks
@@ -116,7 +124,7 @@ adaptive controller.
 | Key | Type | Unit | Default | Allowed | Effect | Restart |
 | --- | --- | --- | --- | --- | --- | --- |
 | `capacity` | integer | tasks | `8192` | `>= 1` | Hard bound on all queued (not running) tasks | yes |
-| `overflow-policy` | enum | — | `reject` | `reject`, `drop-oldest` | Parsed, reported and diffed, but **not consulted by the queue**. The submitting consumer's `overflow-policy` decides for both the global and the consumer bound | no (unused) |
+| `overflow-policy` | enum | — | `reject` | `reject`, `drop-oldest` | Overflow default for the `default` consumer and for consumers registered on the fly; `consumers.<id>.overflow-policy` overrides it, and an explicit `registerConsumer` policy wins over both | no |
 
 Capacity protects the heap from a submission burst. It does not slow the submitting thread down: at the
 bound the scheduler refuses or evicts, it never blocks. See
@@ -182,10 +190,14 @@ always at least one task. It is a cap, not a reservation.
 
 ### Shipped consumer sections
 
-The template configures three example consumers: `chunk-generation` (`0.60`), `pathfinding` (`0.30`) and
-`ai-computation` (`0.20`). On start the engine registers every configured override, so a consumer with that
-id gets those limits whether the work comes from a server subsystem or from a plugin using the same id.
-Nothing is reserved for them; a subsystem that never submits leaves its share to everyone else.
+The template ships three **example policies**: `chunk-generation` (`0.60`), `pathfinding` (`0.30`) and
+`ai-computation` (`0.20`). They are not integrations. Nothing in this build submits under those ids; the
+sections only predefine limits for a plugin (or a later subsystem) that chooses the same id. The engine
+registers every configured override at start, so such a consumer inherits the section automatically, and a
+section nobody uses costs nothing but can be deleted.
+
+No built-in consumer exists in this build for any server subsystem. Treat these three ids as placeholders
+to copy, rename or remove.
 
 ## `async-compute.metrics`
 
@@ -221,7 +233,7 @@ shrinks on latency pressure or after three idle windows. Full decision logic is 
 
 | Key | Type | Unit | Default | Allowed | Effect |
 | --- | --- | --- | --- | --- | --- |
-| `shutdown-grace-seconds` | number | seconds | `10` | `>= 0` | How long shutdown waits for running tasks before it keeps waiting in 100 ms slices. Queued work is cancelled immediately regardless |
+| `shutdown-grace-seconds` | number | seconds | `10` | `>= 0` | How long running tasks are given to finish. Queued work is cancelled immediately; when the grace period expires the scheduler terminates anyway, without interrupting running tasks, and their futures complete later |
 
 The `ComputeSettings` record default is 30 seconds; the server file ships 10 because the world save runs
 right after the pool stops. Running tasks are never interrupted, so this value does not kill anything.
@@ -265,10 +277,10 @@ async-compute:
       max-queued-tasks: 512
 ```
 
-Automatic sizing on four cores yields a target of zero, so the floor lands on one worker; the explicit
-ceiling prevents growth from taking a core the regioniser needs.
+With a small budget automatic sizing lands on one worker (the floor), and the ceiling of two keeps growth
+from taking a processor the regioniser needs.
 
-### Large server (32+ cores, chunk generation and pathfinding under load)
+### Large server (32+ cores, several plugin consumers)
 
 ```yaml
 async-compute:
@@ -301,8 +313,9 @@ async-compute:
     target-utilization: 0.85
 ```
 
-`max-threads` keeps the pool below the core count, and adaptive growth is bounded by it. The weights only
-matter while both consumers have queued work.
+`max-threads` caps growth independently of the budget, and adaptive growth is bounded by it. The weights
+only matter while both consumers have queued work. `chunk-generation` and `pathfinding` here are the example
+ids from the template, not built-in integrations.
 
 ### Background-only pool (fixed size, work is disposable)
 

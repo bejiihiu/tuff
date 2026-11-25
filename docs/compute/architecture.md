@@ -21,7 +21,9 @@ flowchart LR
 ```
 
 One engine owns exactly one queue, one worker pool and one metrics collector. Consumers are just ids with
-policies; they do not own threads.
+policies; they do not own threads. The engine registers the `default` consumer and every configured
+override at start, but it never registers a consumer on behalf of a subsystem: in this build nothing submits
+under those ids until a plugin or a future subsystem does.
 
 | Component | Responsibility | Source |
 | --- | --- | --- |
@@ -91,8 +93,8 @@ and shutdown racing each other:
    code that completes the caller's future. The queue, dispatcher, janitor, eviction listener and shutdown
    path only *request* a transition; the winner of the terminal compare-and-set performs it.
 2. **Only the worker that received an entry releases its quota slot.** The dispatcher acquires a slot
-   before returning an entry, so `taskFinished` and `taskCancelled` are the only release points, and both
-   run on the worker thread that holds the entry.
+   before returning an entry, so `taskFinished`, `taskCompleted` and `taskCancelled` are the only release
+   points, and all of them run on the worker thread that holds the entry.
 3. **A queued entry never held a slot, so it never releases one.** Cancellation, expiry, eviction, consumer
    removal and shutdown of queued work are pure handle transitions plus a metrics event.
 4. **Exactly one terminal metrics event per accepted task.** The caller that won the handle's terminal CAS
@@ -200,9 +202,9 @@ Other refusals happen before the queue is touched: `SCHEDULER_DISABLED`, `CONSUM
 `CONSUMER_UNKNOWN` (dynamic registration off), `TASK_TYPE_NOT_ALLOWED`, `PRIORITY_NOT_ALLOWED`. None of
 them occupy a queue slot, and all of them are counted in the rejection metrics.
 
-> The top-level `queue.overflow-policy` is parsed and reported, but the queue applies the **submitting
-> consumer's** overflow policy to both the global and the per-consumer bound. Configure
-> `consumers.default.overflow-policy` (and per-consumer overrides) to change behaviour.
+> `queue.overflow-policy` is the overflow default for the `default` consumer and for consumers registered
+> on the fly; `consumers.<id>.overflow-policy` overrides it. A consumer registered explicitly through the
+> API carries the policy it was registered with.
 
 ## Cancellation
 
@@ -215,12 +217,38 @@ Cancellation is cooperative and has four entry points: `ComputeTaskHandle.cancel
 - A running task is only flagged. The worker never interrupts it; the result is discarded when it arrives.
 - Cancellation is idempotent and returns `false` when the task already ended or the request lost the race.
 
+Removing a consumer is not cancellation of its running work: queued work of that consumer is cancelled
+immediately with `CONSUMER_DISABLED`, while work that already started runs to completion and its future
+completes normally with the produced value. This keeps a plugin disable from throwing away a half-finished
+computation.
+
 Because workers are never interrupted, a task that ignores the flag holds its slot until it returns. There
 is no per-task timeout and no watchdog that kills it.
 
 ## Autoscaling
 
-There are two mutually exclusive owners of pool size.
+There are two mutually exclusive owners of pool size, and one source of truth for the number itself.
+
+**Worker count.** A fixed `threads` is used as written. `threads: -1` resolves through
+`ComputeSettings.Workers#resolveThreadCount(budget)`:
+
+```
+workers = clamp(max(min-threads, budget - 1), 1, ceiling)
+ceiling = max-threads when set, otherwise max(min-threads, budget)
+```
+
+`budget` is the number of processors the platform grants the compute pool, not the raw core count. The
+server computes it with `ComputeThreadBudget`:
+
+```
+budget = max(1, floor(cores * 0.8) - regionThreads - chunkWorkers - ioThreads - 4)
+```
+
+The engine never subtracts region, chunk or IO threads itself; doing both would leave the pool with far
+fewer workers than the administrator asked for. The server resolves the budget and applies it with
+`AsyncComputeScheduler#applyProcessorBudget(int)` once the region scheduler is up; the engine resizes the
+pool, its concurrency gate and the quota limit on that call. Before the first call — and in a direct
+construction — `Runtime.availableProcessors()` is used as the budget.
 
 **Static autoscaler** (adaptive disabled, `threads: -1`): a submission that finds a backlog raises the
 desired worker count by one when no worker is idle, and the janitor reconciles every tick towards
@@ -239,8 +267,8 @@ and the process CPU load is below 90%. Growth is additive:
 It shrinks on latency pressure (`W >= 2C` or `W99 >= 4C`) or after three consecutive idle windows (empty
 queue, utilisation below half the target). Failed tasks are not sampled; their timing says nothing about
 capacity. The floor is `max(min-concurrency, min-threads)`, the ceiling is `min(max-concurrency, worker
-ceiling)` or the worker ceiling when `max-concurrency` is `-1`. An explicit worker count pins the limit and
-the controller reports `EXPLICIT_WORKER_COUNT`.
+ceiling)` or the worker ceiling when `max-concurrency` is `-1`; the processor budget is a hard cap on top of
+that. An explicit worker count pins the limit and the controller reports `EXPLICIT_WORKER_COUNT`.
 
 ## Shutdown
 
@@ -248,14 +276,15 @@ the controller reports `EXPLICIT_WORKER_COUNT`.
 
 1. moves to `SHUTTING_DOWN`, closes the queue to new offers;
 2. cancels **all** queued work with `SHUTDOWN` immediately;
-3. asks the pool to stop claiming, then waits for workers to leave their current task;
+3. asks the pool to stop claiming, and gives running tasks the grace period to finish;
 4. stops the janitor and the adaptive timer, closes the metrics collector, resets quotas;
 5. moves to `TERMINATED` and releases `awaitTermination`.
 
-Running tasks are never interrupted, so the grace period does not kill anything. It bounds how long the
-shutdown thread waits before it keeps waiting in 100 ms slices; a task that never returns delays
-termination indefinitely. `shutdownNow()` on the facade is the same sequence with a zero grace period, and
-is not part of the public scheduler interface.
+Running tasks are never interrupted. If the grace period expires, the scheduler moves to `TERMINATED`
+anyway: the tasks that are still running keep running and their futures complete normally (or with the
+failure the body throws) after termination. `awaitTermination` therefore returns within roughly the grace
+period even when a task hangs. `shutdownNow()` on the facade is the same sequence with a zero grace period,
+and is not part of the public scheduler interface.
 
 ## Metrics and JFR
 

@@ -68,6 +68,14 @@ For local plugin development the simplest option is:
 and then use `mavenLocal()` with the same coordinates. Publishing from CI uses the `tuffUsername` / `tuffPassword`
 Gradle properties (see `.github/workflows/release.yml`).
 
+## Tuff compute
+
+Tuff has a shared compute scheduler for CPU-bound work: priorities with aging, per-consumer quotas and
+fair-share weights, a bounded queue, metrics and JFR. Plugins reach it through `TuffCompute` and hand results
+back to the owning region with `ComputeHandoff`; the configuration lives in `config/tuff.yml`. Built-in
+consumers and an admin command are not part of this build yet. See
+[`docs/compute/`](docs/compute/README.md).
+
 ## Region threading (the Folia part)
 
 Folia groups nearby loaded chunks into an "independent region". See

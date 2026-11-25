@@ -1,6 +1,6 @@
 # Compute scheduler
 
-Tuff ships one shared pool of worker threads for CPU-bound server work. Subsystems and plugins submit a
+Tuff ships one shared pool of worker threads for CPU-bound server work. Server code and plugins submit a
 task, get a `CompletableFuture` back, and the scheduler decides when it runs, on which worker, and how the
 pool is shared between everyone who submitted.
 
@@ -9,10 +9,10 @@ delivered back to the thread that owns the world state.
 
 ## Why it exists
 
-Without a shared pool every subsystem grows its own `ExecutorService`: chunk work, pathfinding, map
-colours, Anti-Xray, plugin caches. Each pool is sized for itself, so the server ends up with more runnable
-threads than cores, and the region tick threads pay for it in context switches. None of those pools knows
-about the others either, so a burst in one subsystem starves the rest, and queues are usually unbounded.
+Without a shared pool every subsystem grows its own `ExecutorService`. Each pool is sized for itself, so the
+server ends up with more runnable threads than cores, and the region tick threads pay for it in context
+switches. None of those pools knows about the others either, so a burst in one subsystem starves the rest,
+and queues are usually unbounded.
 
 The compute scheduler replaces that with:
 
@@ -41,14 +41,26 @@ Entry points in the repository:
 - [`TuffCompute`](../../tuff-api/src/main/java/kz/bejiihiu/tuff/api/compute/TuffCompute.java) — how a plugin reaches the engine
 - [`config/tuff.yml`](../../tuff-server/src/main/resources/tuff/tuff.yml) — the shipped configuration template
 
+## Scope of this build
+
+The engine, its public API, the configuration loader and the JFR instrumentation are in this build. The
+following are not:
+
+| Not included | What it means for you |
+| --- | --- |
+| Built-in consumers | No server subsystem submits to the pool. The `consumers.chunk-generation`, `consumers.pathfinding` and `consumers.ai-computation` sections are **examples** of policies for ids that a plugin or a future subsystem may use; nothing runs under those ids by default |
+| An admin command | There is no `/tuff` command yet. Metrics are read through the Java API (`TuffCompute.scheduler().metrics()`); JFR is recorded with the standard JDK tools |
+
+The rest of these pages describe the subsystem as implemented. The server bootstrap owns creating,
+starting and installing the engine; plugins only read it.
+
 ## Enable it
 
-1. The first time the configuration is loaded, `config/tuff.yml` is written from the bundled template if
-   it does not exist.
-2. Keep `async-compute.enabled: true` (the default), adjust the sections you care about, apply the change.
-   `enabled`, `queue.capacity`, `scheduling.*`, `adaptive.enabled` and dynamic consumer registration are
-   baked into a running pool and need a restart; everything else is adoptable at runtime when the server
-   bootstrap attaches a config apply hook.
+1. `config/tuff.yml` is written from the bundled template the first time the configuration is loaded.
+2. Keep `async-compute.enabled: true` (the default) and adjust the sections you care about. `enabled`,
+   `queue.capacity`, `scheduling.*`, `adaptive.enabled` and dynamic consumer registration are baked into a
+   running pool and need a restart; everything else is adoptable at runtime when a config apply hook is
+   attached.
 3. From a plugin, take the scheduler in `onEnable` and submit work:
 
 ```java

@@ -15,12 +15,13 @@ logger. There is no periodic "pool status" log line — use the metrics API or J
 | `Tuff/ComputeConfig` | WARN | `These compute settings take effect after a restart: …` | Changed keys the live pool cannot adopt |
 | `Tuff/ComputeConfig` | WARN | `Compute configuration was not reloaded, the scheduler keeps its previous settings` | The file could not be parsed at all |
 | `Tuff/ComputeConfig` | ERROR | `Failed to apply the compute configuration to the scheduler` | The apply hook threw; the snapshot stays published |
+| `ComputeEngineImpl` | INFO | `compute processor budget changed from X to Y (target workers N, ceiling M)` | The platform applied a new CPU budget at runtime |
+| `ComputeEngineImpl` | WARN | `compute scheduler terminated with N task(s) still running after the grace period; …` | Running bodies outlived the grace period; they are not interrupted and complete after termination |
 | `DynamicWorkerPool` | ERROR | `could not create/start a worker thread` | Thread creation failed; the pool is short a worker |
 | `DynamicWorkerPool` | WARN | `worker N escaped executeNext (attempt N)` | A loop bug escaped; three in a row retire the worker |
 | `DynamicWorkerPool` | WARN | `workerStopped failed for worker N` | Cleanup failure while a worker exited |
 | `QueueJanitor` | WARN | `compute janitor tick failed` | One housekeeping tick threw; the cadence continues |
 | `ComputeEngineImpl` | WARN | `adaptive evaluation failed` | The controller threw; the limit holds |
-| `ComputeEngineImpl` | WARN | `compute shutdown was interrupted` | Shutdown thread interrupted; termination still completes |
 | `ComputeEngineImpl` | ERROR | `compute janitor died` / `compute shutdown failed` | A housekeeping thread died unexpectedly |
 
 Task failures are **not** logged. They go to the caller's future and are counted in `failedTasks`; a stack
@@ -30,7 +31,10 @@ logging failure handler in the plugin or record `tuff.compute.TaskFailed`.
 ## Metrics
 
 Read a point-in-time snapshot with `scheduler.metrics()`. Counters are monotonic since the scheduler
-started; gauges describe the moment of capture; durations are averages over the scheduler's lifetime.
+started; gauges describe the moment of capture; durations are averages over the scheduler's lifetime. There
+is no admin command in this build: the snapshot is read through the Java API from a plugin, and JFR through
+the standard JDK tools. If the engine is not installed (see the scope note on the overview page), neither is
+available.
 
 | Metric | Meaning | Watch for |
 | --- | --- | --- |
@@ -120,7 +124,7 @@ size matters.
 
 | Symptom | First knob | Then | Caveat |
 | --- | --- | --- | --- |
-| Queue grows, workers busy | `workers.max-threads` or `workers.threads` | `adaptive.enabled: true` with a matching `max-concurrency` | More workers than cores only adds context switches |
+| Queue grows, workers busy | `workers.max-threads` or `workers.threads` | `adaptive.enabled: true` with a matching `max-concurrency` | More workers than the processor budget only adds context switches |
 | Queue grows, workers idle | Consumer `max-concurrent` | `fair-share-weight` | A share is a cap, not a reservation; check which consumer is at its limit |
 | Background work starves | `scheduling.priority-aging`, `aging-interval-millis` | `max-aging-boost` | Aging lifts priority, it does not preempt running work |
 | One consumer monopolises turns | `weighted-fair` + weights | Per-consumer `max-concurrent` | Weights only order dispatch while both queues have work |
@@ -144,13 +148,18 @@ These are deliberate, with the technical reason:
 - **No preemption or per-task timeout.** A running task holds its slot until it returns. Interrupting
   arbitrary user code is unsafe, and a watchdog that kills threads would corrupt plugin state.
 - **Cooperative cancellation only.** Queued work is removed immediately; running work is flagged and its
-  result discarded. A body that never checks the flag runs to completion.
+  result discarded. Consumer removal is the exception: running tasks finish and deliver their result, only
+  not-started work is cancelled. A body that never checks the flag runs to completion.
 - **Queue capacity needs a restart.** The queue allocates its bound at construction; growing it live would
   require a different structure with the same ordering guarantees.
-- **`queue.overflow-policy` is not consulted.** Both the global and the per-consumer bound use the
-  submitting consumer's `overflow-policy`. Configure `consumers.*` instead.
-- **No metrics exporter or console command.** Metrics are available through `SchedulerMetrics` and JFR.
-  Pushing them somewhere is the job of the consumer of that API.
+- **`queue.overflow-policy` is a default, not an override.** It applies to the `default` consumer and to
+  consumers registered on the fly; `consumers.<id>.overflow-policy` and an explicit `registerConsumer`
+  policy take precedence for their ids.
+- **No built-in consumers.** No server subsystem submits to the pool in this build. The three consumer
+  sections in the template are example policies; a plugin must submit under its own id.
+- **No admin command and no metrics exporter.** There is no `/tuff` command yet; metrics are read through
+  `TuffCompute.scheduler().metrics()` and JFR through the standard tools. Pushing them anywhere is the job of
+  the consumer of that API.
 - **The CPU figure is process-wide.** There is no cheap, honest pool-only CPU measurement on the JVM; a
   made-up number would be worse than `NaN`.
 - **Queue and worker gauges are sampled.** They can be one sample interval stale. Counters derived from
@@ -166,9 +175,11 @@ These are deliberate, with the technical reason:
   how an idle worker picks the next consumer to look at.
 - **Per-poll cost grows with the consumer count.** Selection is `O(consumers × log(entries per consumer))`.
   Use a stable consumer id per subsystem, never one per request.
-- **Automatic sizing approximates the rest of the server.** It subtracts a tick/reserve formula from the
-  core count, not the live region, chunk and IO thread counts. Set `threads` or `max-threads` explicitly on
-  large servers.
-- **Shutdown cancels queued work immediately.** The grace period only bounds the wait for running tasks,
-  and running tasks are never interrupted, so a task that never returns delays termination.
+- **Automatic sizing trusts the platform budget.** The engine only applies `Workers.resolveThreadCount`;
+  the quality of the number depends on the region, chunk and IO thread counts the server reports to
+  `ComputeThreadBudget`, and on the bootstrap calling `applyProcessorBudget(int)`. A direct engine
+  construction falls back to `Runtime.availableProcessors()`.
+- **Shutdown does not wait for running work forever.** Queued work is cancelled immediately. Running tasks
+  get the grace period; when it expires the scheduler terminates and the tasks keep running, with their
+  futures completing later.
 - **No state survives a restart.** Counters, queues and in-flight work are process-local by design.

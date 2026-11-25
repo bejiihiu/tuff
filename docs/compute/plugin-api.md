@@ -35,8 +35,9 @@ if (compute == null) {
 can be installed while the configuration disables the engine, and it can be shutting down. Always handle
 `ComputeRejectedException` and `ComputeShutdownException`.
 
-The scheduler is process-wide and owned by the server. Plugins never call `start()`, `shutdown()` or
-`TuffCompute.install()`.
+The scheduler is process-wide and owned by the server. The server bootstrap creates it, starts it and
+installs it before plugins enable; plugins never call `start()`, `shutdown()` or `TuffCompute.install()`.
+If the configuration disables the engine, the bootstrap installs nothing and `scheduler()` is empty.
 
 ## Submitting work
 
@@ -135,9 +136,10 @@ Relative limits are a share of the *current* limit, so they follow adaptive resi
 a reservation: a consumer with `0.5` is not guaranteed half the workers.
 
 `registerConsumer` replaces an existing policy with the same id, which makes plugin enable/disable cycles
-safe. `unregisterConsumer(id)` cancels queued work of that consumer with `CONSUMER_DISABLED` and flags
-running work; running tasks are not interrupted. `updateConsumerPolicy(id, policy)` requires the consumer
-to be registered and applies the new limits from the moment it returns.
+safe. `unregisterConsumer(id)` cancels queued work of that consumer with `CONSUMER_DISABLED`; tasks that
+already started are not cancelled — they run to completion and their future completes with the produced
+value, because workers are never interrupted. `updateConsumerPolicy(id, policy)` requires the consumer to be
+registered and applies the new limits from the moment it returns.
 
 ## Results, failures and refusals
 
@@ -149,6 +151,11 @@ to be registered and applies the new limits from the moment it returns.
 | Cancelled while running | `ComputeCancelledException` after the body returns | `CANCELLED` |
 | Queue wait expired | `ComputeCancelledException` `QUEUE_EXPIRED` | `CANCELLED` |
 | Evicted by `DROP_OLDEST` | `ComputeCancelledException` `EVICTED` | `CANCELLED` |
+
+On the future object itself, cancellation is a normal `CompletableFuture` cancellation: `future().isCancelled()`
+returns `true`, and `get()` / `join()` throw the `ComputeCancelledException` directly rather than wrapping it
+in `ExecutionException` (it extends `CancellationException`). Dependent stages such as `thenAccept` and
+`whenComplete` see the same exception as the completion error.
 
 Refusals throw from the submission call, not from the future:
 
@@ -199,10 +206,12 @@ self.set(handle);
 ```
 
 Workers are never interrupted, so `Thread.currentThread().isInterrupted()` is not a cancellation signal here;
-the handle flag is the only one.
+the handle flag is the only one. Consumer removal is narrower than a task cancel: only work that has not
+started is cancelled with `CONSUMER_DISABLED`, while running work finishes and delivers its result.
 
 Cancelling the future is equivalent: `future.cancel(true)` routes to `handle.cancel()` and never interrupts
-the worker. `cancel()` returns `false` if the task already ended; it is idempotent.
+the worker. After cancellation `future.isCancelled()` is `true`, and `get()`/`join()` throw the
+`ComputeCancelledException` directly. `cancel()` returns `false` if the task already ended; it is idempotent.
 
 `queueWaitNanos()` and `executionNanos()` return `-1` until the corresponding phase has happened.
 
