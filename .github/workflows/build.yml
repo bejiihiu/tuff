@@ -62,9 +62,11 @@ jobs:
           # checkoutPaperRepo already produced the upstream clone in the apply step.
           # Excluding it dodges a paperweight/Gradle 9 implicit-dependency validation
           # error: the rebuild tasks read that clone without declaring the dependency.
+          # --no-parallel is required: several rebuild tasks run `git add -A` in the
+          # same applied repositories, and in parallel they race on .git/index.lock.
           ./gradlew rebuildPaperApiPatches rebuildPaperCheckstylePatches \
             rebuildPaperCheckstyleConfigPatches :tuff-server:rebuildAllServerPatches \
-            -x checkoutPaperRepo --stacktrace
+            -x checkoutPaperRepo --no-parallel --stacktrace
           dirs="tuff-api/paper-patches tuff-server/paper-patches tuff-server/minecraft-patches tuff-checkstyle"
           dirty=$(git status --porcelain -- $dirs)
           if [ -n "$dirty" ]; then
