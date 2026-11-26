@@ -241,6 +241,23 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     }
 
     /**
+     * Rebuilds the budget ledger from the registry as it is now.
+     *
+     * <p>The ledger already refreshes itself when a spec changes, so this is not needed on the request
+     * path. It exists for bootstrap: the controller is built before any pool is registered, and the
+     * runtime wants {@link #plan()} to describe the registered set before the first lease or snapshot
+     * asks for it. Held permits and parked waiters are preserved.
+     */
+    public void refresh() {
+        this.lock.lock();
+        try {
+            this.ledger = this.buildLedger(this.ledger.states());
+        } finally {
+            this.lock.unlock();
+        }
+    }
+
+    /**
      * Returns how many permits of a pool are currently held.
      *
      * @param pool pool id
