@@ -12,6 +12,7 @@ import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ComputeTaskType;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.OverflowPolicy;
+import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.config.ConfigDiff;
 import kz.bejiihiu.tuff.compute.config.ConfigLoadResult;
 import kz.bejiihiu.tuff.compute.config.ConfigProblem;
@@ -72,6 +73,8 @@ class ComputeReportTest {
             assertTrue(report.contains("workers: "), report);
             assertTrue(report.contains("live ("), report);
             assertTrue(report.contains("concurrency limit "), report);
+            assertTrue(report.contains("lanes: platform "), report);
+            assertTrue(report.contains("virtual 0/64"), report);
             assertTrue(report.contains("queue: 0 / " + QUEUE_CAPACITY), report);
             assertTrue(report.contains("tasks: 1 submitted, 1 completed, 0 failed, 0 rejected, 0 cancelled, 0 expired"), report);
             assertTrue(report.contains("throughput: "), report);
@@ -80,6 +83,7 @@ class ComputeReportTest {
             assertTrue(report.contains("cpu: "), report);
             assertTrue(report.contains("settings: workers requested 2, 2 live (min 1, max 2"), report);
             assertTrue(report.contains("queue " + QUEUE_CAPACITY + " REJECT"), report);
+            assertTrue(report.contains("lane settings: virtual lane enabled, LOW on the virtual lane"), report);
         } finally {
             stopScheduler(scheduler);
         }
@@ -190,6 +194,72 @@ class ComputeReportTest {
         assertFalse(report.contains("applied now"), report);
         assertTrue(report.contains("saved for a consumer id that is not registered yet: ghost"), report);
         assertFalse(report.contains("takes effect after a restart"), report);
+    }
+
+    @Test
+    void laneLinesSeparateThePlatformPoolFromTheVirtualLane() {
+        assertEquals(
+            "  lanes: platform 4/5 (3 busy, 1 idle) | virtual 12/64 (9 queued, 3 spilled)",
+            ComputeReport.describeLanes(
+                4,
+                3,
+                1,
+                5,
+                new SchedulerMetrics.VirtualLaneMetrics(true, 12, 64, 9, 20L, 8L, 0L, 1L, 3L)
+            )
+        );
+    }
+
+    @Test
+    void laneLinesHandleAnIdleEngineAndADisabledLane() {
+        assertEquals(
+            "  lanes: platform 0/1 (0 busy, 0 idle) | virtual 0/64 (0 queued, 0 spilled)",
+            ComputeReport.describeLanes(
+                0,
+                0,
+                0,
+                1,
+                new SchedulerMetrics.VirtualLaneMetrics(true, 0, 64, 0, 0L, 0L, 0L, 0L, 0L)
+            )
+        );
+        assertEquals(
+            "  lanes: platform 2/2 (0 busy, 2 idle) | virtual disabled (LOW tasks use the platform workers)",
+            ComputeReport.describeLanes(2, 0, 2, 2, SchedulerMetrics.VirtualLaneMetrics.disabled())
+        );
+    }
+
+    @Test
+    void laneSettingsShowThresholdsAndTheDisabledDepthTrigger() {
+        assertEquals(
+            "  lane settings: virtual lane enabled, LOW on the virtual lane, NORMAL spills when saturated, "
+                + "max-concurrent 64, spill after 50 ms or 64 queued NORMAL tasks",
+            ComputeReport.describeLaneSettings(ComputeSettings.Lanes.Virtual.defaults())
+        );
+        assertEquals(
+            "  lane settings: virtual lane enabled, LOW on the platform workers, NORMAL never spills, "
+                + "max-concurrent 8, spill after 0 ms (queue depth trigger off)",
+            ComputeReport.describeLaneSettings(
+                new ComputeSettings.Lanes.Virtual(true, false, false, 8, Duration.ZERO, 0)
+            )
+        );
+        assertEquals(
+            "  lane settings: virtual lane disabled, LOW tasks run on the platform workers",
+            ComputeReport.describeLaneSettings(ComputeSettings.Lanes.Virtual.withoutVirtual())
+        );
+    }
+
+    @Test
+    void laneChangesAreReportedAsNeedingARestart() {
+        final ConfigDiff diff = new ConfigDiff(
+            List.of("async-compute.lanes.virtual.max-concurrent"),
+            List.of("async-compute.lanes.virtual.max-concurrent")
+        );
+        final ConfigLoadResult result = new ConfigLoadResult(ComputeSettings.defaults(), List.of(), diff, false, false);
+        final String report = String.join("\n", ComputeReport.reload(
+            new ReloadReport(result, List.of(), List.of(), List.of("async-compute.lanes.virtual.max-concurrent"))));
+
+        assertTrue(report.contains("takes effect after a restart: async-compute.lanes.virtual.max-concurrent"), report);
+        assertFalse(report.contains("applied now"), report);
     }
 
     @Test

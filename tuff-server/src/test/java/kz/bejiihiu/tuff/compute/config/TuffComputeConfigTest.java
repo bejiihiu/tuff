@@ -170,6 +170,39 @@ class TuffComputeConfigTest {
     }
 
     @Test
+    void laneChangesRequireARestart() throws IOException {
+        final TuffComputeConfig config = TuffComputeConfig.inDirectory(this.directory);
+        Files.writeString(this.file(), """
+            async-compute:
+              lanes:
+                virtual:
+                  max-concurrent: 64
+                  spill-queue-depth: 64
+            """, StandardCharsets.UTF_8);
+        config.load();
+
+        Files.writeString(this.file(), """
+            async-compute:
+              lanes:
+                virtual:
+                  max-concurrent: 8
+                  spill-queue-depth: 0
+            """, StandardCharsets.UTF_8);
+        final ConfigLoadResult reloaded = config.reload();
+
+        assertEquals(8, config.settings().lanes().virtual().maxConcurrent());
+        assertEquals(0, config.settings().lanes().virtual().spillQueueDepth());
+        assertEquals(
+            List.of(
+                "async-compute.lanes.virtual.max-concurrent",
+                "async-compute.lanes.virtual.spill-queue-depth"
+            ),
+            reloaded.diff().restartRequiredPaths()
+        );
+        assertTrue(reloaded.diff().livePaths().isEmpty());
+    }
+
+    @Test
     void applyTargetSeesOnlyRealChanges() throws IOException {
         final TuffComputeConfig config = TuffComputeConfig.inDirectory(this.directory);
         Files.writeString(this.file(), """

@@ -16,6 +16,10 @@ import java.util.TreeSet;
  * live pool. Keys in {@link #changedPaths()} that are not in {@link #restartRequiredPaths()} are the
  * ones an engine implementation may pick up at runtime.
  *
+ * <p>The lane tree is immutable engine wiring: the virtual lane is created (or not) with the
+ * scheduler, so every {@code async-compute.lanes.*} key needs a restart even though the file keeps
+ * the new value for the next start.
+ *
  * @param changedPaths         every key whose effective value differs, sorted
  * @param restartRequiredPaths the subset that a running scheduler cannot adopt safely, sorted
  */
@@ -33,7 +37,8 @@ public record ConfigDiff(List<String> changedPaths, List<String> restartRequired
     );
 
     private static final List<String> RESTART_PREFIXES = List.of(
-        "async-compute.scheduling."
+        "async-compute.scheduling.",
+        "async-compute.lanes."
     );
 
     /**

@@ -75,6 +75,13 @@ public final class ComputeReport {
         lines.add(INDENT + "workers: " + metrics.totalWorkers() + " live (" + metrics.activeWorkers() + " busy, "
             + metrics.idleWorkers() + " idle), concurrency limit " + metrics.concurrencyLimit()
             + ", peak " + metrics.peakWorkers());
+        lines.add(describeLanes(
+            metrics.totalWorkers(),
+            metrics.activeWorkers(),
+            metrics.idleWorkers(),
+            metrics.concurrencyLimit(),
+            metrics.lanes().virtual()
+        ));
         lines.add(INDENT + "queue: " + metrics.queuedTasks() + " / " + metrics.queueCapacity());
         lines.add(INDENT + "tasks: " + metrics.submittedTasks() + " submitted, " + metrics.completedTasks()
             + " completed, " + metrics.failedTasks() + " failed, " + metrics.rejectedTasks() + " rejected, "
@@ -88,6 +95,7 @@ public final class ComputeReport {
         lines.add(INDENT + "settings: workers " + describeWorkers(settings.workers(), metrics.totalWorkers())
             + ", queue " + settings.queue().capacity() + " " + settings.queue().overflowPolicy()
             + ", scheduling " + settings.scheduling().strategy());
+        lines.add(describeLaneSettings(settings.lanes().virtual()));
         return List.copyOf(lines);
     }
 
@@ -215,6 +223,65 @@ public final class ComputeReport {
 
     private static String describeState(final AsyncComputeScheduler.SchedulerState state) {
         return state.name().toLowerCase(Locale.ROOT).replace('_', ' ');
+    }
+
+    /**
+     * Builds the lane line: the platform pool on the left, the virtual lane on the right.
+     *
+     * <p>The platform pair is live workers over the current concurrency limit, which adaptive
+     * concurrency may keep below the pool size. Virtual numbers come from
+     * {@link SchedulerMetrics.VirtualLane}: {@code running} and {@code limit} are gauges,
+     * {@code queued} is the lane backlog (LOW entries plus spill eligible NORMAL entries) and
+     * {@code spilled} is the cumulative number of NORMAL tasks that left the platform lane since the
+     * scheduler started, not a current gauge.
+     *
+     * @param liveWorkers      worker threads that exist
+     * @param busyWorkers      workers executing a task
+     * @param idleWorkers      workers waiting for a task
+     * @param concurrencyLimit current scheduler concurrency limit
+     * @param virtual          virtual lane snapshot
+     * @return the formatted line
+     */
+    static String describeLanes(
+        final int liveWorkers,
+        final int busyWorkers,
+        final int idleWorkers,
+        final int concurrencyLimit,
+        final SchedulerMetrics.VirtualLane virtual
+    ) {
+        final String platform = "lanes: platform " + liveWorkers + "/" + concurrencyLimit
+            + " (" + busyWorkers + " busy, " + idleWorkers + " idle)";
+        if (!virtual.enabled()) {
+            return INDENT + platform + " | virtual disabled (LOW tasks use the platform workers)";
+        }
+        return INDENT + platform + " | virtual " + virtual.running() + "/" + virtual.limit()
+            + " (" + virtual.queued() + " queued, " + virtual.spilled() + " spilled)";
+    }
+
+    /**
+     * Builds the line with the effective virtual lane settings.
+     *
+     * <p>This is the configuration the running engine was created with, not what the last reload
+     * read: lane settings need a restart before they change anything.
+     *
+     * @param virtual configured virtual lane
+     * @return the formatted line
+     */
+    static String describeLaneSettings(final ComputeSettings.Lanes.Virtual virtual) {
+        if (!virtual.enabled()) {
+            return INDENT + "lane settings: virtual lane disabled, LOW tasks run on the platform workers";
+        }
+        final StringBuilder out = new StringBuilder(INDENT).append("lane settings: virtual lane enabled, ");
+        out.append(virtual.lowPriority() ? "LOW on the virtual lane" : "LOW on the platform workers");
+        out.append(", ").append(virtual.normalSpill() ? "NORMAL spills when saturated" : "NORMAL never spills");
+        out.append(", max-concurrent ").append(virtual.maxConcurrent());
+        out.append(", spill after ").append(virtual.spillWait().toMillis()).append(" ms");
+        if (virtual.spillQueueDepth() == 0) {
+            out.append(" (queue depth trigger off)");
+        } else {
+            out.append(" or ").append(virtual.spillQueueDepth()).append(" queued NORMAL tasks");
+        }
+        return out.toString();
     }
 
     private static String describeWorkers(final ComputeSettings.Workers workers, final int liveWorkers) {

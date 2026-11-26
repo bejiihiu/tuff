@@ -35,6 +35,7 @@ class ComputeConfigParserTest {
         assertEquals(defaults.scheduling(), parsed.settings().scheduling());
         assertEquals(defaults.metrics(), parsed.settings().metrics());
         assertEquals(defaults.adaptive(), parsed.settings().adaptive());
+        assertEquals(defaults.lanes(), parsed.settings().lanes());
         assertEquals(defaults.shutdownGracePeriod(), parsed.settings().shutdownGracePeriod());
 
         assertEquals(defaults.consumers().defaultPolicy(), parsed.settings().consumers().defaultPolicy());
@@ -114,6 +115,14 @@ class ComputeConfigParserTest {
                 increase-step: 0.2
                 decrease-factor: 0.4
                 target-utilization: 0.8
+              lanes:
+                virtual:
+                  enabled: false
+                  low-priority: false
+                  normal-spill: false
+                  max-concurrent: 16
+                  spill-wait-millis: 0
+                  spill-queue-depth: 0
               shutdown-grace-seconds: 7
             """);
 
@@ -168,6 +177,12 @@ class ComputeConfigParserTest {
             new ComputeSettings.Adaptive(true, 2, 6, Duration.ofSeconds(15), 30, 0.2d, 0.4d, 0.8d),
             settings.adaptive()
         );
+        assertEquals(
+            new ComputeSettings.Lanes(
+                new ComputeSettings.Lanes.Virtual(false, false, false, 16, Duration.ZERO, 0)
+            ),
+            settings.lanes()
+        );
         assertEquals(Duration.ofSeconds(7), settings.shutdownGracePeriod());
     }
 
@@ -187,6 +202,7 @@ class ComputeConfigParserTest {
         assertEquals(defaults.consumers(), parsed.settings().consumers());
         assertEquals(defaults.metrics(), parsed.settings().metrics());
         assertEquals(defaults.adaptive(), parsed.settings().adaptive());
+        assertEquals(defaults.lanes(), parsed.settings().lanes());
         assertEquals(defaults.shutdownGracePeriod(), parsed.settings().shutdownGracePeriod());
     }
 
@@ -266,6 +282,10 @@ class ComputeConfigParserTest {
                   turbo: 2
               metrics:
                 flame-graphs: true
+              lanes:
+                extra: 1
+                virtual:
+                  turbo: true
             """);
 
         assertProblem(parsed.problems(), "other-section", "unknown key");
@@ -273,9 +293,98 @@ class ComputeConfigParserTest {
         assertProblem(parsed.problems(), "async-compute.workers.turbo", "unknown key");
         assertProblem(parsed.problems(), "async-compute.consumers.mystery-consumer.turbo", "unknown key");
         assertProblem(parsed.problems(), "async-compute.metrics.flame-graphs", "unknown key");
+        assertProblem(parsed.problems(), "async-compute.lanes.extra", "unknown key");
+        assertProblem(parsed.problems(), "async-compute.lanes.virtual.turbo", "unknown key");
 
         assertEquals(2, parsed.settings().workers().threads());
         assertNotNull(parsed.settings().consumers().overrides().get("mystery-consumer"));
+    }
+
+    @Test
+    void missingLaneSectionsKeepTheDefaults() {
+        final Parsed onlyVirtual = parse("""
+            async-compute:
+              lanes:
+                virtual:
+                  enabled: false
+            """);
+
+        assertTrue(onlyVirtual.problems().isEmpty(), () -> "unexpected problems " + onlyVirtual.problems());
+        assertEquals(
+            new ComputeSettings.Lanes.Virtual(false, true, true, 64, Duration.ofMillis(50L), 64),
+            onlyVirtual.settings().lanes().virtual()
+        );
+
+        final Parsed empty = parse("""
+            async-compute:
+              lanes: {}
+            """);
+
+        assertTrue(empty.problems().isEmpty(), () -> "unexpected problems " + empty.problems());
+        assertEquals(ComputeSettings.Lanes.defaults(), empty.settings().lanes());
+    }
+
+    @Test
+    void brokenVirtualLaneValuesFallBackPerKey() {
+        final Parsed parsed = parse("""
+            async-compute:
+              lanes:
+                virtual:
+                  enabled: "sometimes"
+                  low-priority: 2
+                  normal-spill: 1
+                  max-concurrent: 0
+                  spill-wait-millis: -5
+                  spill-queue-depth: -1
+            """);
+
+        assertEquals(ComputeSettings.Lanes.defaults().virtual(), parsed.settings().lanes().virtual());
+        assertProblem(parsed.problems(), "async-compute.lanes.virtual.enabled", "true or false");
+        assertProblem(parsed.problems(), "async-compute.lanes.virtual.low-priority", "true or false");
+        assertProblem(parsed.problems(), "async-compute.lanes.virtual.normal-spill", "true or false");
+        assertProblem(parsed.problems(), "async-compute.lanes.virtual.max-concurrent", "at least 1");
+        assertProblem(parsed.problems(), "async-compute.lanes.virtual.spill-wait-millis", "must not be negative");
+        assertProblem(parsed.problems(), "async-compute.lanes.virtual.spill-queue-depth", "must not be negative");
+    }
+
+    @Test
+    void virtualLaneAcceptsZeroOneAndLargeValues() {
+        final Parsed minimal = parse("""
+            async-compute:
+              lanes:
+                virtual:
+                  max-concurrent: 1
+                  spill-wait-millis: 0
+                  spill-queue-depth: 0
+            """);
+
+        assertTrue(minimal.problems().isEmpty(), () -> "unexpected problems " + minimal.problems());
+        assertEquals(
+            new ComputeSettings.Lanes.Virtual(true, true, true, 1, Duration.ZERO, 0),
+            minimal.settings().lanes().virtual()
+        );
+
+        final Parsed large = parse("""
+            async-compute:
+              lanes:
+                virtual:
+                  max-concurrent: 2147483647
+                  spill-wait-millis: 2147483647
+                  spill-queue-depth: 2147483647
+            """);
+
+        assertTrue(large.problems().isEmpty(), () -> "unexpected problems " + large.problems());
+        assertEquals(
+            new ComputeSettings.Lanes.Virtual(
+                true,
+                true,
+                true,
+                Integer.MAX_VALUE,
+                Duration.ofMillis(Integer.MAX_VALUE),
+                Integer.MAX_VALUE
+            ),
+            large.settings().lanes().virtual()
+        );
     }
 
     @Test

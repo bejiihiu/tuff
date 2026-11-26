@@ -11,8 +11,8 @@
 # server.
 #
 # The file is read at startup and re-read by /tuff reload. A few settings are baked into the running
-# pool (enabled, queue capacity, scheduling, adaptive.enabled, dynamic registration); the reload log
-# lists them as "takes effect after a restart".
+# pool (enabled, queue capacity, scheduling, adaptive.enabled, dynamic registration, lanes); the
+# reload log lists them as "takes effect after a restart".
 
 async-compute:
   # Master switch. When false the scheduler starts no worker threads and every submission is
@@ -148,6 +148,34 @@ async-compute:
     decrease-factor: 0.5
     # Estimated utilisation the controller aims for, in (0.0, 1.0].
     target-utilization: 0.9
+
+  lanes:
+    # Execution lanes. The platform lane is the worker pool above. The virtual lane runs tasks on
+    # Java virtual threads and has its own hard limit of concurrent tasks.
+    #
+    # The virtual lane is for blocking or IO bound work, and as a deadlock breaker when a task waits
+    # on something a worker thread would otherwise hold up. Virtual threads add no CPU parallelism:
+    # CPU bound work on the lane competes with the platform workers for the same cores and can slow
+    # the server down, so keep CPU bound work on the platform lane.
+    virtual:
+      # Create the virtual lane. When false, LOW tasks fall back to the platform workers, which is
+      # the behaviour before lanes existed. Changing this needs a restart.
+      enabled: true
+      # Route LOW priority tasks to the virtual lane. They never occupy a platform worker; when the
+      # lane limit is reached they wait in the bounded queue instead of moving to the workers.
+      low-priority: true
+      # Let NORMAL tasks spill to the virtual lane while every platform worker is busy and one of
+      # the thresholds below is met. HIGH and CRITICAL tasks never spill.
+      normal-spill: true
+      # Hard limit of virtual tasks executing at the same time. At least 1. This is a ceiling, not a
+      # reservation, and the lane never grows the platform pool or the processor budget.
+      max-concurrent: 64
+      # Milliseconds a NORMAL task must have waited before it may spill while the platform pool is
+      # saturated. 0 means every waiting NORMAL task may spill as soon as the pool is full.
+      spill-wait-millis: 50
+      # NORMAL queue depth at which a task may spill regardless of its wait. 0 turns the depth
+      # trigger off, so spill-wait-millis stays the only condition.
+      spill-queue-depth: 64
 
   # Seconds a graceful shutdown lets running tasks finish. Queued tasks that did not start are
   # cancelled. Kept short because the world save runs right after the pool stops.

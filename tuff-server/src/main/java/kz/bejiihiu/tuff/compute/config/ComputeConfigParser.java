@@ -45,13 +45,15 @@ final class ComputeConfigParser {
     private static final String CONSUMERS_PATH = SECTION + ".consumers";
     private static final String METRICS_PATH = SECTION + ".metrics";
     private static final String ADAPTIVE_PATH = SECTION + ".adaptive";
+    private static final String LANES_PATH = SECTION + ".lanes";
+    private static final String LANE_VIRTUAL_PATH = LANES_PATH + ".virtual";
 
     private static final String DEFAULT_CONSUMER = "default";
     private static final String ALLOW_DYNAMIC_REGISTRATION = "allow-dynamic-registration";
 
     private static final Set<String> ROOT_KEYS = Set.of(SECTION);
     private static final Set<String> SETTINGS_KEYS = Set.of(
-        "enabled", "workers", "queue", "scheduling", "consumers", "metrics", "adaptive", "shutdown-grace-seconds"
+        "enabled", "workers", "queue", "scheduling", "consumers", "metrics", "adaptive", "lanes", "shutdown-grace-seconds"
     );
     private static final Set<String> WORKER_KEYS = Set.of(
         "threads", "min-threads", "max-threads", "keep-alive-seconds", "thread-name-prefix"
@@ -70,6 +72,10 @@ final class ComputeConfigParser {
     private static final Set<String> ADAPTIVE_KEYS = Set.of(
         "enabled", "min-concurrency", "max-concurrency", "sample-window-seconds", "min-samples",
         "increase-step", "decrease-factor", "target-utilization"
+    );
+    private static final Set<String> LANES_KEYS = Set.of("virtual");
+    private static final Set<String> LANE_VIRTUAL_KEYS = Set.of(
+        "enabled", "low-priority", "normal-spill", "max-concurrent", "spill-wait-millis", "spill-queue-depth"
     );
 
     private ComputeConfigParser() {
@@ -116,10 +122,11 @@ final class ComputeConfigParser {
         final ComputeSettings.Consumers consumers = parseConsumers(readSection(root, "consumers", CONSUMERS_PATH, problems), defaults.consumers(), problems);
         final ComputeSettings.Metrics metrics = parseMetrics(readSection(root, "metrics", METRICS_PATH, problems), defaults.metrics(), problems);
         final ComputeSettings.Adaptive adaptive = parseAdaptive(readSection(root, "adaptive", ADAPTIVE_PATH, problems), defaults.adaptive(), problems);
+        final ComputeSettings.Lanes lanes = parseLanes(readSection(root, "lanes", LANES_PATH, problems), defaults.lanes(), problems);
         final Duration grace = readSeconds(root, "shutdown-grace-seconds", defaults.shutdownGracePeriod(), true, SECTION + ".shutdown-grace-seconds", problems);
 
         try {
-            return new ComputeSettings(enabled, workers, queue, scheduling, consumers, metrics, adaptive, grace);
+            return new ComputeSettings(enabled, workers, queue, scheduling, consumers, metrics, adaptive, lanes, grace);
         } catch (final IllegalArgumentException | NullPointerException ex) {
             // sections are validated on their own, so this only catches a cross-section mistake we do
             // not know about - keep the server alive and say so
@@ -179,6 +186,14 @@ final class ComputeConfigParser {
         flat.put(ADAPTIVE_PATH + ".increase-step", Double.toString(adaptive.increaseStep()));
         flat.put(ADAPTIVE_PATH + ".decrease-factor", Double.toString(adaptive.decreaseFactor()));
         flat.put(ADAPTIVE_PATH + ".target-utilization", Double.toString(adaptive.targetUtilization()));
+
+        final ComputeSettings.Lanes.Virtual virtual = settings.lanes().virtual();
+        flat.put(LANE_VIRTUAL_PATH + ".enabled", Boolean.toString(virtual.enabled()));
+        flat.put(LANE_VIRTUAL_PATH + ".low-priority", Boolean.toString(virtual.lowPriority()));
+        flat.put(LANE_VIRTUAL_PATH + ".normal-spill", Boolean.toString(virtual.normalSpill()));
+        flat.put(LANE_VIRTUAL_PATH + ".max-concurrent", Integer.toString(virtual.maxConcurrent()));
+        flat.put(LANE_VIRTUAL_PATH + ".spill-wait-millis", Long.toString(virtual.spillWait().toMillis()));
+        flat.put(LANE_VIRTUAL_PATH + ".spill-queue-depth", Integer.toString(virtual.spillQueueDepth()));
 
         flat.put(SECTION + ".shutdown-grace-seconds", formatSeconds(settings.shutdownGracePeriod()));
         return flat;
@@ -328,6 +343,65 @@ final class ComputeConfigParser {
             return new ComputeSettings.Adaptive(enabled, minConcurrency, maxConcurrency, window, minSamples, increase, decrease, target);
         } catch (final IllegalArgumentException | NullPointerException ex) {
             problems.add(new ConfigProblem(ADAPTIVE_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
+            return fallback;
+        }
+    }
+
+    private static ComputeSettings.Lanes parseLanes(
+        final @Nullable ConfigurationSection section,
+        final ComputeSettings.Lanes fallback,
+        final List<ConfigProblem> problems
+    ) {
+        if (section == null) {
+            return fallback;
+        }
+        final ComputeSettings.Lanes.Virtual virtual = parseVirtualLane(
+            readSection(section, "virtual", LANE_VIRTUAL_PATH, problems),
+            fallback.virtual(),
+            problems
+        );
+        try {
+            return new ComputeSettings.Lanes(virtual);
+        } catch (final IllegalArgumentException | NullPointerException ex) {
+            problems.add(new ConfigProblem(LANES_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
+            return fallback;
+        }
+    }
+
+    private static ComputeSettings.Lanes.Virtual parseVirtualLane(
+        final @Nullable ConfigurationSection section,
+        final ComputeSettings.Lanes.Virtual fallback,
+        final List<ConfigProblem> problems
+    ) {
+        if (section == null) {
+            return fallback;
+        }
+        final boolean enabled = readBoolean(section, "enabled", fallback.enabled(), LANE_VIRTUAL_PATH + ".enabled", problems);
+        final boolean lowPriority = readBoolean(section, "low-priority", fallback.lowPriority(), LANE_VIRTUAL_PATH + ".low-priority", problems);
+        final boolean normalSpill = readBoolean(section, "normal-spill", fallback.normalSpill(), LANE_VIRTUAL_PATH + ".normal-spill", problems);
+        int maxConcurrent = readInt(section, "max-concurrent", fallback.maxConcurrent(), LANE_VIRTUAL_PATH + ".max-concurrent", problems);
+        final Duration spillWait = readMillis(section, "spill-wait-millis", fallback.spillWait(), true, LANE_VIRTUAL_PATH + ".spill-wait-millis", problems);
+        int spillQueueDepth = readInt(section, "spill-queue-depth", fallback.spillQueueDepth(), LANE_VIRTUAL_PATH + ".spill-queue-depth", problems);
+        // clamp the two counts at their own keys; losing the whole lane over one bad number would
+        // also reset the thresholds that were written correctly
+        if (maxConcurrent < 1) {
+            problems.add(new ConfigProblem(
+                LANE_VIRTUAL_PATH + ".max-concurrent",
+                "must be at least 1, got " + maxConcurrent + "; using " + fallback.maxConcurrent()
+            ));
+            maxConcurrent = fallback.maxConcurrent();
+        }
+        if (spillQueueDepth < 0) {
+            problems.add(new ConfigProblem(
+                LANE_VIRTUAL_PATH + ".spill-queue-depth",
+                "must not be negative, got " + spillQueueDepth + "; using " + fallback.spillQueueDepth()
+            ));
+            spillQueueDepth = fallback.spillQueueDepth();
+        }
+        try {
+            return new ComputeSettings.Lanes.Virtual(enabled, lowPriority, normalSpill, maxConcurrent, spillWait, spillQueueDepth);
+        } catch (final IllegalArgumentException | NullPointerException ex) {
+            problems.add(new ConfigProblem(LANE_VIRTUAL_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
             return fallback;
         }
     }
@@ -748,6 +822,15 @@ final class ComputeConfigParser {
         reportUnknownIn(root.getConfigurationSection("scheduling"), SCHEDULING_PATH, SCHEDULING_KEYS, problems);
         reportUnknownIn(root.getConfigurationSection("metrics"), METRICS_PATH, METRICS_KEYS, problems);
         reportUnknownIn(root.getConfigurationSection("adaptive"), ADAPTIVE_PATH, ADAPTIVE_KEYS, problems);
+
+        final ConfigurationSection lanes = root.getConfigurationSection("lanes");
+        reportUnknownIn(lanes, LANES_PATH, LANES_KEYS, problems);
+        reportUnknownIn(
+            lanes == null ? null : lanes.getConfigurationSection("virtual"),
+            LANE_VIRTUAL_PATH,
+            LANE_VIRTUAL_KEYS,
+            problems
+        );
 
         final ConfigurationSection consumers = root.getConfigurationSection("consumers");
         if (consumers == null) {
