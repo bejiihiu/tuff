@@ -8,9 +8,10 @@ import kz.bejiihiu.tuff.compute.config.ConfigLoadResult;
  * Outcome of a {@code /tuff compute reload}, split into what changed now and what has to wait.
  *
  * <p>The configuration layer reports every changed key in one list. The scheduler, however, can only
- * adopt a new consumer policy on a live pool: worker sizing, queue capacity and the metrics switches
- * are baked into the engine that was created at startup, because {@code AsyncComputeScheduler}
- * exposes its settings as an immutable snapshot. Even a consumer policy is applied only when that
+ * adopt a new consumer policy on a live pool: worker sizing, queue capacity, scheduling, metrics,
+ * adaptive control, the lanes and the shutdown grace period are baked into the engine that was
+ * created at startup, because {@code AsyncComputeScheduler} exposes its settings as an immutable
+ * snapshot. Even a consumer policy is applied only when that
  * consumer is registered at the moment; an override for an id nobody uses is kept for when it
  * registers, not reported as applied. The report keeps the groups apart instead of pretending that
  * everything was applied.

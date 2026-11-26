@@ -16,9 +16,11 @@ import java.util.TreeSet;
  * live pool. Keys in {@link #changedPaths()} that are not in {@link #restartRequiredPaths()} are the
  * ones an engine implementation may pick up at runtime.
  *
- * <p>The lane tree is immutable engine wiring: the virtual lane is created (or not) with the
- * scheduler, so every {@code async-compute.lanes.*} key needs a restart even though the file keeps
- * the new value for the next start.
+ * <p>The engine takes its settings as one immutable snapshot at start, so most of the tree is
+ * startup-only: worker sizing, queue capacity, scheduling, metrics, adaptive control, the lanes and
+ * the shutdown grace period all need a restart even though the file keeps the new value for the next
+ * start. Only consumer policies (and {@code queue.overflow-policy}, which feeds them) can change on
+ * a live pool.
  *
  * @param changedPaths         every key whose effective value differs, sorted
  * @param restartRequiredPaths the subset that a running scheduler cannot adopt safely, sorted
@@ -33,11 +35,14 @@ public record ConfigDiff(List<String> changedPaths, List<String> restartRequired
         "async-compute.enabled",
         "async-compute.queue.capacity",
         "async-compute.consumers.allow-dynamic-registration",
-        "async-compute.adaptive.enabled"
+        "async-compute.shutdown-grace-seconds"
     );
 
     private static final List<String> RESTART_PREFIXES = List.of(
+        "async-compute.workers.",
         "async-compute.scheduling.",
+        "async-compute.metrics.",
+        "async-compute.adaptive.",
         "async-compute.lanes."
     );
 

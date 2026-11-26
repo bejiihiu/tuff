@@ -50,6 +50,15 @@ public final class ComputeBootstrap {
 
     private static final Object LOCK = new Object();
 
+    /**
+     * Hard ceiling of the wait after {@code shutdown(grace)}.
+     *
+     * <p>{@code /restart} gives the server roughly ten seconds before the process is killed and the
+     * world save runs right after this hook, so the compute stop has to leave room for both. The
+     * grace period already waits for the drain; the extra second covers the bookkeeping after it.
+     */
+    private static final Duration SHUTDOWN_AWAIT_CAP = Duration.ofSeconds(5L);
+
     private static volatile ComputeStatus status = ComputeStatus.notInitialised();
     private static volatile @Nullable TuffComputeConfig config;
     private static volatile List<String> lastAppliedConsumers = List.of();
@@ -133,8 +142,9 @@ public final class ComputeBootstrap {
      * Stops the engine while the server shuts down.
      *
      * <p>Called after plugins are disabled and their async tasks finished, before the world save
-     * starts. Running tasks get the configured grace period, then the pool is given five more seconds
-     * to report {@code TERMINATED}; nothing here throws, so a stuck task cannot break the shutdown.
+     * starts. Running tasks get the configured grace period, then the pool is given a bounded wait
+     * (see {@link #shutdownTimeout(Duration)}) to report {@code TERMINATED}; nothing here throws, so
+     * a stuck task cannot break the shutdown.
      */
     public static void stop() {
         ComputeJfr.shutdown();
@@ -156,7 +166,7 @@ public final class ComputeBootstrap {
         }
 
         final Duration grace = scheduler.settings().shutdownGracePeriod();
-        final Duration timeout = grace.plusSeconds(5L);
+        final Duration timeout = shutdownTimeout(grace);
         final long startNanos = System.nanoTime();
         try {
             scheduler.shutdown(grace);
@@ -175,6 +185,21 @@ public final class ComputeBootstrap {
         } catch (final Throwable ex) {
             LOGGER.error("Failed to stop the Tuff compute engine", ex);
         }
+    }
+
+    /**
+     * Works out how long the shutdown may wait for {@code TERMINATED}.
+     *
+     * <p>The grace period plus one second for the steps that follow it, capped at five seconds: a
+     * {@code /restart} gives the whole shutdown about ten seconds and the world save still has to
+     * run, so this hook must not eat the budget even when the file asks for a long grace.
+     *
+     * @param grace configured shutdown grace period
+     * @return the wait bound, never longer than five seconds
+     */
+    static Duration shutdownTimeout(final Duration grace) {
+        final Duration wanted = grace.plusSeconds(1L);
+        return wanted.compareTo(SHUTDOWN_AWAIT_CAP) > 0 ? SHUTDOWN_AWAIT_CAP : wanted;
     }
 
     /**
@@ -263,10 +288,11 @@ public final class ComputeBootstrap {
      * Applies one configuration snapshot to a running engine.
      *
      * <p>Only consumer policies can change on a live pool: {@code AsyncComputeScheduler} keeps its
-     * settings as an immutable snapshot, so worker sizing, queue capacity and the metrics switches are
-     * baked into the engine created at startup. Those keys are reported as "after a restart" instead
-     * of being silently ignored. Even among consumers, only the ones whose configured policy really
-     * changed are touched, and a policy a plugin passed to {@code registerConsumer} stays unless the
+     * settings as an immutable snapshot, so worker sizing, queue capacity, scheduling, metrics, the
+     * adaptive controller and the shutdown grace period are baked into the engine created at startup.
+     * Those keys are reported as "after a restart" instead of being silently ignored. Even among
+     * consumers, only the ones whose configured policy really changed are touched, and a policy a
+     * plugin passed to {@code registerConsumer} stays unless the
      * file has an explicit override for that id. Called with the configuration lock held, so it must
      * stay cheap.
      *

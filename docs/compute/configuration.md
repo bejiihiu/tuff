@@ -13,7 +13,7 @@ async-compute:
   consumers: { ... }
   metrics: { ... }
   adaptive: { ... }
-  shutdown-grace-seconds: 10
+  shutdown-grace-seconds: 5
 ```
 
 Rules that apply to the whole file:
@@ -37,14 +37,16 @@ publishes an immutable snapshot and logs every problem. The command prints the s
 A live pool adopts very little. The bootstrap compares the previous and the updated effective policy of
 every consumer that is **already registered on the engine** and calls
 `AsyncComputeScheduler#updateConsumerPolicy` for the ones that differ. Everything else — `enabled`,
-`workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*`, `shutdown-grace-seconds` — is
+`workers.*`, `queue.capacity`, `scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*`,
+`shutdown-grace-seconds` — is
 reported as `takes effect after a restart`. Consumer overrides for ids that are not registered yet are not
 applied either: dynamic registration reads the policy from the engine's startup snapshot, so a new consumer
 gets its new limits only after a restart. Such an override is not added to the deferred list either.
 
-The loader's `ConfigDiff` marks a narrower restart set (`enabled`, `queue.capacity`, `scheduling.*`,
-`lanes.*`, `allow-dynamic-registration`, `adaptive.enabled`), but the bootstrap is stricter. For a running
-server the deferred list printed by the command is the authoritative answer.
+The loader's `ConfigDiff` marks the same startup-only set (`enabled`, `workers.*`, `queue.capacity`,
+`scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*`, `shutdown-grace-seconds`,
+`allow-dynamic-registration`), so the log line and the command agree. `queue.overflow-policy` and the
+policies of already registered consumers are the only keys a reload applies to the running engine.
 
 Reload log lines:
 
@@ -272,10 +274,12 @@ continues; `absolute(N)` and `max-concurrent` still bound it. The lane cannot be
 
 | Key | Type | Unit | Default | Allowed | Effect |
 | --- | --- | --- | --- | --- | --- |
-| `shutdown-grace-seconds` | number | seconds | `10` | `>= 0` | How long running tasks are given to finish. Queued work is cancelled immediately; when the grace period expires the scheduler terminates anyway, without interrupting running tasks, and their futures complete later |
+| `shutdown-grace-seconds` | number | seconds | `5` | `>= 0` | How long running tasks are given to finish. Queued work is cancelled immediately; when the grace period expires the scheduler terminates anyway, without interrupting running tasks, and their futures complete later |
 
-The `ComputeSettings` record default is 30 seconds; the server file ships 10 because the world save runs
-right after the pool stops. Running tasks are never interrupted, so this value does not kill anything. The
+The `ComputeSettings` record default is 30 seconds; the server file ships 5 because the world save runs
+right after the pool stops and `/restart` gives the whole shutdown about ten seconds. The bootstrap waits
+at most `min(grace + 1 s, 5 s)` for `TERMINATED`, so a large value here cannot stall the restart past that
+budget. Running tasks are never interrupted, so this value does not kill anything. The
 running engine keeps the value it started with, so a change applies on the next restart.
 
 ## Reading validation errors

@@ -10,9 +10,10 @@
 # and a value that cannot be used is replaced by its default with a warning instead of stopping the
 # server.
 #
-# The file is read at startup and re-read by /tuff reload. A few settings are baked into the running
-# pool (enabled, queue capacity, scheduling, adaptive.enabled, dynamic registration, lanes); the
-# reload log lists them as "takes effect after a restart".
+# The file is read at startup and re-read by /tuff reload. Most settings are baked into the running
+# pool (enabled, workers, queue capacity, scheduling, metrics, adaptive, dynamic registration, lanes
+# and the shutdown grace period); the reload log lists them as "takes effect after a restart". Only
+# consumer policies can change on a live pool.
 
 async-compute:
   # Master switch. When false the scheduler starts no worker threads and every submission is
@@ -178,5 +179,8 @@ async-compute:
       spill-queue-depth: 64
 
   # Seconds a graceful shutdown lets running tasks finish. Queued tasks that did not start are
-  # cancelled. Kept short because the world save runs right after the pool stops.
-  shutdown-grace-seconds: 10
+  # cancelled. Kept short on purpose: the world save runs right after the pool stops and /restart
+  # gives the server about ten seconds in total, so grace plus the shutdown wait has to fit there.
+  # The whole stop waits at most five seconds (or grace + 1 s, whichever is smaller), so a large
+  # value here cannot stall the restart forever.
+  shutdown-grace-seconds: 5

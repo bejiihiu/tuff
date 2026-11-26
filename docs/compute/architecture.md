@@ -389,7 +389,7 @@ The server owns the engine through `ComputeBootstrap`, which has three hooks:
 | --- | --- |
 | End of the `CraftServer` constructor, before plugins are enabled | `ComputeBootstrap.start()` reads `config/tuff.yml`, creates the scheduler with a conservative processor budget, starts it and publishes it through `TuffCompute.install` |
 | Right after `RegionizedServer.init()` | `ComputeBootstrap.applyRegionBudget()` reads the region, chunk worker and IO thread counts, computes the real budget with `ComputeThreadBudget` and calls `applyProcessorBudget` |
-| During `MinecraftServer#stopServer()`, after plugins are disabled and their async tasks finished, before the world save | `ComputeBootstrap.stop()` stops an active JFR recording, uninstalls the scheduler, calls `shutdown(grace)` and waits up to `grace + 5 s` for `TERMINATED` |
+| During `MinecraftServer#stopServer()`, after plugins are disabled and their async tasks finished, before the world save | `ComputeBootstrap.stop()` stops an active JFR recording, uninstalls the scheduler, calls `shutdown(grace)` and waits up to `min(grace + 1 s, 5 s)` for `TERMINATED`, so a `/restart` with its roughly ten second budget still reaches the world save |
 
 The startup budget cannot know the region threads yet, so it is `max(1, floor(cores * 0.8) - 4)`. Once
 the regions exist, the pool is resized against what the rest of the server actually owns. A fixed

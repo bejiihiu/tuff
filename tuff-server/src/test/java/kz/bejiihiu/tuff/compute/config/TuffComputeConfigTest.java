@@ -39,7 +39,7 @@ class TuffComputeConfigTest {
         assertTrue(Files.exists(this.file()));
         assertTrue(result.problems().isEmpty(), () -> "unexpected problems " + result.problems());
         assertTrue(result.diff().isEmpty(), "the first read has nothing to compare against");
-        assertEquals(Duration.ofSeconds(10), result.settings().shutdownGracePeriod());
+        assertEquals(Duration.ofSeconds(5), result.settings().shutdownGracePeriod());
         assertEquals(
             Set.of("chunk-generation", "pathfinding", "ai-computation"),
             result.settings().consumers().overrides().keySet()
@@ -148,9 +148,93 @@ class TuffComputeConfigTest {
             List.of("async-compute.queue.capacity", "async-compute.workers.threads"),
             reloaded.diff().changedPaths()
         );
-        assertEquals(List.of("async-compute.queue.capacity"), reloaded.diff().restartRequiredPaths());
-        assertEquals(List.of("async-compute.workers.threads"), reloaded.diff().livePaths());
+        assertEquals(
+            List.of("async-compute.queue.capacity", "async-compute.workers.threads"),
+            reloaded.diff().restartRequiredPaths()
+        );
+        assertTrue(reloaded.diff().livePaths().isEmpty());
         assertEquals("async-compute.queue.capacity, async-compute.workers.threads", reloaded.diff().summary());
+    }
+
+    @Test
+    void everythingTheEngineCannotAdoptLiveNeedsARestart() throws IOException {
+        final TuffComputeConfig config = TuffComputeConfig.inDirectory(this.directory);
+        Files.writeString(this.file(), """
+            async-compute:
+              workers:
+                threads: 4
+              metrics:
+                sample-interval-seconds: 1
+              adaptive:
+                min-samples: 20
+              shutdown-grace-seconds: 5
+            """, StandardCharsets.UTF_8);
+        config.load();
+
+        Files.writeString(this.file(), """
+            async-compute:
+              workers:
+                threads: 6
+                keep-alive-seconds: 10
+              queue:
+                capacity: 4096
+                overflow-policy: drop-oldest
+              metrics:
+                sample-interval-seconds: 2
+              adaptive:
+                min-samples: 10
+              shutdown-grace-seconds: 3
+            """, StandardCharsets.UTF_8);
+        final ConfigLoadResult reloaded = config.reload();
+
+        assertEquals(List.of(
+            "async-compute.adaptive.min-samples",
+            "async-compute.metrics.sample-interval-seconds",
+            "async-compute.queue.capacity",
+            "async-compute.queue.overflow-policy",
+            "async-compute.shutdown-grace-seconds",
+            "async-compute.workers.keep-alive-seconds",
+            "async-compute.workers.threads"
+        ), reloaded.diff().changedPaths());
+        assertEquals(List.of(
+            "async-compute.adaptive.min-samples",
+            "async-compute.metrics.sample-interval-seconds",
+            "async-compute.queue.capacity",
+            "async-compute.shutdown-grace-seconds",
+            "async-compute.workers.keep-alive-seconds",
+            "async-compute.workers.threads"
+        ), reloaded.diff().restartRequiredPaths());
+        assertEquals(List.of("async-compute.queue.overflow-policy"), reloaded.diff().livePaths());
+    }
+
+    @Test
+    void consumerPoliciesAreTheOnlyLiveChange() throws IOException {
+        final TuffComputeConfig config = TuffComputeConfig.inDirectory(this.directory);
+        Files.writeString(this.file(), """
+            async-compute:
+              consumers:
+                chunk-generation:
+                  max-concurrent: 0.50
+            """, StandardCharsets.UTF_8);
+        config.load();
+
+        Files.writeString(this.file(), """
+            async-compute:
+              consumers:
+                chunk-generation:
+                  max-concurrent: 0.40
+            """, StandardCharsets.UTF_8);
+        final ConfigLoadResult reloaded = config.reload();
+
+        assertEquals(
+            List.of("async-compute.consumers.chunk-generation.max-concurrent"),
+            reloaded.diff().changedPaths()
+        );
+        assertTrue(reloaded.diff().restartRequiredPaths().isEmpty());
+        assertEquals(
+            List.of("async-compute.consumers.chunk-generation.max-concurrent"),
+            reloaded.diff().livePaths()
+        );
     }
 
     @Test

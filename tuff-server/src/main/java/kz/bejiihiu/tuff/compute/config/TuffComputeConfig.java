@@ -44,10 +44,11 @@ public final class TuffComputeConfig {
     public static final String DIRECTORY_NAME = "config";
 
     /**
-     * Grace period shipped for a server: the world save starts right after the pool stops, so the
-     * pool gets less time than the standalone default of thirty seconds.
+     * Grace period shipped for a server: the world save starts right after the pool stops and
+     * {@code /restart} gives the whole shutdown about ten seconds, so the pool gets a fraction of the
+     * standalone default of thirty seconds.
      */
-    private static final Duration SERVER_SHUTDOWN_GRACE = Duration.ofSeconds(10);
+    private static final Duration SERVER_SHUTDOWN_GRACE = Duration.ofSeconds(5);
 
     private static final Logger LOGGER = LogManager.getLogger("Tuff/ComputeConfig");
 
@@ -93,8 +94,9 @@ public final class TuffComputeConfig {
      * Returns the defaults of the shipped {@code tuff.yml}.
      *
      * <p>Identical to {@link ComputeSettings#defaults()} except for the shutdown grace period, which
-     * is ten seconds for a server because the world save runs right after the pool stops. The plain
-     * record default stays at thirty seconds for embedders that do not save a world on shutdown.
+     * is five seconds for a server because the world save runs right after the pool stops and
+     * {@code /restart} only gives the shutdown about ten seconds in total. The plain record default
+     * stays at thirty seconds for embedders that do not save a world on shutdown.
      *
      * @return the settings an untouched configuration file produces
      */

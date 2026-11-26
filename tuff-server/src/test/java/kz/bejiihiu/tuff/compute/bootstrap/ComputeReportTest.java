@@ -234,6 +234,31 @@ class ComputeReportTest {
     }
 
     @Test
+    void restartOnlyChangesAreNotReportedAsApplied() {
+        final List<String> restartKeys = List.of(
+            "async-compute.adaptive.enabled",
+            "async-compute.metrics.enabled",
+            "async-compute.scheduling.strategy",
+            "async-compute.shutdown-grace-seconds",
+            "async-compute.workers.threads"
+        );
+        final ConfigDiff diff = new ConfigDiff(restartKeys, restartKeys);
+        final ConfigLoadResult result = new ConfigLoadResult(ComputeSettings.defaults(), List.of(), diff, false, false);
+        final ReloadReport report = new ReloadReport(
+            result,
+            List.of(),
+            List.of(),
+            ConsumerReload.deferredPaths(diff, List.of(), List.of())
+        );
+
+        final String text = String.join("\n", ComputeReport.reload(report));
+
+        assertTrue(text.contains("takes effect after a restart: " + String.join(", ", restartKeys)), text);
+        assertFalse(text.contains("applied now"), text);
+        assertTrue(report.deferredPaths().containsAll(restartKeys), report.deferredPaths().toString());
+    }
+
+    @Test
     void aReloadWithoutChangesSaysSo() {
         final ConfigLoadResult result = new ConfigLoadResult(
             ComputeSettings.defaults(), List.of(), ConfigDiff.empty(), false, false);
