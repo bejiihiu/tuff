@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Locks the {@code -1 = unknown} rule of {@link PoolSnapshot}.
@@ -67,6 +68,27 @@ class PoolSnapshotTest {
         assertEquals(0, snapshot.activeThreads());
         assertEquals(0L, snapshot.submittedTasks());
         assertEquals(0.0d, snapshot.cpuLoad(), 0.0d);
+    }
+
+    @Test
+    void regionMetricsAreAbsentByDefault() {
+        final PoolSnapshot snapshot = new PoolSnapshot(
+            spec(),
+            0,
+            0,
+            0,
+            0,
+            0L,
+            0L,
+            0L,
+            0L,
+            0L,
+            0.0d,
+            SaturationReport.unknown(POOL),
+            List.of()
+        );
+
+        assertTrue(snapshot.regionMetrics().isEmpty(), "a pool that runs no regions has nothing to report");
     }
 
     @Test

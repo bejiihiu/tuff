@@ -16,6 +16,7 @@ import kz.bejiihiu.tuff.threads.ExecutionPoolRegistry;
 import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.PoolSnapshot;
 import kz.bejiihiu.tuff.threads.PoolSpec;
+import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 import kz.bejiihiu.tuff.threads.ResourceBudget;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.SaturationReport;
@@ -495,6 +496,11 @@ public final class ResourceSampler {
                 id, alive, active, queued, capacity, this.leaseWaitNanos(id)
             );
             final List<DegradedReason> reasons = cpuSupported ? List.of() : List.of(DegradedReason.METRICS_UNAVAILABLE);
+            // region data comes from the probe itself: the sampler has no region view of its own, and a
+            // pool that does not tick regions simply has nothing here
+            final Optional<RegionPoolMetrics> regionMetrics = observation == null
+                ? Optional.empty()
+                : observation.regionMetrics();
 
             final PoolSnapshot poolSnapshot = new PoolSnapshot(
                 spec,
@@ -509,7 +515,8 @@ public final class ResourceSampler {
                 -1L,
                 cpuLoad,
                 saturation,
-                reasons
+                reasons,
+                regionMetrics
             );
             // degradation is a state, not a publication detail: it has to survive per-pool being off
             degraded.addAll(reasons);

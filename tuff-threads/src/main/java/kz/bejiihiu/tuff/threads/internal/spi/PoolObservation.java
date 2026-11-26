@@ -1,6 +1,8 @@
 package kz.bejiihiu.tuff.threads.internal.spi;
 
 import java.util.List;
+import java.util.Optional;
+import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 
 /**
  * One reading of a pool's current state, produced by its probe.
@@ -66,4 +68,17 @@ public interface PoolObservation {
      * @return an immutable list of live threads, possibly empty
      */
     List<Thread> threads();
+
+    /**
+     * Returns the tick health of the regions this pool runs.
+     *
+     * <p>Only a pool that executes region ticks can answer this; every other pool keeps the default and
+     * reports nothing. Absent means "this probe has no region view" or "it could not be read this pass",
+     * never "zero regions".
+     *
+     * @return the region summary, or empty when the pool runs no regions
+     */
+    default Optional<RegionPoolMetrics> regionMetrics() {
+        return Optional.empty();
+    }
 }

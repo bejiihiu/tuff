@@ -350,7 +350,8 @@ public final class ThreadManagerImpl implements UnifiedThreadManager {
             pool.rejectedTasks(),
             pool.cpuLoad(),
             pool.saturation(),
-            List.copyOf(reasons)
+            List.copyOf(reasons),
+            pool.regionMetrics()
         );
     }
 

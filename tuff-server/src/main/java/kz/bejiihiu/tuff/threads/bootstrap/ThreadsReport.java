@@ -4,9 +4,11 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import kz.bejiihiu.tuff.threads.DegradedReason;
 import kz.bejiihiu.tuff.threads.PoolSnapshot;
 import kz.bejiihiu.tuff.threads.PoolSpec;
+import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import org.jspecify.annotations.Nullable;
@@ -77,6 +79,7 @@ public final class ThreadsReport {
         final int width = idWidth(snapshot.pools());
         for (final PoolSnapshot pool : snapshot.pools()) {
             lines.add(describePool(pool, width));
+            lines.addAll(describeRegions(pool));
         }
         if (snapshot.pools().isEmpty()) {
             lines.add(INDENT + INDENT + (status.metricsEnabled()
@@ -119,6 +122,46 @@ public final class ThreadsReport {
             out.append("  cpu ").append(Math.round(pool.cpuLoad() * 100.0d)).append('%');
         }
         return out.toString();
+    }
+
+    /**
+     * Describes the region tick health of a pool, when the probe reported any.
+     *
+     * <p>Two lines on purpose: the first is the one an operator scans for ("is a region late?"), the
+     * second carries the detail that explains it. A pool that does not tick regions, or a pass that could
+     * not read them, prints nothing at all - an empty "regions 0" line on the chunk pool would be noise.
+     *
+     * @param pool pool snapshot
+     * @return the lines to add, empty when there is nothing to say
+     */
+    private static List<String> describeRegions(final PoolSnapshot pool) {
+        final Optional<RegionPoolMetrics> metrics = pool.regionMetrics();
+        if (metrics.isEmpty()) {
+            return List.of();
+        }
+        final RegionPoolMetrics region = metrics.get();
+        final String headline = INDENT + INDENT
+            + "regions " + region.regions()
+            + " / avg MSPT " + describeMspt(region.averageMspt5s())
+            + " / min TPS " + describeTps(region.minimumTps())
+            + " / lag " + Math.round(region.lagFraction() * 100.0d) + "% ("
+            + region.laggingRegions() + " of " + region.regions() + ')';
+        final String detail = INDENT + INDENT
+            + "ticks: 5s max " + describeMspt(region.maximumMspt5s())
+            + ", 15s avg " + describeMspt(region.averageMspt15s())
+            + " max " + describeMspt(region.maximumMspt15s())
+            + "; entities " + region.entities()
+            + " / players " + region.players()
+            + " / chunks " + region.chunks();
+        return List.of(headline, detail);
+    }
+
+    private static String describeMspt(final double millis) {
+        return millis < 0.0d ? "unknown" : String.format(Locale.ROOT, "%.1f ms", millis);
+    }
+
+    private static String describeTps(final double tps) {
+        return tps < 0.0d ? "unknown" : String.format(Locale.ROOT, "%.1f", tps);
     }
 
     private static int idWidth(final List<PoolSnapshot> pools) {

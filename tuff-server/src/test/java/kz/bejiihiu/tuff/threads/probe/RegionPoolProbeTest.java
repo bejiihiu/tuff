@@ -2,7 +2,9 @@ package kz.bejiihiu.tuff.threads.probe;
 
 import java.util.List;
 import kz.bejiihiu.tuff.threads.PoolId;
+import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolObservation;
+import kz.bejiihiu.tuff.threads.region.RegionReading;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -79,6 +81,47 @@ class RegionPoolProbeTest {
         assertEquals(0, observation.activeThreads());
         assertEquals(0, observation.idleThreads());
         assertTrue(observation.threads().isEmpty());
+    }
+
+    @Test
+    void regionMetricsAreAggregatedFromTheProvider() {
+        final RegionThreadScan scan = new RegionThreadScan(
+            () -> List.of(threadIn(Thread.State.RUNNABLE)),
+            () -> 1
+        );
+        final PoolObservation observation = new RegionPoolProbe(scan, () -> List.of(
+            new RegionReading(20.0d, 20.0d, 2.0d, 4.0d, 2.0d, 5.0d, 10, 1, 20),
+            new RegionReading(15.0d, 16.0d, 8.0d, 20.0d, 8.0d, 25.0d, 30, 2, 40)
+        )).observe();
+
+        final RegionPoolMetrics metrics = observation.regionMetrics().orElseThrow();
+        assertEquals(2, metrics.regions());
+        assertEquals(5.0d, metrics.averageMspt5s(), 0.0d);
+        assertEquals(20.0d, metrics.maximumMspt5s(), 0.0d);
+        assertEquals(15.0d, metrics.minimumTps(), 0.0d);
+        assertEquals(1, metrics.laggingRegions());
+        assertEquals(40, metrics.entities());
+    }
+
+    @Test
+    void aBrokenRegionProviderLeavesTheThreadReadingIntact() {
+        final RegionThreadScan scan = new RegionThreadScan(
+            () -> List.of(threadIn(Thread.State.RUNNABLE)),
+            () -> 1
+        );
+        final PoolObservation observation = new RegionPoolProbe(scan, () -> {
+            throw new IllegalStateException("the scheduler went away");
+        }).observe();
+
+        assertEquals(1, observation.aliveThreads());
+        assertTrue(observation.regionMetrics().isEmpty(), "no numbers is better than invented ones");
+    }
+
+    @Test
+    void aProbeWithoutARegionSourceReportsNoRegionMetrics() {
+        final RegionThreadScan scan = new RegionThreadScan(List::of, () -> 0);
+
+        assertTrue(new RegionPoolProbe(scan).observe().regionMetrics().isEmpty());
     }
 
     /**

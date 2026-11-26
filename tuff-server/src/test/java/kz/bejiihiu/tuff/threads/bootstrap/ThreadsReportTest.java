@@ -9,6 +9,7 @@ import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.PoolKind;
 import kz.bejiihiu.tuff.threads.PoolSnapshot;
 import kz.bejiihiu.tuff.threads.PoolSpec;
+import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.SaturationReport;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
@@ -93,6 +94,40 @@ class ThreadsReportTest {
         assertTrue(text.contains("unknown threads: n/a (not measured"), text);
         assertTrue(text.contains("metrics: disabled"), text);
         assertTrue(text.contains("degraded: unknown (metrics are disabled)"), text);
+    }
+
+    @Test
+    void aRegionPoolPrintsItsTickHealth() {
+        final PoolSpec spec = PoolSpec.observeOnly(
+            PoolId.REGION_EXECUTION, PoolKind.REGION_EXECUTION, "folia", "region tick execution"
+        );
+        final PoolSnapshot pool = new PoolSnapshot(
+            spec, 4, 0, 0, 4, -1L, -1L, -1L, -1L, -1L, -1.0d,
+            SaturationReport.unknown(PoolId.REGION_EXECUTION),
+            List.of(DegradedReason.OBSERVE_ONLY),
+            Optional.of(new RegionPoolMetrics(12, 4.24d, 9.5d, 4.4d, 12.0d, 19.4d, 1, 8123, 4, 3951))
+        );
+        final ResourceSnapshot snapshot = new ResourceSnapshot(
+            Instant.EPOCH, 8, 1, 4, 0, 4, 4, 0.0d, 0.0d, -1.0d, List.of(pool), List.of(),
+            Set.of(DegradedReason.OBSERVE_ONLY)
+        );
+        final ThreadsStatus status = new ThreadsStatus(
+            ThreadsStatus.State.RUNNING, ThreadManagementSettings.defaults(), snapshot, 0, true
+        );
+
+        final String text = String.join("\n", ThreadsReport.overview(status));
+
+        assertTrue(text.contains("regions 12 / avg MSPT 4.2 ms / min TPS 19.4 / lag 8% (1 of 12)"), text);
+        assertTrue(text.contains("ticks: 5s max 9.5 ms, 15s avg 4.4 ms max 12.0 ms"), text);
+        assertTrue(text.contains("entities 8123 / players 4 / chunks 3951"), text);
+    }
+
+    @Test
+    void aPoolWithoutRegionMetricsPrintsNoRegionLine() {
+        final String text = String.join("\n", ThreadsReport.overview(runningStatus(0)));
+
+        assertFalse(text.contains("regions "), "an observe-only pool with no source must not claim zero regions");
+        assertFalse(text.contains("avg MSPT"));
     }
 
     private static ThreadsStatus runningStatus(final int unregisteredThreads) {

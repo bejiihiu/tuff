@@ -33,6 +33,8 @@ Tuff thread layer: running, all pools observed only
     compute-virtual   L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
     network           L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
     region-execution  L1  alive 4  active 0  idle 4  [FEATURE_DISABLED, OBSERVE_ONLY]
+      regions 12 / avg MSPT 4.2 ms / min TPS 19.4 / lag 8% (1 of 12)
+      ticks: 5s max 9.5 ms, 15s avg 4.4 ms max 12.0 ms; entities 8123 / players 4 / chunks 3951
     service           L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
   degraded: FEATURE_DISABLED, OBSERVE_ONLY
   unknown threads: 37
@@ -55,6 +57,10 @@ How to read it:
   brackets. `unknown` is printed for `active` and `idle` when a value could not be measured. Queue
   depth is deliberately not printed: without a probe it is `-1`, and a printed `0` would look like an
   empty queue rather than an unmeasured one.
+- **Region lines** appear under the pool that ticks regions, and only when the probe reported something:
+  `regions N / avg MSPT X / min TPS Y / lag Z% (K of N)` on the first line, then the 15-second figure,
+  the worst single tick and the entity, player and chunk totals. `unknown` replaces a value that could
+  not be measured. The region count is the number of regions the pool ticks, not the number of worlds.
 - **`degraded:`** is the union of reasons from every pool and the manager. In the default observe-only
   configuration it always contains `OBSERVE_ONLY` and `FEATURE_DISABLED` while the manager state is
   still `RUNNING`. Observe-only is a statement of coverage, not a failure, and only reasons such as
@@ -78,13 +84,14 @@ How to read it:
 | `creationRatePerSecond`, `terminationRatePerSecond` | `ThreadMXBean.getTotalStartedThreadCount` | JVM-wide deltas over the sampling window, not per pool |
 | `processCpuLoad` | `OperatingSystemMXBean` | Process-wide; `-1` when unavailable |
 | `pools` | One `PoolSnapshot` per registered spec | Sorted by id; empty when `metrics.per-pool: false` |
+| `pools[].regionMetrics` | The region probe | Per-pool aggregate; absent for pools that tick no regions and when the read failed |
 | `threads` | Per-thread snapshots | Sorted by thread id; empty when `metrics.per-thread: false` |
 | `degradedReasons` | Sampler plus manager | Union, independent of `per-pool` |
 | `budgetLedger` | `ThreadResourceController.budgetLedger()` | One printable line with every ledger term; empty only on a hand-built snapshot |
 
 `PoolSnapshot` carries the spec (id, kind, owner, purpose, min/max, coverage, budget), `alive`,
-`core`, `active`, `idle`, `queued`, `capacity`, task counters, `cpuLoad`, saturation and the pool's
-reasons.
+`core`, `active`, `idle`, `queued`, `capacity`, task counters, `cpuLoad`, saturation, the pool's
+reasons and, for a pool that ticks regions, `regionMetrics` (see [Region metrics](#region-metrics)).
 
 Where a value is not measurable it is `-1`, never zero:
 
@@ -126,6 +133,31 @@ thread), so utilisation is an approximation. There is no queue depth, so pressur
 level describes thread occupancy only. Treat region saturation as a hint; use `/tps` for the region
 verdict.
 
+### Region metrics
+
+The region pool also reports an aggregate of the regions it ticks. The numbers come from the scheduler's
+own tick reports and from `RegionStats`; nothing is invented and nothing is sampled from a tick thread:
+
+| Value | Source | Notes |
+| --- | --- | --- |
+| `regions` | Every region under every level | A region that has not ticked yet still counts as a region |
+| `averageMspt5s`, `averageMspt15s` | `getTickReport5s/15s(...).timePerTickData().segmentAll().average()` | Mean over the regions that reported, in milliseconds |
+| `maximumMspt5s`, `maximumMspt15s` | `.segmentAll().greatest()` | The worst single tick any one region saw, not a sum |
+| `minimumTps` | `tpsData().segmentAll().average()` of the 5 s report | The slowest region |
+| `laggingRegions`, `lagFraction()` | Regions whose 5 s TPS is below 18 | A proxy, not a deadline miss |
+| `entities`, `players`, `chunks` | `RegionStats` | Sums over regions; acquire reads |
+
+`lag` is a proxy for lateness. Folia does not publish how late a tick started without a patch, so "late"
+is expressed as "visibly under 20 TPS": a region counts when its 5 s TPS is below 18, and a region at
+exactly 18 does not.
+
+Only the 5 s and 15 s windows are read. The 1 m, 5 m and 15 m reports copy and sort one record per tick
+over the whole window - milliseconds and garbage per region, acceptable for `/tps`, wrong for a layer
+that samples. Reads are throttled to one walk per second, so a second command in the same second gets the
+previous reading. A read triggered from a region tick thread (a player running the command) does not take
+the regioniser lock at all; it answers with the last reading. The aggregation itself is a pure function
+over per-region readings and is tested without a server, including empty and unmeasured reports.
+
 ## Sampling cost
 
 There is no sampling thread. A pass runs when something reads a snapshot — the command — and only if
@@ -136,9 +168,11 @@ the expensive operations are deliberately elsewhere:
 
 - `Thread.getAllStackTraces()` is not part of the live path: the unaccounted-thread scan walks thread
   groups, is throttled to once per 30 seconds and is a diagnostic, not part of the pass.
-- Region tick reports (`5m`, `15m`) are never read by this layer. They allocate and sort one record per
-  tick over the window; reading them periodically would cost milliseconds per region.
-- No probe is called from a tick thread, and the command must not be run from one.
+- Region tick reports (`5m`, `15m`) are never read by this layer: they allocate and sort one record per
+  tick over the window. Region reads take the 5 s and 15 s reports only, and the provider throttles the
+  walk to once per second.
+- No probe runs from a tick thread. When a player runs the command, the region provider notices the tick
+  thread and answers from its previous reading instead of taking the regioniser lock inside a tick.
 
 ## Unknown threads
 
@@ -211,12 +245,13 @@ handle: five windows (5 s, 15 s, 1 m, 5 m, 15 m) of TPS, MSPT, tick CPU time, ti
 between ticks and CPU starvation, plus per-region entity, player and chunk counts. `/tps` reads them
 and is the region view to use.
 
-**This layer does not proxy them.** A `PoolSnapshot` describes threads, not ticks: no TPS, no MSPT, no
-region count, no per-region breakdown. Nothing from the region tick reports is copied, averaged or
-renamed in the snapshot, and no `tuff.threads` event carries a tick value. If you need to know whether
-regions are healthy, use `/tps`; if you need to know whether the machine is out of threads, use
-`/tuff threads`. A future integration can add region aggregates, but until the numbers exist in the
-snapshot, a document that implies they do is worse than no number.
+**This layer carries an aggregate, never a server-wide number.** The region pool's snapshot includes
+`regionMetrics`: the region count, mean and worst MSPT over 5 s and 15 s, the lowest region TPS, the share
+of regions below 18 TPS and the entity, player and chunk totals. That is a summary of per-region reports,
+not a replacement for them: there is no per-region breakdown in the snapshot, no 1 m, 5 m or 15 m window,
+and no `tuff.threads` event carries a tick value. A value the probe could not read is `unknown` (`-1`),
+never zero, and a pool that ticks no regions has no region metrics at all. For one region use `/tps`; for
+"is any region late right now" the region lines under `/tuff threads` answer in one look.
 
 ## During shutdown
 
@@ -236,6 +271,8 @@ integration that reads this data, obey the same rule.
 | `unknown threads` in the hundreds | Normal for observe-only: Folia, netty and plugin threads are not registered | The number drops as pools reach L2 |
 | `degraded:` lists reasons while the layer says running | `OBSERVE_ONLY` and `FEATURE_DISABLED` are coverage statements | Only `BUDGET_EXHAUSTED`, `CONFIG_CONFLICT`, `SCHEDULER_LIMITATION` and creation failures mean degraded |
 | `queued` unknown on every pool | No probe is attached | Expected; queue depth needs an owner getter |
+| No region lines under `region-execution` | The pool ticks no regions yet, no level is loaded, or the read failed this pass | Nothing is printed rather than a fake zero |
+| Region TPS disagrees with `/tps` | `/tuff threads` shows the slowest region and a mean over regions; `/tps` shows per-region windows, including 1 m and beyond | Different aggregates, both honest |
 | No `tuff.threads.*` events in a recording | The recording does not have those events enabled, or it is the compute recording (category `tuff.compute` only) | Start a recording with the events enabled |
 | TPS looks wrong in a profiler | The profiler uses server-wide tick hooks, which Folia does not feed | Use `/tps` or a region-aware profiler |
 | `pools: 0 registered` while the layer is running | `metrics.per-pool: false` (publication off), not `metrics.enabled: false` — with collection off the pools are still listed with unmeasured values | Check the `metrics` keys and the `degraded:` line (`METRICS_UNAVAILABLE` means collection is off) |

@@ -2,6 +2,7 @@ package kz.bejiihiu.tuff.threads;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Point in time observation of one pool.
@@ -36,6 +37,8 @@ import java.util.Objects;
  *                        window, from zero to one, or {@code -1} when unavailable
  * @param saturation      saturation summary
  * @param degradedReasons reasons the pool cannot be fully managed; empty when it can
+ * @param regionMetrics   tick health of the regions this pool runs, or empty when it runs none or the
+ *                        reader has no source for it
  */
 public record PoolSnapshot(
     PoolSpec spec,
@@ -50,7 +53,8 @@ public record PoolSnapshot(
     long rejectedTasks,
     double cpuLoad,
     SaturationReport saturation,
-    List<DegradedReason> degradedReasons
+    List<DegradedReason> degradedReasons,
+    Optional<RegionPoolMetrics> regionMetrics
 ) {
 
     /**
@@ -63,6 +67,7 @@ public record PoolSnapshot(
         Objects.requireNonNull(spec, "spec");
         Objects.requireNonNull(saturation, "saturation");
         Objects.requireNonNull(degradedReasons, "degradedReasons");
+        Objects.requireNonNull(regionMetrics, "regionMetrics");
         if (aliveThreads < 0) {
             throw new IllegalArgumentException("aliveThreads must not be negative, got " + aliveThreads);
         }
@@ -93,6 +98,60 @@ public record PoolSnapshot(
             );
         }
         degradedReasons = List.copyOf(degradedReasons);
+    }
+
+    /**
+     * Creates a pool snapshot without region metrics.
+     *
+     * <p>Kept for call sites that describe a pool by hand - tests, fixtures, pools that run no regions.
+     * Region data is additive: a snapshot that has none is not incomplete, it just has nothing to say
+     * about ticks.
+     *
+     * @param spec            registered description of the pool
+     * @param aliveThreads    threads that currently exist, at least zero
+     * @param coreThreads     threads the pool keeps alive regardless of load, at least zero
+     * @param activeThreads   threads currently runnable, or {@code -1} when unknown
+     * @param idleThreads     threads currently waiting for work, or {@code -1} when unknown
+     * @param queuedTasks     tasks waiting in the pool queue, or {@code -1} when unknown
+     * @param queueCapacity   maximum queue depth, or {@code -1} when unknown or unbounded
+     * @param submittedTasks  tasks accepted since registration, or {@code -1} when this layer has no counter
+     * @param completedTasks  tasks completed since registration, or {@code -1} when this layer has no counter
+     * @param rejectedTasks   tasks refused since registration, or {@code -1} when this layer has no counter
+     * @param cpuLoad         share of the usable cores consumed by this pool, or {@code -1} when unavailable
+     * @param saturation      saturation summary
+     * @param degradedReasons reasons the pool cannot be fully managed; empty when it can
+     */
+    public PoolSnapshot(
+        final PoolSpec spec,
+        final int aliveThreads,
+        final int coreThreads,
+        final int activeThreads,
+        final int idleThreads,
+        final long queuedTasks,
+        final long queueCapacity,
+        final long submittedTasks,
+        final long completedTasks,
+        final long rejectedTasks,
+        final double cpuLoad,
+        final SaturationReport saturation,
+        final List<DegradedReason> degradedReasons
+    ) {
+        this(
+            spec,
+            aliveThreads,
+            coreThreads,
+            activeThreads,
+            idleThreads,
+            queuedTasks,
+            queueCapacity,
+            submittedTasks,
+            completedTasks,
+            rejectedTasks,
+            cpuLoad,
+            saturation,
+            degradedReasons,
+            Optional.empty()
+        );
     }
 
     /**
