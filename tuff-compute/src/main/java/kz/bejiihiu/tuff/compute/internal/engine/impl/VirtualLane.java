@@ -18,6 +18,7 @@ import kz.bejiihiu.tuff.compute.internal.metrics.JfrRecorder;
 import kz.bejiihiu.tuff.compute.internal.queue.LaneAwareQueue;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.compute.internal.util.Durations;
 import kz.bejiihiu.tuff.compute.internal.util.Preconditions;
 import kz.bejiihiu.tuff.compute.internal.util.ThreadFactories;
 import kz.bejiihiu.tuff.compute.internal.worker.impl.DynamicWorkerPool;
@@ -129,7 +130,7 @@ final class VirtualLane {
         this.threadPrefix = Preconditions.requireNonBlank(threadPrefix, "threadPrefix");
         this.permits = new Semaphore(config.maxConcurrent());
         this.virtualFactory = ThreadFactories.virtual(this.threadPrefix + "-virtual");
-        this.spillWaitNanos = toNanosSaturated(config.spillWait());
+        this.spillWaitNanos = Durations.toNanosSaturated(config.spillWait());
         this.normalLevel = ComputePriority.NORMAL.level();
     }
 
@@ -179,8 +180,8 @@ final class VirtualLane {
      * @throws InterruptedException if the caller was interrupted
      */
     boolean awaitTermination(final Duration timeout) throws InterruptedException {
-        Preconditions.checkNonNegative(timeout.toNanos(), "timeout");
-        final long deadline = System.nanoTime() + timeout.toNanos();
+        Preconditions.checkNonNegative(Durations.toNanosSaturated(timeout), "timeout");
+        final long deadline = Durations.deadline(System.nanoTime(), Durations.toNanosSaturated(timeout));
         this.terminationLock.lockInterruptibly();
         try {
             while (!this.isTerminated()) {
@@ -436,14 +437,6 @@ final class VirtualLane {
             }
         } finally {
             this.terminationLock.unlock();
-        }
-    }
-
-    private static long toNanosSaturated(final Duration duration) {
-        try {
-            return duration.toNanos();
-        } catch (ArithmeticException _) {
-            return Long.MAX_VALUE;
         }
     }
 }

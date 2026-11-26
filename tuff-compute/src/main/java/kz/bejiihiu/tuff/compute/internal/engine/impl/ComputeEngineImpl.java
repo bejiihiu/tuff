@@ -8,6 +8,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -44,6 +45,7 @@ import kz.bejiihiu.tuff.compute.internal.queue.QuotaController;
 import kz.bejiihiu.tuff.compute.internal.queue.impl.AtomicQuotaController;
 import kz.bejiihiu.tuff.compute.internal.queue.impl.BoundedComputeQueue;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.compute.internal.util.Durations;
 import kz.bejiihiu.tuff.compute.internal.util.Preconditions;
 import kz.bejiihiu.tuff.compute.internal.util.ThreadFactories;
 import kz.bejiihiu.tuff.compute.internal.worker.impl.DynamicWorkerPool;
@@ -87,6 +89,17 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
      * sampling cadence is the configured metrics sample interval, not this value.
      */
     private static final long JANITOR_TICK_MILLIS = 100L;
+
+    /**
+     * Extra time granted on top of the configured grace period for housekeeping to stop. Bounded on
+     * purpose: shutdown must reach {@code TERMINATED} even when a component is wedged.
+     */
+    private static final long SHUTDOWN_SLACK_NANOS = TimeUnit.SECONDS.toNanos(2L);
+
+    /**
+     * Upper bound for stopping the janitor thread.
+     */
+    private static final Duration JANITOR_STOP_TIMEOUT = Duration.ofSeconds(2L);
 
     private final ComputeSettings settings;
     private final ComputeClock clock;
@@ -139,6 +152,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     private volatile @Nullable QueueJanitor janitor;
     private volatile @Nullable AdaptiveConcurrencyController adaptive;
     private volatile @Nullable ScheduledExecutorService adaptiveTimer;
+    private volatile @Nullable ExecutorService completionExecutor;
     private volatile @Nullable Thread shutdownThread;
 
     /**
@@ -212,7 +226,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     @Override
     public void shutdown(final Duration gracePeriod) {
         Preconditions.requireNonNull(gracePeriod, "gracePeriod");
-        Preconditions.checkNonNegative(gracePeriod.toNanos(), "gracePeriod");
+        Preconditions.checkNonNegative(Durations.toNanosSaturated(gracePeriod), "gracePeriod");
         this.beginShutdown(false, gracePeriod);
     }
 
@@ -224,8 +238,9 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     @Override
     public boolean awaitTermination(final Duration timeout) throws InterruptedException {
         Preconditions.requireNonNull(timeout, "timeout");
-        Preconditions.checkNonNegative(timeout.toNanos(), "timeout");
-        final boolean inTime = this.terminated.await(timeout.toNanos(), TimeUnit.NANOSECONDS);
+        Preconditions.checkNonNegative(Durations.toNanosSaturated(timeout), "timeout");
+        final long timeoutNanos = Durations.toNanosSaturated(timeout);
+        final boolean inTime = this.terminated.await(timeoutNanos, TimeUnit.NANOSECONDS);
         if (inTime) {
             final Thread thread = this.shutdownThread;
             if (thread != null && thread != Thread.currentThread()) {
@@ -280,9 +295,11 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             throw new ComputeShutdownException("compute scheduler is terminated");
         }
         this.unregisteredConsumers.remove(consumer.id());
+        // register the queue stream and the quota before the registry becomes visible: a submission
+        // that resolves the consumer from the registry must find a stream to offer into
+        this.queue.registerConsumer(consumer.id(), consumer.policy());
+        this.quota.updateConsumerPolicy(consumer.id(), consumer.policy());
         final ComputeConsumer stored = this.registry.register(consumer);
-        this.queue.registerConsumer(stored.id(), stored.policy());
-        this.quota.updateConsumerPolicy(stored.id(), stored.policy());
         final MetricsCollector collector = this.metricsCollector;
         if (collector != null) {
             collector.onConsumerRegistered(stored, this.quota.limit(stored.id()));
@@ -570,7 +587,14 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this.clock,
             ThreadFactories.platform(this.settings.workers().threadNamePrefix(), true)
         );
+        newLoop.bindPool(newPool);
         this.pool = newPool;
+        // Future completions that would otherwise run on the janitor, the shutdown thread or a
+        // submitting thread are dispatched here instead. One virtual thread per completion keeps a
+        // blocking dependent stage from delaying any other completion or any scheduler thread.
+        this.completionExecutor = Executors.newThreadPerTaskExecutor(
+            ThreadFactories.virtual(this.settings.workers().threadNamePrefix() + "-completion")
+        );
         if (laneConfig.enabled()) {
             if (!(this.queue instanceof LaneAwareQueue laneQueue)) {
                 throw new IllegalStateException("virtual lane requires a lane aware queue, got " + this.queue.getClass());
@@ -630,7 +654,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             controller.enabled() ? null : this::autoscale,
             this::platformBacklog,
             this.janitorTickMillis(),
-            this.settings.metrics().sampleInterval().toNanos()
+            Durations.toNanosSaturated(this.settings.metrics().sampleInterval())
         );
         this.janitor = newJanitor;
         final Thread janitorThread = new Thread(newJanitor, this.settings.workers().threadNamePrefix() + "-janitor");
@@ -648,7 +672,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             return;
         }
         controller.start();
-        final long periodMillis = Math.max(1_000L, controller.sampleWindow().toMillis());
+        final long periodMillis = Math.max(1_000L, Durations.toMillisSaturated(controller.sampleWindow()));
         final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(
             ThreadFactories.platform(this.settings.workers().threadNamePrefix() + "-adaptive", true)
         );
@@ -665,7 +689,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     }
 
     private long janitorTickMillis() {
-        final long configured = this.settings.metrics().sampleInterval().toMillis();
+        final long configured = Durations.toMillisSaturated(this.settings.metrics().sampleInterval());
         return Math.clamp(configured, 10L, JANITOR_TICK_MILLIS);
     }
 
@@ -750,6 +774,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         final long taskId = this.taskIds.incrementAndGet();
         final long sequence = this.sequences.incrementAndGet();
         final long submittedAtNanos = this.clock.nanoTime();
+        final ExecutorService completions = this.completionExecutor;
         final TaskHandle<T> handle = new TaskHandle<>(
             taskId,
             consumerId,
@@ -758,7 +783,8 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this.clock.instant(),
             submittedAtNanos,
             request.label(),
-            this
+            this,
+            completions == null ? Runnable::run : completions
         );
         final QueueEntry entry = new QueueEntry(
             taskId,
@@ -772,38 +798,68 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         );
         handle.bindEntry(entry);
         this.handles.put(taskId, handle);
-        final ComputeQueue.OfferResult result = this.queue.offer(entry);
+        final MetricsCollector collector = this.metricsCollector;
+        if (collector != null) {
+            // publish the submission before the entry can be claimed, so a worker can never record a
+            // completion before its submission and drive the derived depth negative
+            collector.onSubmitted(entry);
+        }
+        final ComputeQueue.OfferResult result = this.queue.offerRegistered(entry);
         return switch (result) {
             case ACCEPTED -> {
-                final MetricsCollector collector = this.metricsCollector;
-                if (collector != null) {
-                    collector.onSubmitted(entry);
-                }
                 final VirtualLane lane = this.virtualLane;
                 if (lane != null) {
                     lane.onSubmission(request.priority());
+                }
+                final DynamicWorkerPool currentPool = this.pool;
+                if (currentPool != null) {
+                    // an idle worker may be parked for idle-wait; a submission is the signal it is
+                    // waiting for
+                    currentPool.wakeUp();
                 }
                 this.maybeGrow();
                 yield handle;
             }
             case CLOSED -> {
+                this.withdraw(collector, entry);
                 this.handles.remove(taskId);
                 handle.reject();
                 throw new ComputeShutdownException("compute scheduler stopped accepting work during submission");
             }
+            case CONSUMER_UNKNOWN -> {
+                this.withdraw(collector, entry);
+                this.handles.remove(taskId);
+                handle.reject();
+                throw this.reject(consumerId, request.priority(), ComputeRejectedException.Reason.CONSUMER_UNKNOWN,
+                    "consumer " + consumerId + " was unregistered while the task was being submitted");
+            }
             case QUEUE_FULL -> {
+                this.withdraw(collector, entry);
                 this.handles.remove(taskId);
                 handle.reject();
                 throw this.reject(consumerId, request.priority(), ComputeRejectedException.Reason.QUEUE_FULL,
                     "global queue capacity " + this.queue.capacity() + " is exhausted");
             }
             case CONSUMER_QUEUE_FULL -> {
+                this.withdraw(collector, entry);
                 this.handles.remove(taskId);
                 handle.reject();
                 throw this.reject(consumerId, request.priority(), ComputeRejectedException.Reason.CONSUMER_QUEUE_FULL,
                     "consumer " + consumerId + " reached its queue bound");
             }
         };
+    }
+
+    /**
+     * Takes back a submission counter that was published before a refused offer.
+     *
+     * @param collector collector to notify, or {@code null} when metrics are off
+     * @param entry     entry that never reached the queue
+     */
+    private void withdraw(final @Nullable MetricsCollector collector, final QueueEntry entry) {
+        if (collector != null) {
+            collector.onSubmissionWithdrawn(entry);
+        }
     }
 
     private ComputeRejectedException reject(
@@ -919,12 +975,12 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             }
             this.state.set(AsyncComputeScheduler.SchedulerState.SHUTTING_DOWN);
             this.queue.close();
-            this.cancelAllQueued(ComputeCancelledException.Reason.SHUTDOWN);
+            this.cancelAllQueued(ComputeCancelledException.Reason.SHUTDOWN, true);
             final DispatcherImpl pendingDispatcher = this.dispatcher;
             if (pendingDispatcher != null) {
                 // carried entries have not started either; make sure they are cancelled even if their
                 // worker never asks for work again
-                pendingDispatcher.cancelAllCarried(ComputeCancelledException.Reason.SHUTDOWN);
+                pendingDispatcher.cancelAllCarried(ComputeCancelledException.Reason.SHUTDOWN, true);
             }
             final VirtualLane lane = this.virtualLane;
             if (lane != null) {
@@ -945,7 +1001,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             } else {
                 currentPool.shutdown();
             }
-            final long graceNanos = gracePeriod.toNanos();
+            final long graceNanos = Durations.toNanosSaturated(gracePeriod);
             final Thread thread = new Thread(
                 () -> this.awaitAndTerminate(graceNanos),
                 this.settings.workers().threadNamePrefix() + "-shutdown"
@@ -958,11 +1014,23 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         }
     }
 
+    /**
+     * Waits for the runtime to drain, bounded by the grace period plus a fixed safety margin.
+     *
+     * <p>Every step is bounded. A component that refuses to stop is logged and the engine still
+     * moves to {@code TERMINATED}: an operator must never end up with a scheduler that cannot be
+     * shut down because one thread is wedged.
+     *
+     * @param graceNanos grace period in nanoseconds, already saturated
+     */
     private void awaitAndTerminate(final long graceNanos) {
         try {
+            final long deadline = Durations.deadline(
+                Durations.deadline(System.nanoTime(), graceNanos),
+                SHUTDOWN_SLACK_NANOS
+            );
             this.stopJanitor();
             this.stopAdaptiveTimer();
-            final long deadline = System.nanoTime() + graceNanos;
             boolean abandoned = false;
             final DynamicWorkerPool currentPool = this.pool;
             if (currentPool != null) {
@@ -979,11 +1047,12 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
                 // forever; they are never interrupted and complete after termination
                 this.logAbandonedTasks();
             }
-            // safety net: nothing may remain outside the queue after the workers stopped
-            this.cancelAllQueued(ComputeCancelledException.Reason.SHUTDOWN);
+            // safety net: nothing may remain outside the queue after the workers stopped. completion
+            // is deferred so a blocked dependent stage cannot wedge this thread either
+            this.cancelAllQueued(ComputeCancelledException.Reason.SHUTDOWN, true);
             final DispatcherImpl currentDispatcher = this.dispatcher;
             if (currentDispatcher != null) {
-                currentDispatcher.cancelAllCarried(ComputeCancelledException.Reason.SHUTDOWN);
+                currentDispatcher.cancelAllCarried(ComputeCancelledException.Reason.SHUTDOWN, true);
             }
             final MetricsCollector collector = this.metricsCollector;
             if (collector != null) {
@@ -996,6 +1065,12 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             Thread.currentThread().interrupt();
             LOG.log(System.Logger.Level.WARNING, "compute shutdown was interrupted while waiting for the grace period");
         } finally {
+            final ExecutorService completions = this.completionExecutor;
+            if (completions != null) {
+                // let already scheduled completions finish, but never wait for user code: the
+                // workers are daemon virtual threads and a blocked one cannot keep the JVM alive
+                completions.shutdown();
+            }
             this.state.set(AsyncComputeScheduler.SchedulerState.TERMINATED);
             this.terminated.countDown();
         }
@@ -1026,8 +1101,9 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
 
     private void stopJanitor() {
         final QueueJanitor current = this.janitor;
-        if (current != null) {
-            current.stop();
+        if (current != null && !current.stop(JANITOR_STOP_TIMEOUT)) {
+            LOG.log(System.Logger.Level.WARNING,
+                "compute janitor was still running after " + JANITOR_STOP_TIMEOUT + "; terminating anyway");
         }
     }
 
@@ -1042,7 +1118,10 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         }
         timer.shutdownNow();
         try {
-            timer.awaitTermination(1L, TimeUnit.SECONDS);
+            if (!timer.awaitTermination(1L, TimeUnit.SECONDS)) {
+                LOG.log(System.Logger.Level.WARNING,
+                    "compute adaptive timer did not stop within one second; terminating anyway");
+            }
         } catch (InterruptedException _) {
             Thread.currentThread().interrupt();
         }
@@ -1063,25 +1142,37 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (collector != null) {
             collector.close();
         }
+        final ExecutorService completions = this.completionExecutor;
+        if (completions != null) {
+            completions.shutdown();
+        }
         this.state.set(AsyncComputeScheduler.SchedulerState.TERMINATED);
         this.terminated.countDown();
     }
 
-    private void cancelAllQueued(final ComputeCancelledException.Reason reason) {
+    private void cancelAllQueued(final ComputeCancelledException.Reason reason, final boolean deferred) {
         final Collection<QueueEntry> drained = this.queue.clear();
         for (final QueueEntry entry : drained) {
-            this.cancelQueued(entry, reason);
+            this.cancelQueued(entry, reason, deferred);
         }
     }
 
     private void cancelQueued(final QueueEntry entry, final ComputeCancelledException.Reason reason) {
+        this.cancelQueued(entry, reason, false);
+    }
+
+    private void cancelQueued(
+        final QueueEntry entry,
+        final ComputeCancelledException.Reason reason,
+        final boolean deferred
+    ) {
         final DispatcherImpl currentDispatcher = this.dispatcher;
         if (currentDispatcher != null) {
-            currentDispatcher.cancelQueued(entry, reason);
+            currentDispatcher.cancelQueued(entry, reason, deferred);
             return;
         }
         final TaskHandle<?> handle = (TaskHandle<?>) entry.handle();
-        if (handle.completeCancelled(reason)) {
+        if (handle.completeCancelled(reason, deferred)) {
             final MetricsCollector collector = this.metricsCollector;
             if (collector != null) {
                 collector.onCancelled(entry, reason);
@@ -1108,11 +1199,12 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     private void onEvicted(final QueueEntry entry) {
         final DispatcherImpl currentDispatcher = this.dispatcher;
         if (currentDispatcher != null) {
-            currentDispatcher.cancelQueued(entry, ComputeCancelledException.Reason.EVICTED);
+            // this runs on the submitting thread inside offer; a dependent stage must not run there
+            currentDispatcher.cancelQueued(entry, ComputeCancelledException.Reason.EVICTED, true);
             return;
         }
         final TaskHandle<?> handle = (TaskHandle<?>) entry.handle();
-        if (handle.completeCancelled(ComputeCancelledException.Reason.EVICTED)) {
+        if (handle.completeCancelled(ComputeCancelledException.Reason.EVICTED, true)) {
             final MetricsCollector collector = this.metricsCollector;
             if (collector != null) {
                 collector.onCancelled(entry, ComputeCancelledException.Reason.EVICTED);

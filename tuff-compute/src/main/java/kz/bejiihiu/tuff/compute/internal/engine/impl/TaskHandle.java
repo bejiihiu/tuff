@@ -2,8 +2,11 @@ package kz.bejiihiu.tuff.compute.internal.engine.impl;
 
 import java.time.Instant;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import kz.bejiihiu.tuff.compute.ComputeCancelledException;
@@ -70,6 +73,7 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
     private final String label;
     private final CompletableFuture<T> future;
     private final Owner owner;
+    private final Executor completionExecutor;
 
     private final AtomicReference<State> state = new AtomicReference<>(State.QUEUED);
     private final AtomicBoolean cancelRequested = new AtomicBoolean();
@@ -93,6 +97,8 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
      * @param submittedAtNanos monotonic acceptance timestamp
      * @param label            normalized task label, may be empty
      * @param owner            engine side of the handle
+     * @param completions      executor used for completions that must not run on a scheduler
+     *                         service thread (janitor, eviction, shutdown), must not be {@code null}
      */
     TaskHandle(
         final long taskId,
@@ -102,7 +108,8 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
         final Instant submittedAt,
         final long submittedAtNanos,
         final String label,
-        final Owner owner
+        final Owner owner,
+        final Executor completions
     ) {
         this.taskId = taskId;
         this.consumerId = consumerId;
@@ -112,6 +119,7 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
         this.submittedAtNanos = submittedAtNanos;
         this.label = label;
         this.owner = owner;
+        this.completionExecutor = Objects.requireNonNull(completions, "completions");
         this.future = new HandleFuture();
     }
 
@@ -257,6 +265,23 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
      * @return {@code true} if this call moved the handle into the cancelled state
      */
     boolean completeCancelled(final ComputeCancelledException.Reason reason) {
+        return this.completeCancelled(reason, false);
+    }
+
+    /**
+     * Completes a cancelled task and optionally moves the future completion off the calling thread.
+     *
+     * <p>The terminal state is always published inline, only {@link CompletableFuture} completion is
+     * optional. Completion is deferred when the caller is a scheduler service thread (queue janitor,
+     * shutdown thread) or the eviction path of a submitting thread, because dependent stages such as
+     * {@code thenApply} run on the completing thread and may block on user code. A blocked
+     * continuation must never be able to stall housekeeping or shutdown.
+     *
+     * @param reason   why the task was cancelled
+     * @param deferred whether the future should be completed on the engine's completion path
+     * @return {@code true} if this call moved the handle into the cancelled state
+     */
+    boolean completeCancelled(final ComputeCancelledException.Reason reason, final boolean deferred) {
         this.rememberCancelReason(reason);
         while (true) {
             final State current = this.state.get();
@@ -264,10 +289,32 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
                 return false;
             }
             if (this.state.compareAndSet(current, State.CANCELLED)) {
-                this.future.completeExceptionally(this.cancelledException());
+                final ComputeCancelledException cancellation = this.cancelledException();
+                if (deferred) {
+                    this.completeLater(() -> this.future.completeExceptionally(cancellation));
+                } else {
+                    this.future.completeExceptionally(cancellation);
+                }
                 this.signalTerminal();
                 return true;
             }
+        }
+    }
+
+    /**
+     * Runs one future completion off the calling thread when possible.
+     *
+     * <p>The completion executor may already be shut down during termination. Falling back to an
+     * inline completion is safe then: the caller is the worker that just finished the body, which is
+     * the thread user code is expected to run on anyway.
+     *
+     * @param completion completion action
+     */
+    private void completeLater(final Runnable completion) {
+        try {
+            this.completionExecutor.execute(completion);
+        } catch (RejectedExecutionException _) {
+            completion.run();
         }
     }
 

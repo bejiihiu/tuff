@@ -23,6 +23,7 @@ import kz.bejiihiu.tuff.compute.internal.metrics.JfrRecorder;
 import kz.bejiihiu.tuff.compute.internal.metrics.MetricsCollector;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.compute.internal.util.Durations;
 import kz.bejiihiu.tuff.compute.internal.util.ThreadFactories;
 import org.jspecify.annotations.Nullable;
 
@@ -57,6 +58,8 @@ import org.jspecify.annotations.Nullable;
  * otherwise the sampler thread outlives the pool.
  */
 public final class ComputeMetricsCollector implements MetricsCollector {
+
+    private static final System.Logger LOG = System.getLogger(ComputeMetricsCollector.class.getName());
 
     private static final String SAMPLER_THREAD_PREFIX = "Tuff Compute Metrics";
 
@@ -152,6 +155,22 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             this.currentQueuedDepth(),
             labelOf(entry)
         );
+    }
+
+    @Override
+    public void onSubmissionWithdrawn(final QueueEntry entry) {
+        final GlobalCounters current = this.counters;
+        if (current == null) {
+            return;
+        }
+        // mirror of onSubmitted for a submission the queue refused after the counter was published
+        current.submitted.decrement();
+        current.addQueued(entry.priority(), -1L);
+        final ConsumerState state = this.consumers.get(entry.consumerId());
+        if (state != null) {
+            state.submitted.decrement();
+            state.queued.decrement();
+        }
     }
 
     @Override
@@ -422,6 +441,13 @@ public final class ComputeMetricsCollector implements MetricsCollector {
 
     @Override
     public synchronized void reset() {
+        if (this.hasLiveTasks()) {
+            // zeroing a live counter makes every later decrement wrong, so refuse instead of
+            // silently breaking the invariant until the next restart
+            throw new IllegalStateException(
+                "cannot reset compute metrics while tasks are queued or running; stop the scheduler first"
+            );
+        }
         this.counters = this.metricsEnabled ? new GlobalCounters(this.clock, this.throughputWindow) : null;
         this.consumers.clear();
         this.queuedTasks = 0;
@@ -434,11 +460,45 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         this.cpuUtilization = Double.NaN;
     }
 
+    /**
+     * Checks whether any lifecycle-derived counter still describes live work.
+     *
+     * <p>Sampled gauges are deliberately ignored: a stale queue depth sample is harmless, a zeroed
+     * active counter is not.
+     *
+     * @return {@code true} if a task is queued or running according to this collector
+     */
+    private boolean hasLiveTasks() {
+        final GlobalCounters current = this.counters;
+        if (current != null) {
+            for (final LongAdder depth : current.queuedByPriority) {
+                if (depth.sum() != 0L) {
+                    return true;
+                }
+            }
+        }
+        for (final ConsumerState state : this.consumers.values()) {
+            if (state.active.sum() != 0L || state.queued.sum() != 0L) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     @Override
     public void close() {
         final ScheduledExecutorService current = this.sampler;
-        if (current != null) {
-            current.shutdownNow();
+        if (current == null) {
+            return;
+        }
+        current.shutdownNow();
+        try {
+            if (!current.awaitTermination(1L, TimeUnit.SECONDS)) {
+                LOG.log(System.Logger.Level.WARNING,
+                    "compute metrics sampler did not stop within one second; it will terminate on its own");
+            }
+        } catch (InterruptedException _) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -472,7 +532,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
     private ScheduledExecutorService startSampler(final Duration interval) {
         final ScheduledExecutorService executor =
             Executors.newSingleThreadScheduledExecutor(ThreadFactories.platform(SAMPLER_THREAD_PREFIX, true));
-        final long millis = Math.max(1L, interval.toMillis());
+        final long millis = Math.max(1L, Durations.toMillisSaturated(interval));
         executor.scheduleAtFixedRate(this::sampleSafely, millis, millis, TimeUnit.MILLISECONDS);
         return executor;
     }

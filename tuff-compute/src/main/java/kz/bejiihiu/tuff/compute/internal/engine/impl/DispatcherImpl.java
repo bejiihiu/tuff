@@ -18,6 +18,7 @@ import kz.bejiihiu.tuff.compute.internal.queue.LaneAwareQueue;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.queue.QuotaController;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.compute.internal.util.Durations;
 import kz.bejiihiu.tuff.compute.internal.util.Preconditions;
 import org.jspecify.annotations.Nullable;
 
@@ -375,8 +376,26 @@ final class DispatcherImpl implements Dispatcher {
      * @param reason why it is cancelled
      */
     void cancelQueued(final QueueEntry entry, final ComputeCancelledException.Reason reason) {
+        this.cancelQueued(entry, reason, false);
+    }
+
+    /**
+     * Terminalizes one entry and optionally moves the future completion off the calling thread.
+     *
+     * <p>Service threads (janitor, shutdown) and the eviction path must pass {@code true}: dependent
+     * stages run on the completing thread and user code may block there.
+     *
+     * @param entry    entry to cancel
+     * @param reason   why it is cancelled
+     * @param deferred whether the future completion may be deferred to the completion path
+     */
+    void cancelQueued(
+        final QueueEntry entry,
+        final ComputeCancelledException.Reason reason,
+        final boolean deferred
+    ) {
         final TaskHandle<?> handle = handleOf(entry);
-        if (handle.completeCancelled(reason)) {
+        if (handle.completeCancelled(reason, deferred)) {
             this.emitCancelled(entry, reason);
         }
     }
@@ -404,15 +423,25 @@ final class DispatcherImpl implements Dispatcher {
      * @param reason why the entries are cancelled
      */
     void cancelAllCarried(final ComputeCancelledException.Reason reason) {
+        this.cancelAllCarried(reason, false);
+    }
+
+    /**
+     * Cancels every carried or orphaned entry, optionally deferring the future completion.
+     *
+     * @param reason   why the entries are cancelled
+     * @param deferred whether the future completion may leave the calling thread
+     */
+    void cancelAllCarried(final ComputeCancelledException.Reason reason, final boolean deferred) {
         for (int index = 0; index < this.carried.length(); index++) {
             final QueueEntry entry = this.carried.getAndSet(index, null);
             if (entry != null) {
-                this.cancelQueued(entry, reason);
+                this.cancelQueued(entry, reason, deferred);
             }
         }
         QueueEntry orphan = this.orphans.poll();
         while (orphan != null) {
-            this.cancelQueued(orphan, reason);
+            this.cancelQueued(orphan, reason, deferred);
             orphan = this.orphans.poll();
         }
     }
@@ -457,15 +486,25 @@ final class DispatcherImpl implements Dispatcher {
      * @param nowNanos current clock reading
      */
     void sweepCarried(final long nowNanos) {
+        this.sweepCarried(nowNanos, false);
+    }
+
+    /**
+     * Expires carried and orphaned entries, optionally deferring the future completion.
+     *
+     * @param nowNanos current clock reading
+     * @param deferred whether the future completion may leave the calling thread
+     */
+    void sweepCarried(final long nowNanos, final boolean deferred) {
         for (int index = 0; index < this.carried.length(); index++) {
             final QueueEntry entry = this.carried.get(index);
             if (entry != null && this.isExpired(entry, nowNanos) && this.carried.compareAndSet(index, entry, null)) {
-                this.cancelQueued(entry, ComputeCancelledException.Reason.QUEUE_EXPIRED);
+                this.cancelQueued(entry, ComputeCancelledException.Reason.QUEUE_EXPIRED, deferred);
             }
         }
         for (final QueueEntry orphan : new ArrayList<>(this.orphans)) {
             if (this.isExpired(orphan, nowNanos) && this.orphans.remove(orphan)) {
-                this.cancelQueued(orphan, ComputeCancelledException.Reason.QUEUE_EXPIRED);
+                this.cancelQueued(orphan, ComputeCancelledException.Reason.QUEUE_EXPIRED, deferred);
             }
         }
     }
@@ -686,7 +725,7 @@ final class DispatcherImpl implements Dispatcher {
         if (policy == null || !policy.expiresQueuedTasks()) {
             return false;
         }
-        return nowNanos - entry.submittedAtNanos() >= policy.maxQueueWait().toNanos();
+        return nowNanos - entry.submittedAtNanos() >= Durations.toNanosSaturated(policy.maxQueueWait());
     }
 
     private static TaskHandle<?> handleOf(final QueueEntry entry) {

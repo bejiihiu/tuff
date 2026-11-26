@@ -44,14 +44,14 @@ public final class AtomicQuotaController implements QuotaController {
     public boolean admits(final String consumerId) {
         Objects.requireNonNull(consumerId, "consumerId");
         final Quota quota = this.quotas.get(consumerId);
-        return quota != null && quota.active.get() < this.limitOf(quota);
+        return quota != null && !quota.retired && quota.active.get() < this.limitOf(quota);
     }
 
     @Override
     public boolean tryAcquire(final String consumerId) {
         Objects.requireNonNull(consumerId, "consumerId");
         final Quota quota = this.quotas.get(consumerId);
-        if (quota == null) {
+        if (quota == null || quota.retired) {
             return false;
         }
         while (true) {
@@ -60,6 +60,12 @@ public final class AtomicQuotaController implements QuotaController {
                 return false;
             }
             if (quota.active.compareAndSet(active, active + 1)) {
+                if (quota.retired) {
+                    // removeConsumer marked it while this acquire was in flight; undo the slot so
+                    // the retired object does not carry a phantom reservation
+                    quota.active.decrementAndGet();
+                    return false;
+                }
                 return true;
             }
         }
@@ -120,30 +126,37 @@ public final class AtomicQuotaController implements QuotaController {
         final Quota existing = this.quotas.get(consumerId);
         if (existing != null) {
             existing.policy = policy;
+            // a re-registration revives the same quota object, so outstanding slots of the previous
+            // registration keep counting against the new limit instead of vanishing
+            existing.retired = false;
             return;
         }
         final Quota raced = this.quotas.putIfAbsent(consumerId, new Quota(policy));
         if (raced != null) {
             raced.policy = policy;
+            raced.retired = false;
         }
     }
 
     @Override
     public void removeConsumer(final String consumerId) {
         Objects.requireNonNull(consumerId, "consumerId");
-        final Quota removed = this.quotas.remove(consumerId);
-        if (removed == null) {
+        final Quota quota = this.quotas.get(consumerId);
+        if (quota == null) {
             return;
         }
-        final int active = removed.active.get();
+        // mark first, then check: an acquire that already has the object either sees the flag and
+        // rolls back, or bumps the counter before the check below keeps the object alive
+        quota.retired = true;
+        final int active = quota.active.get();
         if (active != 0) {
-            // put the accounting back so the engine can still release the outstanding slots instead
-            // of leaking them.
-            this.quotas.putIfAbsent(consumerId, removed);
+            // keep the very same object in the map so the outstanding releases still land here. do
+            // not putIfAbsent a fresh quota: that would zero the live count.
             throw new IllegalStateException(
                 "consumer " + consumerId + " still has " + active + " active task(s)"
             );
         }
+        this.quotas.remove(consumerId, quota);
     }
 
     @Override
@@ -175,6 +188,12 @@ public final class AtomicQuotaController implements QuotaController {
 
         private final AtomicInteger active = new AtomicInteger();
         private volatile ConsumerPolicy policy;
+
+        /**
+         * Set while the engine is removing the consumer. Kept on the same object so an in-flight
+         * acquire/release cannot be lost into a replacement quota.
+         */
+        private volatile boolean retired;
 
         /**
          * Creates a quota.

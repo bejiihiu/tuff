@@ -4,6 +4,7 @@ import java.util.Objects;
 import kz.bejiihiu.tuff.compute.internal.queue.LaneAwareQueue;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.worker.WorkerLoop;
+import kz.bejiihiu.tuff.compute.internal.worker.impl.DynamicWorkerPool;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -23,6 +24,12 @@ final class EngineWorkerLoop implements WorkerLoop {
     private final EngineTaskRunner runner;
 
     /**
+     * Pool that owns this loop, bound after construction because the pool needs the loop first.
+     * Used only for the busy worker gauge.
+     */
+    private volatile @Nullable DynamicWorkerPool pool;
+
+    /**
      * Creates the loop.
      *
      * @param dispatcher dispatcher that owns the queue and the quotas
@@ -33,13 +40,32 @@ final class EngineWorkerLoop implements WorkerLoop {
         this.runner = Objects.requireNonNull(runner, "runner");
     }
 
+    /**
+     * Binds the pool so the loop can report which workers are actually executing a task.
+     *
+     * @param workerPool pool that owns this loop
+     */
+    void bindPool(final DynamicWorkerPool workerPool) {
+        this.pool = Objects.requireNonNull(workerPool, "workerPool");
+    }
+
     @Override
     public boolean executeNext(final int workerIndex) {
         final QueueEntry entry = this.dispatcher.next(workerIndex);
         if (entry == null) {
             return false;
         }
-        this.runner.run(entry, LaneAwareQueue.Lane.PLATFORM);
+        final DynamicWorkerPool owner = this.pool;
+        if (owner != null) {
+            owner.taskStarted();
+        }
+        try {
+            this.runner.run(entry, LaneAwareQueue.Lane.PLATFORM);
+        } finally {
+            if (owner != null) {
+                owner.taskFinished();
+            }
+        }
         return true;
     }
 

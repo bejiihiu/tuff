@@ -26,10 +26,20 @@ final class TestWorkerLoop implements WorkerLoop {
     final AtomicInteger steals = new AtomicInteger();
     private final TestTaskQueue queue;
     private final boolean workStealing;
+    private volatile DynamicWorkerPool pool;
 
     TestWorkerLoop(final TestTaskQueue queue, final boolean workStealing) {
         this.queue = queue;
         this.workStealing = workStealing;
+    }
+
+    /**
+     * Binds the pool so this loop reports real busy workers instead of inferred permits.
+     *
+     * @param workerPool pool that owns this loop
+     */
+    void bindPool(final DynamicWorkerPool workerPool) {
+        this.pool = workerPool;
     }
 
     @Override
@@ -71,6 +81,10 @@ final class TestWorkerLoop implements WorkerLoop {
         final int now = this.concurrent.incrementAndGet();
         this.maxConcurrent.accumulateAndGet(now, Math::max);
         this.executed.incrementAndGet();
+        final DynamicWorkerPool owner = this.pool;
+        if (owner != null) {
+            owner.taskStarted();
+        }
         try {
             task.handle.markRunning();
             entry.execute();
@@ -79,6 +93,9 @@ final class TestWorkerLoop implements WorkerLoop {
             task.failure = thrown;
             task.handle.markFailed(thrown);
         } finally {
+            if (owner != null) {
+                owner.taskFinished();
+            }
             this.concurrent.decrementAndGet();
         }
         return true;

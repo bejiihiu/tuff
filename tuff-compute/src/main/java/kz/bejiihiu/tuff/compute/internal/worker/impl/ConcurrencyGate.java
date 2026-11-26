@@ -1,6 +1,7 @@
 package kz.bejiihiu.tuff.compute.internal.worker.impl;
 
 import java.util.concurrent.atomic.AtomicInteger;
+import kz.bejiihiu.tuff.compute.internal.util.Durations;
 
 /**
  * Limits how many workers may be inside {@code executeNext} at the same time.
@@ -88,7 +89,7 @@ final class ConcurrencyGate {
         if (this.tryAcquire()) {
             return true;
         }
-        final long deadline = System.nanoTime() + Math.max(0L, timeoutNanos);
+        final long deadline = Durations.deadline(System.nanoTime(), Math.max(0L, timeoutNanos));
         synchronized (this.monitor) {
             this.waiters++;
             try {

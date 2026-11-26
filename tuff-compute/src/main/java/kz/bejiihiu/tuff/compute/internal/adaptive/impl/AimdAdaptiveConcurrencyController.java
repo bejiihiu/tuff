@@ -14,6 +14,7 @@ import kz.bejiihiu.tuff.compute.internal.adaptive.AdaptiveConcurrencyController;
 import kz.bejiihiu.tuff.compute.internal.adaptive.AdaptiveSnapshot;
 import kz.bejiihiu.tuff.compute.internal.metrics.impl.CpuUtilizationProbe;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.compute.internal.util.Durations;
 import kz.bejiihiu.tuff.compute.internal.util.Preconditions;
 import org.jspecify.annotations.Nullable;
 
@@ -278,7 +279,7 @@ public final class AimdAdaptiveConcurrencyController implements AdaptiveConcurre
         final ComputeSettings.Adaptive adaptive = settings.adaptive();
         this.adaptiveEnabled = adaptive.enabled();
         this.workerCountAutomatic = settings.workers().automaticThreadCount();
-        this.windowNanos = adaptive.sampleWindow().toNanos();
+        this.windowNanos = Durations.toNanosSaturated(adaptive.sampleWindow());
         this.decisionIntervalNanos = Math.max(this.windowNanos, MINIMUM_DECISION_INTERVAL);
         this.minSamples = adaptive.minSamples();
         this.increaseStep = adaptive.increaseStep();

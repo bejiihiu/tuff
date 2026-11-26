@@ -40,6 +40,18 @@ public interface MetricsCollector {
     void onSubmitted(QueueEntry entry);
 
     /**
+     * Undoes {@link #onSubmitted(QueueEntry)} when the queue refused the entry after all.
+     *
+     * <p>The engine publishes the submission before the entry becomes visible to a worker, so a
+     * completion can never be counted before its submission. When the offer is then refused the
+     * counter must be taken back out; this is the only event pair that is not one submission, one
+     * terminal event.
+     *
+     * @param entry the entry that was never queued
+     */
+    void onSubmissionWithdrawn(QueueEntry entry);
+
+    /**
      * Records a refused submission.
      *
      * @param consumerId consumer the submission was made for

@@ -7,6 +7,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.ComputeRejectedException;
@@ -17,6 +18,7 @@ import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.assertEventually;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.settings;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.startedScheduler;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -29,6 +31,91 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @Timeout(90)
 class EngineMetricsConsistencyTest {
+
+    @Test
+    void countersStayConsistentWithRunningAndQueuedTasks() throws Exception {
+        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(2).capacity(64);
+        final AsyncComputeScheduler compute = startedScheduler(builder.build(), new EngineTestSupport.FakeClock());
+        final CountDownLatch running = new CountDownLatch(2);
+        final CountDownLatch release = new CountDownLatch(1);
+        try {
+            for (int index = 0; index < 5; index++) {
+                compute.submit(() -> {
+                    running.countDown();
+                    release.await();
+                    return "held";
+                });
+            }
+            assertTrue(running.await(10L, TimeUnit.SECONDS));
+
+            // both workers are busy with a task and three more are queued: the invariant is checked
+            // where every term is non zero instead of at rest
+            final ConsumerMetrics busy = compute.metrics().consumer(AsyncComputeScheduler.DEFAULT_CONSUMER_ID).orElseThrow();
+            assertEquals(5L, busy.submittedTasks());
+            assertEquals(2, busy.activeTasks());
+            assertEquals(3, busy.queuedTasks());
+
+            final AtomicBoolean gauge = new AtomicBoolean();
+            final long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+            while (!gauge.get() && System.nanoTime() < deadline) {
+                final SchedulerMetrics sample = compute.metrics();
+                gauge.set(sample.activeWorkers() == 2 && sample.idleWorkers() == 0);
+                if (!gauge.get()) {
+                    Thread.sleep(2L);
+                }
+            }
+            assertTrue(gauge.get(), "activeWorkers must report the two busy workers, not permits");
+            final SchedulerMetrics live = compute.metrics();
+            assertEquals(
+                live.submittedTasks(),
+                live.completedTasks() + live.failedTasks() + live.cancelledTasks()
+                    + live.queuedTasks() + live.activeWorkers()
+            );
+
+            release.countDown();
+            assertEventually("all tasks finish", Duration.ofSeconds(10), () -> {
+                final SchedulerMetrics settled = compute.metrics();
+                return settled.completedTasks() == 5L;
+            });
+        } finally {
+            release.countDown();
+            compute.shutdown();
+            assertTrue(compute.awaitTermination(Duration.ofSeconds(10)));
+        }
+    }
+
+    @Test
+    void rejectedSubmissionsAreNotCountedAsSubmitted() throws Exception {
+        final AsyncComputeScheduler compute = startedScheduler(
+            settings().fixedWorkers(1).capacity(1).build(),
+            new EngineTestSupport.FakeClock()
+        );
+        final CountDownLatch running = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        try {
+            compute.submit(() -> {
+                running.countDown();
+                release.await();
+                return "blocker";
+            });
+            assertTrue(running.await(10L, TimeUnit.SECONDS));
+            compute.submit(() -> "queued");
+            assertThrows(ComputeRejectedException.class, () -> compute.submit(() -> "overflow"));
+
+            final SchedulerMetrics sample = compute.metrics();
+            assertEquals(2L, sample.submittedTasks(), "the refused offer must not stay counted");
+            assertEquals(1L, sample.rejectedTasks());
+            assertEquals(1, sample.consumer(AsyncComputeScheduler.DEFAULT_CONSUMER_ID).orElseThrow().queuedTasks());
+
+            release.countDown();
+            assertEventually("accepted tasks finish", Duration.ofSeconds(10),
+                () -> compute.metrics().completedTasks() == 2L);
+        } finally {
+            release.countDown();
+            compute.shutdown();
+            assertTrue(compute.awaitTermination(Duration.ofSeconds(10)));
+        }
+    }
 
     @Test
     void mixedWorkloadKeepsEveryCounterConsistent() throws Exception {

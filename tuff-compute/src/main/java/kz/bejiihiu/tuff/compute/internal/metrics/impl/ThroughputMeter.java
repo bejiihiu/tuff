@@ -3,6 +3,7 @@ package kz.bejiihiu.tuff.compute.internal.metrics.impl;
 import java.time.Duration;
 import java.util.Objects;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.compute.internal.util.Durations;
 
 /**
  * Throughput meter driven by periodic samples of a monotonically growing completion counter.
@@ -55,7 +56,7 @@ public final class ThroughputMeter {
         if (window.isNegative() || window.isZero()) {
             throw new IllegalArgumentException("window must be positive, got " + window);
         }
-        this.windowNanos = window.toNanos();
+        this.windowNanos = Durations.toNanosSaturated(window);
     }
 
     /**

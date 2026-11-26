@@ -332,6 +332,37 @@ class ComputeMetricsCollectorTest {
         assertEquals(0, snapshot.consumer("b").orElseThrow().activeTasks());
     }
 
+    @Test
+    void resetIsRefusedWhileATaskIsQueuedOrRunning() {
+        final ComputeMetricsCollector collector = this.collector(true, false, new MetricsFixtures.FakeClock());
+        collector.onConsumerRegistered(MetricsFixtures.consumer("chunk"), 4);
+        collector.onSubmitted(MetricsFixtures.entry(1L, "chunk", ComputePriority.NORMAL));
+        collector.onStarted(MetricsFixtures.entry(1L, "chunk", ComputePriority.NORMAL), 5L);
+
+        assertThrows(IllegalStateException.class, collector::reset, "a live task must not be wiped by reset");
+        assertEquals(1, collector.consumerMetrics("chunk").activeTasks());
+
+        collector.onCompleted(MetricsFixtures.entry(1L, "chunk", ComputePriority.NORMAL), 5L);
+        collector.reset();
+        assertEquals(0L, collector.schedulerMetrics().submittedTasks());
+        assertTrue(collector.consumerMetrics().isEmpty());
+    }
+
+    @Test
+    void withdrawnSubmissionLeavesNoTrace() {
+        final ComputeMetricsCollector collector = this.collector(true, false, new MetricsFixtures.FakeClock());
+        collector.onConsumerRegistered(MetricsFixtures.consumer("chunk"), 4);
+        final var entry = MetricsFixtures.entry(1L, "chunk", ComputePriority.HIGH);
+        collector.onSubmitted(entry);
+        collector.onSubmissionWithdrawn(entry);
+
+        final SchedulerMetrics snapshot = collector.schedulerMetrics();
+        assertEquals(0L, snapshot.submittedTasks());
+        assertEquals(0, ((SchedulerMetricsSnapshot) snapshot).queuedByPriority().get(ComputePriority.HIGH));
+        assertEquals(0, snapshot.consumer("chunk").orElseThrow().queuedTasks());
+        assertEquals(0L, snapshot.consumer("chunk").orElseThrow().submittedTasks());
+    }
+
     private ComputeMetricsCollector collector(final boolean metrics, final boolean jfr, final MetricsFixtures.FakeClock clock) {
         return this.newCollector(
             MetricsFixtures.settings(metrics, jfr, Duration.ofSeconds(1), false, Duration.ofHours(1)),

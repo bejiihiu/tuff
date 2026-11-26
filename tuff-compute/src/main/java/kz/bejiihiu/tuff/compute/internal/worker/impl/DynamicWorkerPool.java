@@ -11,6 +11,7 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.concurrent.locks.ReentrantLock;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.compute.internal.util.Durations;
 import kz.bejiihiu.tuff.compute.internal.util.Preconditions;
 import kz.bejiihiu.tuff.compute.internal.worker.WorkerLoop;
 import kz.bejiihiu.tuff.compute.internal.worker.WorkerPool;
@@ -72,6 +73,7 @@ public final class DynamicWorkerPool implements WorkerPool {
     private final Set<Worker> workers = ConcurrentHashMap.newKeySet();
     private final Set<Thread> createdThreads = ConcurrentHashMap.newKeySet();
     private final AtomicInteger liveWorkers = new AtomicInteger();
+    private final AtomicInteger busyWorkers = new AtomicInteger();
     private final AtomicInteger exitReservations = new AtomicInteger();
     private final AtomicInteger desiredWorkers = new AtomicInteger();
     private final AtomicInteger retirementFloor = new AtomicInteger();
@@ -157,8 +159,8 @@ public final class DynamicWorkerPool implements WorkerPool {
         this.minWorkers = Math.min(workers.minThreads(), this.maxWorkers);
         this.initialWorkers = WorkerSizing.targetWorkers(workers, availableProcessors);
         this.automatic = workers.automaticThreadCount();
-        this.keepAliveNanos = workers.keepAlive().toNanos();
-        this.idleWaitNanos = scheduling.idleWait().toNanos();
+        this.keepAliveNanos = Durations.toNanosSaturated(workers.keepAlive());
+        this.idleWaitNanos = Durations.toNanosSaturated(scheduling.idleWait());
 
         this.slots = new Worker[this.maxWorkers];
         this.desiredWorkers.set(this.initialWorkers);
@@ -202,8 +204,8 @@ public final class DynamicWorkerPool implements WorkerPool {
 
     @Override
     public boolean awaitTermination(final Duration timeout) throws InterruptedException {
-        Preconditions.checkNonNegative(timeout.toNanos(), "timeout");
-        final long deadline = System.nanoTime() + timeout.toNanos();
+        Preconditions.checkNonNegative(Durations.toNanosSaturated(timeout), "timeout");
+        final long deadline = Durations.deadline(System.nanoTime(), Durations.toNanosSaturated(timeout));
         boolean terminatedInTime = false;
         this.terminationLock.lockInterruptibly();
         try {
@@ -262,12 +264,30 @@ public final class DynamicWorkerPool implements WorkerPool {
 
     @Override
     public int activeWorkers() {
-        return this.gate.inUse();
+        return Math.max(0, this.busyWorkers.get());
     }
 
     @Override
     public int idleWorkers() {
-        return Math.max(0, this.liveWorkers.get() - this.gate.inUse());
+        return Math.max(0, this.liveWorkers.get() - this.activeWorkers());
+    }
+
+    /**
+     * Records that a worker just started executing a task body.
+     *
+     * <p>Kept separate from the concurrency gate on purpose: a permit is also held while a worker
+     * polls the queue, so gate usage is a claim gauge, not a busy worker gauge. Only the loop knows
+     * when a real task begins.
+     */
+    public void taskStarted() {
+        this.busyWorkers.incrementAndGet();
+    }
+
+    /**
+     * Records that a worker left the task body (or failed before entering it).
+     */
+    public void taskFinished() {
+        this.busyWorkers.decrementAndGet();
     }
 
     @Override
@@ -285,6 +305,17 @@ public final class DynamicWorkerPool implements WorkerPool {
         Preconditions.checkAtLeast(permits, 1, "permits");
         this.explicitLimit = true;
         this.gate.setLimit(Math.min(permits, this.maxWorkers));
+        this.wakeAll();
+    }
+
+    /**
+     * Wakes parked workers after work was submitted.
+     *
+     * <p>Without this an idle worker sleeps until {@code idle-wait}, which is harmless for a latency
+     * tolerant tick but turns a huge configured wait into a stalled submission. The engine calls this
+     * for every accepted task; it is cheap and never blocks.
+     */
+    public void wakeUp() {
         this.wakeAll();
     }
 

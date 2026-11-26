@@ -226,13 +226,15 @@ class EngineCancellationStateTest {
         final ComputeTaskHandle<?> handle,
         final ComputeCancelledException.Reason expected
     ) {
+        // expiry and eviction may complete the future on the scheduler's completion path, so wait
+        // for the completion before asserting on it
+        final ComputeCancelledException cancelled = cancellationOf(handle.future());
+        assertEquals(expected, cancelled.reason());
         assertTrue(handle.future().isCancelled(), "future must report isCancelled");
         assertTrue(handle.future().isCompletedExceptionally());
         assertEquals(ComputeTaskHandle.State.CANCELLED, handle.state());
         assertTrue(handle.isCancelled());
         assertTrue(handle.isDone());
-        final ComputeCancelledException cancelled = cancellationOf(handle.future());
-        assertEquals(expected, cancelled.reason());
         assertThrows(CancellationException.class, () -> handle.future().get());
         assertThrows(CancellationException.class, handle.future()::join);
     }

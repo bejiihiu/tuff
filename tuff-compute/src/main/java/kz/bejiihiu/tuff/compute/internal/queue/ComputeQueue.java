@@ -72,6 +72,27 @@ public interface ComputeQueue {
     OfferResult offer(QueueEntry entry);
 
     /**
+     * Offers a task that is only accepted while its consumer is still registered.
+     *
+     * <p>The engine resolves a consumer before it builds an entry, so by the time the entry reaches
+     * the queue that consumer may have been unregistered concurrently. A plain {@link #offer} would
+     * silently recreate a stream for the unknown id, which leaves the entry with no quota, no
+     * registry entry and no dispatch path: a future that never completes. This variant answers
+     * {@link OfferResult#CONSUMER_UNKNOWN} instead, and never creates consumer state.
+     *
+     * <p>The check is racy by nature, but it is safe in both directions: an entry accepted just
+     * before the consumer was unregistered is drained and cancelled by
+     * {@link #unregisterConsumer(String)}, and an entry that loses the race is refused. A refused
+     * offer transfer no work, and a re-registration never resurrects the refused entry.
+     *
+     * @param entry entry to enqueue
+     * @return how the offer was handled
+     * @throws IllegalStateException if eviction is required by
+     *     {@link OverflowPolicy#DROP_OLDEST} but no eviction listener was installed
+     */
+    OfferResult offerRegistered(QueueEntry entry);
+
+    /**
      * Installs the sink that receives entries evicted by {@link #offer(QueueEntry)}.
      *
      * <p>The scheduler owns task handles and metrics, so the queue cannot cancel an evicted task
@@ -335,7 +356,12 @@ public interface ComputeQueue {
         /**
          * The queue is closed, nothing is accepted anymore.
          */
-        CLOSED
+        CLOSED,
+
+        /**
+         * The consumer is not registered (any more), so the entry has nowhere to run.
+         */
+        CONSUMER_UNKNOWN
     }
 
     /**

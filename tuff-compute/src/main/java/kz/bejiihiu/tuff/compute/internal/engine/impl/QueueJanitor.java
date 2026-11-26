@@ -1,9 +1,11 @@
 package kz.bejiihiu.tuff.compute.internal.engine.impl;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.function.IntSupplier;
 import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.internal.adaptive.AdaptiveConcurrencyController;
@@ -11,6 +13,7 @@ import kz.bejiihiu.tuff.compute.internal.metrics.MetricsCollector;
 import kz.bejiihiu.tuff.compute.internal.queue.ComputeQueue;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.compute.internal.util.Durations;
 import kz.bejiihiu.tuff.compute.internal.worker.WorkerPool;
 import org.jspecify.annotations.Nullable;
 
@@ -32,8 +35,10 @@ import org.jspecify.annotations.Nullable;
  *     autoscaler owns pool sizing.</li>
  * </ul>
  *
- * <p>The thread never touches task bodies, never interrupts a worker and never blocks on user code.
- * Its stop() interrupts this thread only.
+ * <p>The thread never touches task bodies, never interrupts a worker and never runs user code. An
+ * expired entry is terminalized with a deferred future completion, so a dependent stage that blocks
+ * cannot park this thread. Its {@link #stop(Duration)} is bounded and reports a miss instead of
+ * waiting forever.
  */
 final class QueueJanitor implements Runnable {
 
@@ -154,33 +159,54 @@ final class QueueJanitor implements Runnable {
     }
 
     /**
-     * Stops the janitor and waits for its thread to leave the loop.
+     * Stops the janitor and waits for its thread to leave the loop, bounded by a timeout.
+     *
+     * <p>Expiry no longer terminalizes futures inline, so this should return almost immediately. The
+     * bound exists anyway: a stuck sweep must not turn into a scheduler that never reaches
+     * {@code TERMINATED}.
+     *
+     * @param timeout maximum time to wait for the thread, must not be negative
+     * @return {@code true} if the janitor left its loop in time
      */
-    void stop() {
+    boolean stop(final Duration timeout) {
         this.running = false;
         final Thread current = this.thread;
         if (current != null) {
             current.interrupt();
         }
         try {
-            this.stopped.await();
+            final boolean stoppedInTime = this.stopped.await(
+                Math.max(0L, Durations.toNanosSaturated(timeout)),
+                TimeUnit.NANOSECONDS
+            );
+            if (!stoppedInTime) {
+                LOG.log(System.Logger.Level.WARNING,
+                    "compute janitor did not stop within " + timeout + "; continuing shutdown without it");
+            }
+            return stoppedInTime;
         } catch (InterruptedException _) {
             Thread.currentThread().interrupt();
+            LOG.log(System.Logger.Level.WARNING, "compute janitor stop was interrupted");
+            return false;
         }
     }
 
     private void sweep() {
         final long now = this.clock.nanoTime();
+        // a manual sweep from diagnostics or a test runs on the calling thread; only the janitor's own
+        // tick must push user continuations off the service thread
+        final boolean defer = Thread.currentThread() == this.thread;
         if (this.queue.hasExpired(now)) {
             this.expired.clear();
             if (this.queue.drainExpired(now, this.expired) > 0) {
                 for (final QueueEntry entry : this.expired) {
-                    this.dispatcher.cancelQueued(entry, ComputeCancelledException.Reason.QUEUE_EXPIRED);
+                    // completion goes through the completion path, never inline here
+                    this.dispatcher.cancelQueued(entry, ComputeCancelledException.Reason.QUEUE_EXPIRED, defer);
                 }
                 this.expired.clear();
             }
         }
-        this.dispatcher.sweepCarried(now);
+        this.dispatcher.sweepCarried(now, defer);
         final AdaptiveConcurrencyController controller = this.adaptive;
         if (controller != null) {
             // the adaptive controller models the platform pool only; virtual lane backlog must not

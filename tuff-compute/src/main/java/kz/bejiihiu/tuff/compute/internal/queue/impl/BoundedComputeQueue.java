@@ -23,6 +23,7 @@ import kz.bejiihiu.tuff.compute.internal.queue.LaneAwareQueue;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueSnapshot;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.compute.internal.util.Durations;
 import kz.bejiihiu.tuff.compute.internal.util.Preconditions;
 import org.jspecify.annotations.Nullable;
 
@@ -167,6 +168,13 @@ public final class BoundedComputeQueue implements LaneAwareQueue {
     private volatile boolean closed;
 
     /**
+     * Test seam: invoked after the last admission check and before the node is linked, so a test can
+     * deterministically close and clear the queue in the window the production race needs. Always
+     * {@code null} in production.
+     */
+    private volatile @Nullable Runnable insertionGate;
+
+    /**
      * Creates a queue from the scheduler configuration.
      *
      * @param settings scheduler settings; the queue uses the global capacity, the scheduling options
@@ -216,36 +224,64 @@ public final class BoundedComputeQueue implements LaneAwareQueue {
 
     @Override
     public OfferResult offer(final QueueEntry entry) {
+        return this.offer(entry, false);
+    }
+
+    @Override
+    public OfferResult offerRegistered(final QueueEntry entry) {
+        return this.offer(entry, true);
+    }
+
+    /**
+     * Offers one entry, optionally refusing ids that are not registered right now.
+     *
+     * @param entry             entry to enqueue
+     * @param requireRegistered whether a missing consumer stream must be a refusal instead of an
+     *                          implicit registration with the default policy
+     * @return how the offer was handled
+     */
+    private OfferResult offer(final QueueEntry entry, final boolean requireRegistered) {
         Objects.requireNonNull(entry, "entry");
         int retirementRaces = 0;
+        boolean evictedOnce = false;
         while (true) {
             if (this.closed) {
                 return OfferResult.CLOSED;
             }
-            final ConsumerState state = this.stateFor(entry.consumerId());
+            final ConsumerState state = requireRegistered
+                ? this.consumers.get(entry.consumerId())
+                : this.stateFor(entry.consumerId());
+            if (state == null) {
+                // the consumer was unregistered between the engine's registry lookup and this
+                // offer; recreating the stream here would strand the entry forever
+                return OfferResult.CONSUMER_UNKNOWN;
+            }
             final ConsumerPolicy policy = state.policy;
             final int consumerBound = policy.maxQueuedTasks();
             if (consumerBound >= 0 && state.queued.get() >= consumerBound) {
-                final OfferResult refusal = this.handleOverflow(state, policy, OfferResult.CONSUMER_QUEUE_FULL);
+                final OfferResult refusal = this.handleOverflow(state, policy, OfferResult.CONSUMER_QUEUE_FULL, evictedOnce);
                 if (refusal != null) {
                     return refusal;
                 }
+                evictedOnce = true;
                 continue;
             }
             if (!this.reserveGlobal()) {
-                final OfferResult refusal = this.handleOverflow(state, policy, OfferResult.QUEUE_FULL);
+                final OfferResult refusal = this.handleOverflow(state, policy, OfferResult.QUEUE_FULL, evictedOnce);
                 if (refusal != null) {
                     return refusal;
                 }
+                evictedOnce = true;
                 continue;
             }
             final int previousDepth = this.reserveConsumer(state, consumerBound);
             if (previousDepth < 0) {
                 this.queued.decrementAndGet();
-                final OfferResult refusal = this.handleOverflow(state, policy, OfferResult.CONSUMER_QUEUE_FULL);
+                final OfferResult refusal = this.handleOverflow(state, policy, OfferResult.CONSUMER_QUEUE_FULL, evictedOnce);
                 if (refusal != null) {
                     return refusal;
                 }
+                evictedOnce = true;
                 continue;
             }
             if (previousDepth == 0) {
@@ -253,20 +289,37 @@ public final class BoundedComputeQueue implements LaneAwareQueue {
                 // cannot turn into an unbounded burst of dispatch turns.
                 this.alignVirtualService(state);
             }
+            final Runnable gate = this.insertionGate;
+            if (gate != null) {
+                // deterministic test seam: lets a test close and clear the queue between the last
+                // admission check and the actual insertion
+                gate.run();
+            }
             final Node node = new Node(entry, state);
             // putIfAbsent is not needed: sequences are monotone, so the comparator cannot collide.
             state.bucket(node.level).put(node, node);
             this.levelCounts[node.level].incrementAndGet();
-            if (state.retired && node.claim()) {
-                // the consumer was unregistered while we were inserting; drop the entry and retry
-                // against whatever registration exists now.
-                this.unlink(node);
-                retirementRaces++;
-                if (retirementRaces > MAX_RETIREMENT_RACES) {
-                    this.rejectedQueueFull.increment();
-                    return OfferResult.QUEUE_FULL;
+            if (this.closed || state.retired) {
+                // closed during insertion, or the consumer was unregistered while we were inserting.
+                // the second check is what closes the "checked closed, then paused, then inserted"
+                // window; claiming first makes sure a worker that already grabbed the node keeps it.
+                if (node.claim()) {
+                    this.unlink(node);
+                    if (this.closed) {
+                        return OfferResult.CLOSED;
+                    }
+                    if (requireRegistered) {
+                        // never retry against a fresh registration: that would resurrect work the
+                        // caller already lost
+                        return OfferResult.CONSUMER_UNKNOWN;
+                    }
+                    retirementRaces++;
+                    if (retirementRaces > MAX_RETIREMENT_RACES) {
+                        this.rejectedQueueFull.increment();
+                        return OfferResult.QUEUE_FULL;
+                    }
+                    continue;
                 }
-                continue;
             }
             this.accepted.increment();
             return OfferResult.ACCEPTED;
@@ -572,7 +625,15 @@ public final class BoundedComputeQueue implements LaneAwareQueue {
     public void updatePolicy(final String consumerId, final ConsumerPolicy policy) {
         Objects.requireNonNull(policy, "policy");
         Preconditions.requireNonBlank(consumerId, "consumerId");
-        this.register(consumerId, policy);
+        synchronized (this.topologyLock) {
+            final ConsumerState existing = this.consumers.get(consumerId);
+            if (existing == null) {
+                // updating a retired consumer must not recreate its stream: that would accept work
+                // for an id the engine no longer knows
+                return;
+            }
+            existing.policy = policy;
+        }
     }
 
     @Override
@@ -614,6 +675,18 @@ public final class BoundedComputeQueue implements LaneAwareQueue {
     }
 
     /**
+     * Installs a hook that runs between the admission check and the insertion.
+     *
+     * <p>Testing only: it exists so the "closed after the check, inserted before the drain" race can
+     * be reproduced without a sleep or a thread pause. Production code never sets it.
+     *
+     * @param gate hook to run before linking, or {@code null} to remove it
+     */
+    void setInsertionGateForTesting(final @Nullable Runnable gate) {
+        this.insertionGate = gate;
+    }
+
+    /**
      * Reserves one global slot.
      *
      * @return {@code true} if a slot was taken, {@code false} if the global bound is reached
@@ -652,9 +725,14 @@ public final class BoundedComputeQueue implements LaneAwareQueue {
     /**
      * Applies the consumer's overflow policy to a full bound.
      *
-     * @param state   consumer that hit the bound
-     * @param policy  policy in force for that consumer
-     * @param refusal result to report if nothing can be evicted
+     * <p>At most one entry is evicted per {@link #offer(QueueEntry)} call: without that limit a
+     * producer that keeps losing the freshly freed slot to a competitor would evict its whole
+     * backlog for a single incoming submission.
+     *
+     * @param state          consumer that hit the bound
+     * @param policy         policy in force for that consumer
+     * @param refusal        result to report if nothing can be evicted
+     * @param alreadyEvicted whether this offer already evicted one entry
      * @return {@code null} if an entry was evicted and the offer can be retried, otherwise the
      *     refusal result, already counted
      * @throws IllegalStateException if {@link OverflowPolicy#DROP_OLDEST} needs to evict an entry but
@@ -663,9 +741,10 @@ public final class BoundedComputeQueue implements LaneAwareQueue {
     private @Nullable OfferResult handleOverflow(
         final ConsumerState state,
         final ConsumerPolicy policy,
-        final OfferResult refusal
+        final OfferResult refusal,
+        final boolean alreadyEvicted
     ) {
-        if (policy.overflowPolicy() == OverflowPolicy.DROP_OLDEST) {
+        if (policy.overflowPolicy() == OverflowPolicy.DROP_OLDEST && !alreadyEvicted) {
             final EvictionListener listener = this.evictionListener;
             if (listener == null) {
                 if (this.oldestHead(state) != null) {
@@ -1099,11 +1178,7 @@ public final class BoundedComputeQueue implements LaneAwareQueue {
      * @return the duration in nanoseconds, saturated at {@link Long#MAX_VALUE}
      */
     private static long toNanosSaturated(final Duration duration) {
-        try {
-            return Math.max(1L, duration.toNanos());
-        } catch (ArithmeticException _) {
-            return Long.MAX_VALUE;
-        }
+        return Math.max(1L, Durations.toNanosSaturated(duration));
     }
 
     /**

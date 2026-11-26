@@ -174,6 +174,7 @@ class DynamicWorkerPoolReuseTest {
         final TestTaskQueue queue = new TestTaskQueue();
         final TestWorkerLoop loop = new TestWorkerLoop(queue, false);
         final DynamicWorkerPool pool = pool(fixed(2, 1, 2, prefix), scheduling(Duration.ofMillis(2)), 16, loop, prefix);
+        loop.bindPool(pool);
         final CountDownLatch release = new CountDownLatch(1);
         final TestTask task = new TestTask(() -> awaitLatch(release, LONG_WAIT));
         queue.submit(task);
