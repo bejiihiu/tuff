@@ -4,11 +4,14 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputeConsumer;
 import kz.bejiihiu.tuff.compute.ComputePriority;
+import kz.bejiihiu.tuff.compute.ComputeRequest;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
+import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
 import kz.bejiihiu.tuff.compute.ComputeTaskType;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.OverflowPolicy;
@@ -113,6 +116,85 @@ class ComputeReportTest {
             assertTrue(report.contains("active 0 / limit 1, queued 0 / unbounded"), report);
             assertTrue(report.contains("1 submitted, 1 completed, 0 failed, 0 rejected, 0 cancelled, 0 expired"), report);
             assertTrue(report.contains("queue wait avg "), report);
+        } finally {
+            stopScheduler(scheduler);
+        }
+    }
+
+    @Test
+    void tasksOfAnIdleEngineSayNothingIsRunning() throws Exception {
+        final AsyncComputeScheduler scheduler = startScheduler();
+        try {
+            assertEquals(
+                List.of("Tuff compute: nothing is running."),
+                ComputeReport.tasks(ComputeStatus.running(scheduler), 10)
+            );
+        } finally {
+            stopScheduler(scheduler);
+        }
+    }
+
+    @Test
+    void tasksOfADisabledEngineExplainWhyThereAreNone() {
+        final List<String> lines = ComputeReport.tasks(ComputeStatus.disabled(), 10);
+
+        assertEquals(2, lines.size());
+        assertTrue(lines.get(0).contains("disabled in config/tuff.yml"), lines.get(0));
+    }
+
+    @Test
+    void tasksListRunningWorkAndRecentCompletions() throws Exception {
+        final AsyncComputeScheduler scheduler = startScheduler();
+        final CountDownLatch started = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        try {
+            final ComputeTaskHandle<String> handle = scheduler.enqueue(ComputeRequest.of("blocked", () -> {
+                started.countDown();
+                release.await();
+                return "done";
+            }));
+            assertTrue(started.await(10L, TimeUnit.SECONDS), "the task should have started");
+
+            final String runningReport = String.join(
+                "\n", ComputeReport.tasks(ComputeStatus.running(scheduler), 10));
+
+            assertTrue(runningReport.contains("Tuff compute tasks: 1 running"), runningReport);
+            assertTrue(runningReport.contains(
+                "#" + handle.taskId() + " platform default GENERAL NORMAL \"blocked\" RUNNING "), runningReport);
+
+            release.countDown();
+            assertEquals("done", handle.future().get(10L, TimeUnit.SECONDS));
+            awaitCompleted(scheduler, 1L);
+            awaitRecentTasks(scheduler, 1);
+
+            final String finishedReport = String.join(
+                "\n", ComputeReport.tasks(ComputeStatus.running(scheduler), 10));
+
+            assertTrue(finishedReport.contains("0 running"), finishedReport);
+            assertTrue(finishedReport.contains(" COMPLETED "), finishedReport);
+            assertTrue(finishedReport.contains(" / wait "), finishedReport);
+            assertTrue(finishedReport.contains("\"blocked\""), finishedReport);
+        } finally {
+            release.countDown();
+            stopScheduler(scheduler);
+        }
+    }
+
+    @Test
+    void theTaskCountCapsOnlyTheRecentSection() throws Exception {
+        final AsyncComputeScheduler scheduler = startScheduler();
+        try {
+            for (int index = 0; index < 3; index++) {
+                scheduler.submit(() -> "value").get(10L, TimeUnit.SECONDS);
+            }
+            awaitCompleted(scheduler, 3L);
+            awaitRecentTasks(scheduler, 3);
+
+            final String report = String.join(
+                "\n", ComputeReport.tasks(ComputeStatus.running(scheduler), 1));
+
+            assertTrue(report.contains("slowest 1 recent"), report);
+            assertEquals(1, occurrences(report, " COMPLETED "), report);
         } finally {
             stopScheduler(scheduler);
         }
@@ -333,6 +415,28 @@ class ComputeReportTest {
     private static void stopScheduler(final AsyncComputeScheduler scheduler) throws InterruptedException {
         scheduler.shutdown(Duration.ZERO);
         assertTrue(scheduler.awaitTermination(Duration.ofSeconds(10L)));
+    }
+
+    private static void awaitRecentTasks(final AsyncComputeScheduler scheduler, final int expected)
+        throws InterruptedException {
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10L);
+        while (scheduler.metrics().slowestRecentTasks(50).size() < expected) {
+            if (System.nanoTime() > deadline) {
+                fail("the scheduler retained " + scheduler.metrics().slowestRecentTasks(50).size()
+                    + " recent task(s), expected " + expected);
+            }
+            Thread.sleep(1L);
+        }
+    }
+
+    private static int occurrences(final String text, final String needle) {
+        int count = 0;
+        int index = text.indexOf(needle);
+        while (index >= 0) {
+            count++;
+            index = text.indexOf(needle, index + needle.length());
+        }
+        return count;
     }
 
     private static void awaitCompleted(final AsyncComputeScheduler scheduler, final long expected)

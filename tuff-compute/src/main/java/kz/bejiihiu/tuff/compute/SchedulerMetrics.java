@@ -2,6 +2,7 @@ package kz.bejiihiu.tuff.compute;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -222,6 +223,130 @@ public interface SchedulerMetrics {
      * @return the consumer metrics, or an empty optional if no consumer with that id exists
      */
     Optional<ConsumerMetrics> consumer(String consumerId);
+
+    /**
+     * Returns the tasks that were executing when the snapshot was taken.
+     *
+     * <p>The list is materialised on demand, so it describes the capture moment and not a live
+     * view: {@link RunningTaskInfo#elapsedNanos()} is measured against that moment, a task that
+     * finishes right after the snapshot still appears here, and a task that started a moment
+     * before may not. Implementations that do not track live tasks return an empty list.
+     *
+     * @return the running tasks, never {@code null}
+     */
+    default List<RunningTaskInfo> runningTasks() {
+        return List.of();
+    }
+
+    /**
+     * Returns the slowest tasks that finished recently.
+     *
+     * <p>Implementations keep a bounded ring of the last finished tasks and sort it by execution
+     * time descending. Tasks cancelled before they ever started are not part of the ring, because
+     * they have no execution time to compare. Implementations without such a ring return an empty
+     * list.
+     *
+     * @param limit maximum number of entries to return, values below one yield an empty list
+     * @return at most {@code limit} recently finished tasks, never {@code null}
+     */
+    default List<CompletedTaskInfo> slowestRecentTasks(final int limit) {
+        return List.of();
+    }
+
+    /**
+     * One task that was executing when the snapshot was taken.
+     *
+     * @param taskId       unique task id
+     * @param consumerId   consumer the task belongs to
+     * @param taskType     declared category of the task
+     * @param priority     submitted priority
+     * @param lane         execution lane, {@code platform} or {@code virtual}
+     * @param label        optional diagnostic label of the submission
+     * @param startedAt    wall clock instant at which the body started
+     * @param elapsedNanos how long the body had been running when the snapshot was taken
+     */
+    record RunningTaskInfo(
+        long taskId,
+        String consumerId,
+        ComputeTaskType taskType,
+        ComputePriority priority,
+        String lane,
+        Optional<String> label,
+        Instant startedAt,
+        long elapsedNanos
+    ) {
+
+        /**
+         * Validates the entry.
+         *
+         * @param taskId       unique task id
+         * @param consumerId   consumer the task belongs to
+         * @param taskType     declared category of the task
+         * @param priority     submitted priority
+         * @param lane         execution lane
+         * @param label        optional diagnostic label
+         * @param startedAt    wall clock instant at which the body started
+         * @param elapsedNanos how long the body had been running when the snapshot was taken
+         * @throws NullPointerException if a reference is {@code null}
+         */
+        public RunningTaskInfo {
+            Objects.requireNonNull(consumerId, "consumerId");
+            Objects.requireNonNull(taskType, "taskType");
+            Objects.requireNonNull(priority, "priority");
+            Objects.requireNonNull(lane, "lane");
+            Objects.requireNonNull(label, "label");
+            Objects.requireNonNull(startedAt, "startedAt");
+        }
+    }
+
+    /**
+     * One task from the recent completion ring.
+     *
+     * @param taskId         unique task id
+     * @param consumerId     consumer the task belonged to
+     * @param taskType       declared category of the task
+     * @param priority       submitted priority
+     * @param lane           execution lane the body ran on
+     * @param label          optional diagnostic label of the submission
+     * @param executionNanos how long the body ran
+     * @param queueWaitNanos how long the task waited in the queue before it started
+     * @param state          terminal state, one of completed, failed or cancelled after start
+     */
+    record CompletedTaskInfo(
+        long taskId,
+        String consumerId,
+        ComputeTaskType taskType,
+        ComputePriority priority,
+        String lane,
+        Optional<String> label,
+        long executionNanos,
+        long queueWaitNanos,
+        ComputeTaskHandle.State state
+    ) {
+
+        /**
+         * Validates the entry.
+         *
+         * @param taskId         unique task id
+         * @param consumerId     consumer the task belonged to
+         * @param taskType       declared category of the task
+         * @param priority       submitted priority
+         * @param lane           execution lane the body ran on
+         * @param label          optional diagnostic label
+         * @param executionNanos how long the body ran
+         * @param queueWaitNanos how long the task waited before it started
+         * @param state          terminal state
+         * @throws NullPointerException if a reference is {@code null}
+         */
+        public CompletedTaskInfo {
+            Objects.requireNonNull(consumerId, "consumerId");
+            Objects.requireNonNull(taskType, "taskType");
+            Objects.requireNonNull(priority, "priority");
+            Objects.requireNonNull(lane, "lane");
+            Objects.requireNonNull(label, "label");
+            Objects.requireNonNull(state, "state");
+        }
+    }
 
     /**
      * Returns the execution lane snapshot.

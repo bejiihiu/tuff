@@ -1,8 +1,11 @@
 package kz.bejiihiu.tuff.compute.internal.engine.impl;
 
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -37,6 +40,7 @@ import kz.bejiihiu.tuff.compute.internal.metrics.impl.ComputeMetricsCollector;
 import kz.bejiihiu.tuff.compute.internal.metrics.impl.CpuUtilizationProbe;
 import kz.bejiihiu.tuff.compute.internal.metrics.impl.FlightJfrRecorder;
 import kz.bejiihiu.tuff.compute.internal.metrics.impl.LatencyStats;
+import kz.bejiihiu.tuff.compute.internal.metrics.impl.RecentTaskRing;
 import kz.bejiihiu.tuff.compute.internal.metrics.impl.SchedulerMetricsSnapshot;
 import kz.bejiihiu.tuff.compute.internal.queue.ComputeQueue;
 import kz.bejiihiu.tuff.compute.internal.queue.LaneAwareQueue;
@@ -136,6 +140,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     private final int platformLevelMask;
     private final ConsumerRegistryImpl registry = new ConsumerRegistryImpl();
     private final Map<Long, TaskHandle<?>> handles = new ConcurrentHashMap<>();
+    private final RecentTaskRing recentTasks = new RecentTaskRing();
     private final Set<String> unregisteredConsumers = ConcurrentHashMap.newKeySet();
 
     private final AtomicLong taskIds = new AtomicLong();
@@ -397,6 +402,19 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     @Override
     public void onTerminal(final TaskHandle<?> handle) {
         this.handles.remove(handle.taskId());
+        // one terminal event per task, so this is the single writer of the ring; no locks and no
+        // allocations, the strings are the ones the handle already owns
+        this.recentTasks.record(
+            handle.taskId(),
+            handle.consumerId(),
+            handle.taskType(),
+            handle.priority(),
+            handle.laneName(),
+            handle.rawLabel(),
+            handle.executionNanos(),
+            handle.queueWaitNanos(),
+            handle.state()
+        );
         this.removeQuotaIfIdle(handle.consumerId());
     }
 
@@ -595,7 +613,9 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this.settings,
             this.clock,
             recorder,
-            this::laneSnapshot
+            this::laneSnapshot,
+            this::runningTaskSnapshot,
+            this.recentTasks::snapshot
         );
         this.metricsCollector = collector;
         final DispatcherImpl newDispatcher = new DispatcherImpl(
@@ -665,6 +685,43 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     private SchedulerMetrics.LaneMetrics laneSnapshot() {
         final VirtualLane lane = this.virtualLane;
         return lane == null ? SchedulerMetrics.LaneMetrics.disabled() : lane.snapshot();
+    }
+
+    /**
+     * Builds the running task view from the live handle map.
+     *
+     * <p>Called once per metrics snapshot, never from a worker or a submitting thread. The handle
+     * map already holds every task that has not reached a terminal state, so filtering by state is
+     * enough; elapsed time is measured against the snapshot instant.
+     *
+     * @return the running tasks, slowest first
+     */
+    private List<SchedulerMetrics.RunningTaskInfo> runningTaskSnapshot() {
+        final long nowNanos = this.clock.nanoTime();
+        final List<SchedulerMetrics.RunningTaskInfo> running = new ArrayList<>();
+        for (final TaskHandle<?> handle : this.handles.values()) {
+            if (handle.state() != ComputeTaskHandle.State.RUNNING) {
+                continue;
+            }
+            final @Nullable String lane = handle.laneName();
+            final @Nullable Instant startedAt = handle.startedAt();
+            if (lane == null || startedAt == null) {
+                // defensive: without published start bookkeeping the row would be a lie
+                continue;
+            }
+            running.add(new SchedulerMetrics.RunningTaskInfo(
+                handle.taskId(),
+                handle.consumerId(),
+                handle.taskType(),
+                handle.priority(),
+                lane,
+                handle.label(),
+                startedAt,
+                Math.max(0L, nowNanos - handle.startedAtNanos())
+            ));
+        }
+        running.sort((first, second) -> Long.compare(second.elapsedNanos(), first.elapsedNanos()));
+        return List.copyOf(running);
     }
 
     private void startRuntime() {
@@ -1306,7 +1363,9 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             Map.of(),
             LatencyStats.empty(),
             LatencyStats.empty(),
-            this.laneSnapshot()
+            this.laneSnapshot(),
+            List.of(),
+            List.of()
         );
     }
 }

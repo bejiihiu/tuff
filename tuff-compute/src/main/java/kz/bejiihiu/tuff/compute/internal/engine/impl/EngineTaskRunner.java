@@ -51,16 +51,16 @@ final class EngineTaskRunner {
      */
     void run(final QueueEntry entry, final LaneAwareQueue.Lane lane) {
         final TaskHandle<?> handle = (TaskHandle<?>) entry.handle();
-        if (!handle.markRunning()) {
+        final boolean platform = lane == LaneAwareQueue.Lane.PLATFORM;
+        final String laneName = platform ? "platform" : "virtual";
+        final long startNanos = this.clock.nanoTime();
+        final long queueWaitNanos = Math.max(0L, startNanos - entry.submittedAtNanos());
+        if (!handle.markRunning(laneName, startNanos, this.clock.instant())) {
             // cancellation (caller, unregister or shutdown) won before the body started; the slot is
             // held by this runner, so taskCancelled releases it and counts the task exactly once.
             this.dispatcher.taskCancelled(entry, handle.cancelReason());
             return;
         }
-        final boolean platform = lane == LaneAwareQueue.Lane.PLATFORM;
-        handle.recordLane(platform ? "platform" : "virtual");
-        final long startNanos = this.clock.nanoTime();
-        final long queueWaitNanos = Math.max(0L, startNanos - entry.submittedAtNanos());
         handle.recordStart(queueWaitNanos);
         boolean terminalized = false;
         try {

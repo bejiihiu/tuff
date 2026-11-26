@@ -2,6 +2,7 @@ package kz.bejiihiu.tuff.compute.internal.metrics.impl;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -50,6 +51,8 @@ import kz.bejiihiu.tuff.compute.SchedulerMetrics.LaneMetrics;
  * @param queueWaitStats            full queue wait distribution
  * @param executionStats            full execution time distribution
  * @param lanes                     execution lane snapshot
+ * @param runningTasks              tasks executing at the capture moment
+ * @param recentTasks               recently finished tasks, slowest first
  */
 public record SchedulerMetricsSnapshot(
     Instant capturedAt,
@@ -81,7 +84,9 @@ public record SchedulerMetricsSnapshot(
     Map<ComputePriority, Integer> queuedByPriority,
     LatencyStats queueWaitStats,
     LatencyStats executionStats,
-    LaneMetrics lanes
+    LaneMetrics lanes,
+    List<RunningTaskInfo> runningTasks,
+    List<CompletedTaskInfo> recentTasks
 ) implements SchedulerMetrics {
 
     /**
@@ -96,14 +101,28 @@ public record SchedulerMetricsSnapshot(
         Objects.requireNonNull(queueWaitStats, "queueWaitStats");
         Objects.requireNonNull(executionStats, "executionStats");
         Objects.requireNonNull(lanes, "lanes");
+        Objects.requireNonNull(runningTasks, "runningTasks");
+        Objects.requireNonNull(recentTasks, "recentTasks");
         consumers = Map.copyOf(consumers);
         rejectedByReason = Map.copyOf(rejectedByReason);
         cancelledByReason = Map.copyOf(cancelledByReason);
         queuedByPriority = Map.copyOf(queuedByPriority);
+        runningTasks = List.copyOf(runningTasks);
+        recentTasks = List.copyOf(recentTasks);
     }
 
     @Override
     public Optional<ConsumerMetrics> consumer(final String consumerId) {
         return Optional.ofNullable(this.consumers.get(consumerId));
+    }
+
+    @Override
+    public List<CompletedTaskInfo> slowestRecentTasks(final int limit) {
+        if (limit <= 0) {
+            return List.of();
+        }
+        return this.recentTasks.size() <= limit
+            ? this.recentTasks
+            : this.recentTasks.subList(0, limit);
     }
 }

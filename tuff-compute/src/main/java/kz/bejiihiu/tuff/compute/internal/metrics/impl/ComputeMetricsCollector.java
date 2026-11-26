@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -71,6 +72,8 @@ public final class ComputeMetricsCollector implements MetricsCollector {
     private final int configuredCapacity;
     private final Duration throughputWindow;
     private final Supplier<SchedulerMetrics.LaneMetrics> lanes;
+    private final Supplier<List<SchedulerMetrics.RunningTaskInfo>> runningTasks;
+    private final Supplier<List<SchedulerMetrics.CompletedTaskInfo>> recentTasks;
     private final ConcurrentHashMap<String, ConsumerState> consumers = new ConcurrentHashMap<>();
     private final ThreadLocal<StartedMark> startedMark = ThreadLocal.withInitial(StartedMark::new);
     private final @Nullable ScheduledExecutorService sampler;
@@ -94,7 +97,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
      * @throws NullPointerException if an argument is {@code null}
      */
     public ComputeMetricsCollector(final ComputeSettings settings, final ComputeClock clock, final JfrRecorder recorder) {
-        this(settings, clock, recorder, SchedulerMetrics.LaneMetrics::disabled);
+        this(settings, clock, recorder, SchedulerMetrics.LaneMetrics::disabled, List::of, List::of);
     }
 
     /**
@@ -112,10 +115,38 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         final JfrRecorder recorder,
         final Supplier<SchedulerMetrics.LaneMetrics> lanes
     ) {
+        this(settings, clock, recorder, lanes, List::of, List::of);
+    }
+
+    /**
+     * Creates a collector that reports lanes and the live/recent task views.
+     *
+     * <p>The two task suppliers are read once per snapshot and only then; the engine builds the
+     * running list from its handle map and hands out the completion ring, neither of which happens
+     * while a task is submitted or executed.
+     *
+     * @param settings     scheduler settings, the metrics section drives what is collected
+     * @param clock        clock used for snapshot timestamps and throughput sampling
+     * @param recorder     flight recorder bridge, never {@code null}
+     * @param lanes        supplier of the lane snapshot, called once per snapshot
+     * @param runningTasks supplier of the currently running tasks, called once per snapshot
+     * @param recentTasks  supplier of recently finished tasks, slowest first, called once per snapshot
+     * @throws NullPointerException if an argument is {@code null}
+     */
+    public ComputeMetricsCollector(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final JfrRecorder recorder,
+        final Supplier<SchedulerMetrics.LaneMetrics> lanes,
+        final Supplier<List<SchedulerMetrics.RunningTaskInfo>> runningTasks,
+        final Supplier<List<SchedulerMetrics.CompletedTaskInfo>> recentTasks
+    ) {
         Objects.requireNonNull(settings, "settings");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.recorder = Objects.requireNonNull(recorder, "recorder");
         this.lanes = Objects.requireNonNull(lanes, "lanes");
+        this.runningTasks = Objects.requireNonNull(runningTasks, "runningTasks");
+        this.recentTasks = Objects.requireNonNull(recentTasks, "recentTasks");
         final ComputeSettings.Metrics metrics = settings.metrics();
         this.metricsEnabled = metrics.enabled();
         this.jfrEnabled = metrics.jfrEnabled();
@@ -416,7 +447,9 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             this.priorityMap(current),
             queueWaitStats,
             executionStats,
-            this.lanes.get()
+            this.lanes.get(),
+            this.runningTasks.get(),
+            this.recentTasks.get()
         );
     }
 
@@ -713,7 +746,9 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             Map.of(),
             LatencyStats.empty(),
             LatencyStats.empty(),
-            this.lanes.get()
+            this.lanes.get(),
+            this.runningTasks.get(),
+            this.recentTasks.get()
         );
     }
 

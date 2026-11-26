@@ -80,9 +80,11 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
     private final AtomicBoolean terminalSignalled = new AtomicBoolean();
 
     private volatile @Nullable String laneName;
+    private volatile @Nullable Instant startedAt;
     private volatile @Nullable QueueEntry entry;
     private volatile ComputeCancelledException.@Nullable Reason cancelReason;
     private volatile @Nullable Throwable failure;
+    private volatile long startedAtNanos = -1L;
     private volatile long queueWaitNanos = -1L;
     private volatile long executionNanos = -1L;
 
@@ -124,14 +126,68 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
     }
 
     /**
-     * Records the execution lane the task started on.
+     * Marks the task as running and publishes where and when it started.
      *
-     * <p>Diagnostic only; it is shown by {@link #toString()} and never used for scheduling.
+     * <p>The lane and the start instant are written before the state transition, so a metrics
+     * snapshot that observes {@link State#RUNNING} also observes them. A lost race with a
+     * cancellation rolls the diagnostics back: a task that never ran must not look like one.
      *
-     * @param lane lane name, normally {@code platform} or {@code virtual}
+     * @param lane           execution lane, normally {@code platform} or {@code virtual}
+     * @param startedAtNanos monotonic start timestamp
+     * @param startedAt      wall clock start instant
+     * @return {@code true} if the worker owns the execution
      */
-    void recordLane(final String lane) {
+    boolean markRunning(final String lane, final long startedAtNanos, final Instant startedAt) {
+        if (this.cancelRequested.get()) {
+            return false;
+        }
         this.laneName = lane;
+        this.startedAtNanos = startedAtNanos;
+        this.startedAt = startedAt;
+        if (this.state.compareAndSet(State.QUEUED, State.RUNNING)) {
+            return true;
+        }
+        this.startedAt = null;
+        this.startedAtNanos = -1L;
+        return false;
+    }
+
+    /**
+     * Returns the execution lane of a started task.
+     *
+     * @return the lane, or {@code null} before the task started
+     */
+    @Nullable String laneName() {
+        return this.laneName;
+    }
+
+    /**
+     * Returns the wall clock instant at which the body started.
+     *
+     * @return the start instant, or {@code null} before the task started
+     */
+    @Nullable Instant startedAt() {
+        return this.startedAt;
+    }
+
+    /**
+     * Returns the monotonic timestamp at which the body started.
+     *
+     * @return nanoseconds, or {@code -1} before the task started
+     */
+    long startedAtNanos() {
+        return this.startedAtNanos;
+    }
+
+    /**
+     * Returns the normalized label without wrapping it in an optional.
+     *
+     * <p>The ring keeps the same string instance instead of copying it for every diagnostic entry.
+     *
+     * @return the label, empty when the submission had none
+     */
+    String rawLabel() {
+        return this.label;
     }
 
     /**
@@ -162,19 +218,6 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
      */
     long submittedAtNanos() {
         return this.submittedAtNanos;
-    }
-
-    /**
-     * Tries to move this task from queued to running.
-     *
-     * @return {@code true} if the worker owns the execution, {@code false} if the task was already
-     *     cancelled or finished
-     */
-    boolean markRunning() {
-        if (this.cancelRequested.get()) {
-            return false;
-        }
-        return this.state.compareAndSet(State.QUEUED, State.RUNNING);
     }
 
     /**
@@ -471,7 +514,7 @@ final class TaskHandle<T> implements ComputeTaskHandle<T> {
             .append(" prio=").append(this.priority)
             .append(" state=").append(current);
         final String lane = this.laneName;
-        if (lane != null && current != State.QUEUED) {
+        if (lane != null && this.startedAt != null && current != State.QUEUED) {
             out.append(" lane=").append(lane);
         }
         if (!this.label.isEmpty()) {

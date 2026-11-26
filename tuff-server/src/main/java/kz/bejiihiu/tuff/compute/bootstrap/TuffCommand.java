@@ -73,6 +73,7 @@ public final class TuffCommand extends Command implements TabCompleter {
         switch (action) {
             case SUMMARY -> this.send(sender, ComputeReport.overview(ComputeBootstrap.status()));
             case CONSUMERS -> this.send(sender, ComputeReport.consumers(ComputeBootstrap.status()));
+            case TASKS -> this.send(sender, ComputeReport.tasks(ComputeBootstrap.status(), request.limit()));
             case RELOAD -> this.reload(sender);
             case JFR_START -> this.startRecording(sender);
             case JFR_STOP, JFR_DUMP -> this.controlRecording(sender, action == ComputeCommand.Action.JFR_STOP);

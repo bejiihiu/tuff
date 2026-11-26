@@ -31,6 +31,31 @@ class ComputeCommandTest {
     }
 
     @Test
+    void tasksSubcommandDefaultsToTenAndClampsTheCount() {
+        assertTasks(ComputeCommand.DEFAULT_TASK_LIMIT, "compute", "tasks");
+        assertTasks(7, "compute", "tasks", "7");
+        assertTasks(ComputeCommand.MAX_TASK_LIMIT, "compute", "tasks", "500");
+        assertTasks(1, "compute", "tasks", "0");
+        assertTasks(1, "compute", "tasks", "-4");
+    }
+
+    @Test
+    void aBrokenTaskCountExplainsTheAcceptedRange() {
+        final ComputeCommand.Request request = ComputeCommand.parse(new String[] {"compute", "tasks", "many"});
+
+        assertTrue(request.failed());
+        assertTrue(request.error().contains("between 1 and " + ComputeCommand.MAX_TASK_LIMIT), request.error());
+    }
+
+    @Test
+    void extraTaskArgumentsAreRejected() {
+        final ComputeCommand.Request request = ComputeCommand.parse(new String[] {"compute", "tasks", "5", "more"});
+
+        assertTrue(request.failed());
+        assertTrue(request.error().contains("/tuff compute tasks [n]"), request.error());
+    }
+
+    @Test
     void jfrSubcommandsAreRecognized() {
         assertAction(ComputeCommand.Action.JFR_START, "compute", "jfr", "start");
         assertAction(ComputeCommand.Action.JFR_STOP, "compute", "jfr", "STOP");
@@ -47,7 +72,7 @@ class ComputeCommandTest {
 
     @Test
     void unknownSubcommandsAreRejected() {
-        assertError("'nonsense' must be one of: consumers, reload, jfr", "compute", "nonsense");
+        assertError("'nonsense' must be one of: consumers, tasks, reload, jfr", "compute", "nonsense");
         assertError("'dumpme' must be one of: start, stop, dump", "compute", "jfr", "dumpme");
         assertError("Unknown subcommand 'oh no'", "oh no");
     }
@@ -72,9 +97,11 @@ class ComputeCommandTest {
     void completionsWalkDownTheArgumentTree() {
         assertEquals(List.of("compute", "status", "reload"), completions(""));
         assertEquals(List.of("compute"), completions("c"));
-        assertEquals(List.of("consumers", "reload", "jfr"), completions("compute", ""));
+        assertEquals(List.of("consumers", "tasks", "reload", "jfr"), completions("compute", ""));
+        assertEquals(List.of("tasks"), completions("compute", "t"));
         assertEquals(List.of("jfr"), completions("compute", "j"));
         assertEquals(List.of("start", "stop"), completions("compute", "jfr", "s"));
+        assertEquals(List.of(), completions("compute", "tasks", ""));
         assertEquals(List.of(), completions("compute", "consumers", ""));
         assertEquals(List.of(), completions("reload", ""));
         assertEquals(List.of(), completions());
@@ -98,6 +125,13 @@ class ComputeCommandTest {
         final ComputeCommand.Request request = ComputeCommand.parse(args);
         assertFalse(request.failed(), () -> "unexpected error: " + request.error());
         assertEquals(expected, request.action());
+    }
+
+    private static void assertTasks(final int expectedLimit, final String... args) {
+        final ComputeCommand.Request request = ComputeCommand.parse(args);
+        assertFalse(request.failed(), () -> "unexpected error: " + request.error());
+        assertEquals(ComputeCommand.Action.TASKS, request.action());
+        assertEquals(expectedLimit, request.limit());
     }
 
     private static void assertError(final String expectedPart, final String... args) {

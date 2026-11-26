@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
@@ -143,6 +144,92 @@ public final class ComputeReport {
                 + " / longest " + formatDuration(consumerMetrics.longestExecutionTime()));
         }
         return List.copyOf(lines);
+    }
+
+    /**
+     * Builds the task listing shown by {@code /tuff compute tasks}.
+     *
+     * <p>The running section is sorted by how long each body has been executing, the recent
+     * section comes from the completion ring already sorted by execution time. Both views are read
+     * from one metrics snapshot, so the numbers match the state the command observed.
+     *
+     * @param status current bootstrap status
+     * @param limit  maximum number of recent completions to show
+     * @return the report lines, or the reason there is nothing to report
+     */
+    public static List<String> tasks(final ComputeStatus status, final int limit) {
+        final @Nullable AsyncComputeScheduler scheduler = status.engine().orElse(null);
+        if (scheduler == null) {
+            return unavailable(status);
+        }
+        final SchedulerMetrics metrics = scheduler.metrics();
+        final List<SchedulerMetrics.RunningTaskInfo> running = new ArrayList<>(metrics.runningTasks());
+        running.sort((first, second) -> Long.compare(second.elapsedNanos(), first.elapsedNanos()));
+        final List<SchedulerMetrics.CompletedTaskInfo> recent = metrics.slowestRecentTasks(limit);
+        if (running.isEmpty() && recent.isEmpty()) {
+            return List.of("Tuff compute: nothing is running.");
+        }
+
+        final List<String> lines = new ArrayList<>();
+        lines.add("Tuff compute tasks: " + running.size() + " running, slowest " + recent.size() + " recent");
+        for (final SchedulerMetrics.RunningTaskInfo task : running) {
+            lines.add(INDENT + describeTaskPrefix(
+                task.taskId(),
+                task.lane(),
+                task.consumerId(),
+                task.taskType().name(),
+                task.priority().name(),
+                task.label()
+            ) + " RUNNING " + formatDuration(Duration.ofNanos(task.elapsedNanos())));
+        }
+        for (final SchedulerMetrics.CompletedTaskInfo task : recent) {
+            lines.add(INDENT + describeTaskPrefix(
+                task.taskId(),
+                task.lane(),
+                task.consumerId(),
+                task.taskType().name(),
+                task.priority().name(),
+                task.label()
+            ) + ' ' + task.state().name() + ' ' + formatDuration(Duration.ofNanos(task.executionNanos()))
+                + " / wait " + formatDuration(Duration.ofNanos(task.queueWaitNanos())));
+        }
+        return List.copyOf(lines);
+    }
+
+    /**
+     * Formats the columns every task row shares.
+     *
+     * @param taskId     unique task id
+     * @param lane       execution lane
+     * @param consumerId consumer the task belongs to
+     * @param taskType   declared task category
+     * @param priority   submitted priority
+     * @param label      optional diagnostic label
+     * @return the shared row prefix, without the trailing state and timing
+     */
+    static String describeTaskPrefix(
+        final long taskId,
+        final String lane,
+        final String consumerId,
+        final String taskType,
+        final String priority,
+        final Optional<String> label
+    ) {
+        return "#" + taskId + ' ' + lane + ' ' + consumerId + ' ' + taskType + ' ' + priority + ' ' + describeLabel(label);
+    }
+
+    /**
+     * Renders a label without letting odd input break the one line row.
+     *
+     * @param label optional label
+     * @return the quoted label, or {@code -} when the submission had none
+     */
+    private static String describeLabel(final Optional<String> label) {
+        if (label.isEmpty()) {
+            return "-";
+        }
+        final String safe = label.get().replace('\n', ' ').replace('\r', ' ').replace('\t', ' ');
+        return '"' + safe.replace("\\", "\\\\").replace("\"", "\\\"") + '"';
     }
 
     /**

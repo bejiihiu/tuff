@@ -16,6 +16,7 @@ import org.jspecify.annotations.Nullable;
  * <ul>
  *     <li>{@code /tuff} and {@code /tuff compute} - engine summary;</li>
  *     <li>{@code /tuff compute consumers} - per consumer breakdown;</li>
+ *     <li>{@code /tuff compute tasks [n]} - running tasks and the slowest recent completions;</li>
  *     <li>{@code /tuff compute reload} - re-read {@code config/tuff.yml};</li>
  *     <li>{@code /tuff compute jfr start|stop|dump} - Flight Recorder control;</li>
  *     <li>{@code /tuff status} and {@code /tuff reload} - shorthands for the two commands above.</li>
@@ -26,10 +27,21 @@ public final class ComputeCommand {
     /**
      * Usage line shown on argument errors and in {@code /help}.
      */
-    public static final String USAGE = "/tuff [compute] [consumers|reload|jfr <start|stop|dump>]";
+    public static final String USAGE =
+        "/tuff [compute] [consumers|tasks [n]|reload|jfr <start|stop|dump>]";
+
+    /**
+     * Number of tasks {@code /tuff compute tasks} shows when no count is given.
+     */
+    public static final int DEFAULT_TASK_LIMIT = 10;
+
+    /**
+     * Upper bound for the optional task count.
+     */
+    public static final int MAX_TASK_LIMIT = 50;
 
     private static final List<String> ROOT = List.of("compute", "status", "reload");
-    private static final List<String> COMPUTE = List.of("consumers", "reload", "jfr");
+    private static final List<String> COMPUTE = List.of("consumers", "tasks", "reload", "jfr");
     private static final List<String> JFR = List.of("start", "stop", "dump");
 
     private ComputeCommand() {
@@ -59,10 +71,27 @@ public final class ComputeCommand {
         }
         return switch (args[1].toLowerCase(Locale.ROOT)) {
             case "consumers" -> exactly(args, 2, Action.CONSUMERS);
+            case "tasks" -> parseTasks(args);
             case "reload" -> exactly(args, 2, Action.RELOAD);
             case "jfr" -> parseJfr(args);
-            default -> Request.error("'" + args[1] + "' must be one of: consumers, reload, jfr");
+            default -> Request.error("'" + args[1] + "' must be one of: consumers, tasks, reload, jfr");
         };
+    }
+
+    private static Request parseTasks(final String[] args) {
+        if (args.length == 2) {
+            return Request.tasks(DEFAULT_TASK_LIMIT);
+        }
+        if (args.length > 3) {
+            return Request.error("Usage: /tuff compute tasks [n]");
+        }
+        final int requested;
+        try {
+            requested = Integer.parseInt(args[2]);
+        } catch (NumberFormatException _) {
+            return Request.error("'" + args[2] + "' must be a number between 1 and " + MAX_TASK_LIMIT);
+        }
+        return Request.tasks(Math.clamp(requested, 1, MAX_TASK_LIMIT));
     }
 
     /**
@@ -140,6 +169,11 @@ public final class ComputeCommand {
         CONSUMERS,
 
         /**
+         * Running tasks and the slowest recent completions.
+         */
+        TASKS,
+
+        /**
          * Re-read {@code config/tuff.yml} and apply what the running engine can adopt.
          */
         RELOAD,
@@ -165,15 +199,17 @@ public final class ComputeCommand {
      *
      * @param action the action to run, {@code null} when parsing failed
      * @param error  the problem to show, {@code null} when parsing succeeded
+     * @param limit  requested number of tasks for {@link Action#TASKS}, {@code 0} otherwise
      */
-    public record Request(@Nullable Action action, @Nullable String error) {
+    public record Request(@Nullable Action action, @Nullable String error, int limit) {
 
         /**
          * Validates the request.
          *
          * @param action the action to run, {@code null} when parsing failed
          * @param error  the problem to show, {@code null} when parsing succeeded
-         * @throws IllegalArgumentException if exactly one of the components is {@code null}
+         * @param limit  requested number of tasks for {@link Action#TASKS}
+         * @throws IllegalArgumentException if exactly one of the action and the error is {@code null}
          */
         public Request {
             if ((action == null) == (error == null)) {
@@ -188,7 +224,17 @@ public final class ComputeCommand {
          * @return the request
          */
         static Request of(final Action action) {
-            return new Request(action, null);
+            return new Request(action, null, 0);
+        }
+
+        /**
+         * Creates a task listing request.
+         *
+         * @param limit number of tasks to show, already clamped into the accepted range
+         * @return the request
+         */
+        static Request tasks(final int limit) {
+            return new Request(Action.TASKS, null, limit);
         }
 
         /**
@@ -198,7 +244,7 @@ public final class ComputeCommand {
          * @return the request
          */
         static Request error(final String message) {
-            return new Request(null, message);
+            return new Request(null, message, 0);
         }
 
         /**
