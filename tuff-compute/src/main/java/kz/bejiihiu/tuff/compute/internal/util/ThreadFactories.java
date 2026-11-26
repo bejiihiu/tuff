@@ -36,6 +36,26 @@ public final class ThreadFactories {
     }
 
     /**
+     * Creates a factory whose thread carries exactly {@code name}.
+     *
+     * <p>For the one-off service threads (janitor, shutdown, lane pump): their names are already
+     * unique and code that looks for them (thread dumps, the shutdown report) expects the exact
+     * string, so no counter is appended. Use one instance per thread, otherwise the names collide.
+     *
+     * @param name   exact thread name, must not be blank
+     * @param daemon whether the created thread is a daemon
+     * @return the factory
+     */
+    public static ThreadFactory named(final String name, final boolean daemon) {
+        Preconditions.requireNonBlank(name, "name");
+        return runnable -> {
+            final Thread thread = new Thread(runnable, name);
+            thread.setDaemon(daemon);
+            return thread;
+        };
+    }
+
+    /**
      * Creates a factory for virtual threads.
      *
      * <p>Virtual threads are a poor fit for CPU bound compute because they do not add parallelism,

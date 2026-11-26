@@ -17,10 +17,10 @@ import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.internal.metrics.JfrRecorder;
 import kz.bejiihiu.tuff.compute.internal.queue.LaneAwareQueue;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
+import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
 import kz.bejiihiu.tuff.compute.internal.util.Durations;
 import kz.bejiihiu.tuff.compute.internal.util.Preconditions;
-import kz.bejiihiu.tuff.compute.internal.util.ThreadFactories;
 import kz.bejiihiu.tuff.compute.internal.worker.impl.DynamicWorkerPool;
 import org.jspecify.annotations.Nullable;
 
@@ -73,6 +73,7 @@ final class VirtualLane {
     private final boolean jfrEnabled;
     private final BooleanSupplier accepting;
     private final String threadPrefix;
+    private final ComputeThreadFactoryPort threads;
 
     private final Semaphore permits;
     private final ThreadFactory virtualFactory;
@@ -112,6 +113,7 @@ final class VirtualLane {
      * @param jfrEnabled   whether JFR events are configured
      * @param accepting    predicate answering whether the engine still claims work
      * @param threadPrefix worker thread name prefix
+     * @param threads      source of the lane threads, the pump and the virtual tasks
      */
     VirtualLane(
         final ComputeSettings.Lanes.Virtual config,
@@ -123,7 +125,8 @@ final class VirtualLane {
         final JfrRecorder recorder,
         final boolean jfrEnabled,
         final BooleanSupplier accepting,
-        final String threadPrefix
+        final String threadPrefix,
+        final ComputeThreadFactoryPort threads
     ) {
         this.config = Preconditions.requireNonNull(config, "config");
         this.queue = Preconditions.requireNonNull(queue, "queue");
@@ -135,8 +138,9 @@ final class VirtualLane {
         this.jfrEnabled = jfrEnabled;
         this.accepting = Preconditions.requireNonNull(accepting, "accepting");
         this.threadPrefix = Preconditions.requireNonBlank(threadPrefix, "threadPrefix");
+        this.threads = Preconditions.requireNonNull(threads, "threads");
         this.permits = new Semaphore(config.maxConcurrent());
-        this.virtualFactory = ThreadFactories.virtual(this.threadPrefix + "-virtual");
+        this.virtualFactory = this.threads.virtual(this.threadPrefix + "-virtual");
         this.spillWaitNanos = Durations.toNanosSaturated(config.spillWait());
         this.normalLevel = ComputePriority.NORMAL.level();
     }
@@ -154,8 +158,8 @@ final class VirtualLane {
             this.running = true;
             this.pumpStopped = false;
         }
-        final Thread pumpThread = new Thread(this::pumpLoop, this.threadPrefix + "-virtual-pump");
-        pumpThread.setDaemon(true);
+        final Thread pumpThread = this.threads.named(this.threadPrefix + "-virtual-pump", true)
+            .newThread(this::pumpLoop);
         pumpThread.setUncaughtExceptionHandler((thread, failure) ->
             LOG.log(System.Logger.Level.ERROR, "virtual lane pump died", failure));
         this.pump = pumpThread;

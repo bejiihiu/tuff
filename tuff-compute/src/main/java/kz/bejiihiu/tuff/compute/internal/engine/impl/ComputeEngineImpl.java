@@ -48,10 +48,11 @@ import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.queue.QuotaController;
 import kz.bejiihiu.tuff.compute.internal.queue.impl.AtomicQuotaController;
 import kz.bejiihiu.tuff.compute.internal.queue.impl.BoundedComputeQueue;
+import kz.bejiihiu.tuff.compute.internal.spi.ComputeBudgetPort;
+import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
 import kz.bejiihiu.tuff.compute.internal.util.Durations;
 import kz.bejiihiu.tuff.compute.internal.util.Preconditions;
-import kz.bejiihiu.tuff.compute.internal.util.ThreadFactories;
 import kz.bejiihiu.tuff.compute.internal.worker.impl.DynamicWorkerPool;
 import org.jspecify.annotations.Nullable;
 
@@ -107,6 +108,12 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
 
     private final ComputeSettings settings;
     private final ComputeClock clock;
+
+    /**
+     * Where every thread of the engine comes from. The legacy port delegates to the same factories
+     * the engine used before this field existed, so a scheduler without a manager is unchanged.
+     */
+    private final ComputeThreadFactoryPort threads;
 
     /**
      * Processors the engine may use. The platform budget (not the raw core count) is applied here;
@@ -170,7 +177,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
      * @param clock    clock used by every component
      */
     ComputeEngineImpl(final ComputeSettings settings, final ComputeClock clock) {
-        this(settings, clock, Runtime.getRuntime().availableProcessors());
+        this(settings, clock, ComputeBudgetPort.legacy(), ComputeThreadFactoryPort.legacy());
     }
 
     /**
@@ -187,8 +194,51 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
      * @param processorBudget processors available to the engine, at least {@code 1}
      */
     ComputeEngineImpl(final ComputeSettings settings, final ComputeClock clock, final int processorBudget) {
+        this(settings, clock, processorBudget, ComputeThreadFactoryPort.legacy());
+    }
+
+    /**
+     * Creates an engine whose budget comes from a port instead of a number.
+     *
+     * <p>The port is asked exactly once, here. It owns the arithmetic behind the number (including
+     * any reserve subtraction), so the engine never re-applies it. Runtime updates still go through
+     * {@link #applyProcessorBudget(int)} with a number the caller got from the same port.
+     *
+     * @param settings scheduler configuration
+     * @param clock    clock used by every component
+     * @param budget   source of the initial processor budget
+     * @param threads  source of every engine thread
+     * @throws NullPointerException     if an argument is {@code null}
+     * @throws IllegalArgumentException if the port reports a processor count below {@code 1}
+     */
+    ComputeEngineImpl(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final ComputeBudgetPort budget,
+        final ComputeThreadFactoryPort threads
+    ) {
+        this(settings, clock, budgetOf(budget), threads);
+    }
+
+    /**
+     * Creates an engine with an explicit budget and an explicit thread port.
+     *
+     * @param settings        scheduler configuration
+     * @param clock           clock used by every component
+     * @param processorBudget processors available to the engine, at least {@code 1}
+     * @param threads         source of every engine thread
+     * @throws NullPointerException     if an argument is {@code null}
+     * @throws IllegalArgumentException if {@code processorBudget} is not positive
+     */
+    ComputeEngineImpl(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final int processorBudget,
+        final ComputeThreadFactoryPort threads
+    ) {
         this.settings = Preconditions.requireNonNull(settings, "settings");
         this.clock = Preconditions.requireNonNull(clock, "clock");
+        this.threads = Preconditions.requireNonNull(threads, "threads");
         Preconditions.checkAtLeast(processorBudget, 1, "processorBudget");
         this.processorBudget = processorBudget;
         this.workerCeiling = this.ceilingFor(processorBudget);
@@ -197,6 +247,16 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         this.queue = new BoundedComputeQueue(settings, clock);
         this.quota = new AtomicQuotaController(initialConcurrency);
         this.queue.setEvictionListener(this::onEvicted);
+    }
+
+    /**
+     * Reads the budget from the port, failing on a missing port with the usual null message.
+     *
+     * @param budget port to ask
+     * @return the processor budget
+     */
+    private static int budgetOf(final ComputeBudgetPort budget) {
+        return Preconditions.requireNonNull(budget, "budget").processors();
     }
 
     @Override
@@ -618,7 +678,8 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this::laneSnapshot,
             this::runningTaskSnapshot,
             this.recentTasks::snapshot,
-            this.quota::totalLimit
+            this.quota::totalLimit,
+            this.threads
         );
         this.metricsCollector = collector;
         final DispatcherImpl newDispatcher = new DispatcherImpl(
@@ -644,7 +705,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this.processorBudget,
             newLoop,
             this.clock,
-            ThreadFactories.platform(this.settings.workers().threadNamePrefix(), true)
+            this.threads.platform(this.settings.workers().threadNamePrefix(), true)
         );
         newLoop.bindPool(newPool);
         this.pool = newPool;
@@ -652,7 +713,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         // submitting thread are dispatched here instead. One virtual thread per completion keeps a
         // blocking dependent stage from delaying any other completion or any scheduler thread.
         this.completionExecutor = Executors.newThreadPerTaskExecutor(
-            ThreadFactories.virtual(this.settings.workers().threadNamePrefix() + "-completion")
+            this.threads.virtual(this.settings.workers().threadNamePrefix() + "-completion")
         );
         if (laneConfig.enabled()) {
             if (!(this.queue instanceof LaneAwareQueue laneQueue)) {
@@ -668,7 +729,8 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
                 recorder,
                 this.settings.metrics().jfrEnabled(),
                 this::isClaiming,
-                this.settings.workers().threadNamePrefix()
+                this.settings.workers().threadNamePrefix(),
+                this.threads
             );
         }
         this.quota.updateTotalLimit(this.executionCapacity(newPool.concurrencyLimit()));
@@ -753,8 +815,10 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             Durations.toNanosSaturated(this.settings.metrics().sampleInterval())
         );
         this.janitor = newJanitor;
-        final Thread janitorThread = new Thread(newJanitor, this.settings.workers().threadNamePrefix() + "-janitor");
-        janitorThread.setDaemon(true);
+        final Thread janitorThread = this.threads.named(
+            this.settings.workers().threadNamePrefix() + "-janitor",
+            true
+        ).newThread(newJanitor);
         janitorThread.setUncaughtExceptionHandler((thread, failure) ->
             LOG.log(System.Logger.Level.ERROR, "compute janitor died", failure));
         newJanitor.attach(janitorThread);
@@ -770,7 +834,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         controller.start();
         final long periodMillis = Math.max(1_000L, Durations.toMillisSaturated(controller.sampleWindow()));
         final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(
-            ThreadFactories.platform(this.settings.workers().threadNamePrefix() + "-adaptive", true)
+            this.threads.platform(this.settings.workers().threadNamePrefix() + "-adaptive", true)
         );
         timer.scheduleWithFixedDelay(this::evaluateAdaptiveSafely, periodMillis, periodMillis, TimeUnit.MILLISECONDS);
         this.adaptiveTimer = timer;
@@ -1125,11 +1189,10 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
                 currentPool.shutdown();
             }
             final long graceNanos = Durations.toNanosSaturated(gracePeriod);
-            final Thread thread = new Thread(
-                () -> this.awaitAndTerminate(graceNanos),
-                this.settings.workers().threadNamePrefix() + "-shutdown"
-            );
-            thread.setDaemon(true);
+            final Thread thread = this.threads.named(
+                this.settings.workers().threadNamePrefix() + "-shutdown",
+                true
+            ).newThread(() -> this.awaitAndTerminate(graceNanos));
             thread.setUncaughtExceptionHandler((failed, failure) ->
                 LOG.log(System.Logger.Level.ERROR, "compute shutdown failed", failure));
             this.shutdownThread = thread;

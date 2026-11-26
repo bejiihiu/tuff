@@ -25,9 +25,9 @@ import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.internal.metrics.JfrRecorder;
 import kz.bejiihiu.tuff.compute.internal.metrics.MetricsCollector;
 import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
+import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
 import kz.bejiihiu.tuff.compute.internal.util.Durations;
-import kz.bejiihiu.tuff.compute.internal.util.ThreadFactories;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -99,6 +99,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
     private final Supplier<List<SchedulerMetrics.RunningTaskInfo>> runningTasks;
     private final Supplier<List<SchedulerMetrics.CompletedTaskInfo>> recentTasks;
     private final IntSupplier executionCapacity;
+    private final ComputeThreadFactoryPort threads;
     private final ConcurrentHashMap<String, ConsumerState> consumers = new ConcurrentHashMap<>();
     private final ThreadLocal<StartedMark> startedMark = ThreadLocal.withInitial(StartedMark::new);
     private final @Nullable ScheduledExecutorService sampler;
@@ -194,6 +195,37 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         final Supplier<List<SchedulerMetrics.CompletedTaskInfo>> recentTasks,
         final IntSupplier executionCapacity
     ) {
+        this(settings, clock, recorder, lanes, runningTasks, recentTasks, executionCapacity,
+            ComputeThreadFactoryPort.legacy());
+    }
+
+    /**
+     * Creates a collector that also takes its sampler thread from a thread port.
+     *
+     * <p>The engine passes its own port so that a manager which owns compute threads sees the
+     * sampler too. The port is only consulted when metrics are enabled; the sampler name stays the
+     * same as before, because operators and tests search for it.
+     *
+     * @param settings          scheduler settings, the metrics section drives what is collected
+     * @param clock             clock used for snapshot timestamps and throughput sampling
+     * @param recorder          flight recorder bridge, never {@code null}
+     * @param lanes             supplier of the lane snapshot, called once per snapshot
+     * @param runningTasks      supplier of the currently running tasks, called once per snapshot
+     * @param recentTasks       supplier of recently finished tasks, slowest first, called once per snapshot
+     * @param executionCapacity supplier of the capacity relative limits resolve against, {@code 0} when unknown
+     * @param threads           source of the sampler thread, never {@code null}
+     * @throws NullPointerException if an argument is {@code null}
+     */
+    public ComputeMetricsCollector(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final JfrRecorder recorder,
+        final Supplier<SchedulerMetrics.LaneMetrics> lanes,
+        final Supplier<List<SchedulerMetrics.RunningTaskInfo>> runningTasks,
+        final Supplier<List<SchedulerMetrics.CompletedTaskInfo>> recentTasks,
+        final IntSupplier executionCapacity,
+        final ComputeThreadFactoryPort threads
+    ) {
         Objects.requireNonNull(settings, "settings");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.recorder = Objects.requireNonNull(recorder, "recorder");
@@ -201,6 +233,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         this.runningTasks = Objects.requireNonNull(runningTasks, "runningTasks");
         this.recentTasks = Objects.requireNonNull(recentTasks, "recentTasks");
         this.executionCapacity = Objects.requireNonNull(executionCapacity, "executionCapacity");
+        this.threads = Objects.requireNonNull(threads, "threads");
         final ComputeSettings.Metrics metrics = settings.metrics();
         this.metricsEnabled = metrics.enabled();
         this.jfrEnabled = metrics.jfrEnabled();
@@ -620,7 +653,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
      */
     private ScheduledExecutorService startSampler(final Duration interval) {
         final ScheduledExecutorService executor =
-            Executors.newSingleThreadScheduledExecutor(ThreadFactories.platform(SAMPLER_THREAD_PREFIX, true));
+            Executors.newSingleThreadScheduledExecutor(this.threads.platform(SAMPLER_THREAD_PREFIX, true));
         final long millis = Math.max(1L, Durations.toMillisSaturated(interval));
         executor.scheduleAtFixedRate(this::sampleSafely, millis, millis, TimeUnit.MILLISECONDS);
         return executor;

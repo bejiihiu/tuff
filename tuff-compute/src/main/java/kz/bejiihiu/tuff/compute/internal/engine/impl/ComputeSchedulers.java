@@ -3,6 +3,8 @@ package kz.bejiihiu.tuff.compute.internal.engine.impl;
 import java.util.Objects;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
+import kz.bejiihiu.tuff.compute.internal.spi.ComputeBudgetPort;
+import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
 
 /**
@@ -12,6 +14,12 @@ import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
  * reads {@code config/tuff.yml} into {@link ComputeSettings} and calls
  * {@link #create(ComputeSettings)}; nothing else is needed, and no component outside this package
  * has to know the queue, pool or metrics implementation.
+ *
+ * <p>An outer thread manager plugs in through two ports instead of a compile dependency: {@link
+ * ComputeThreadFactoryPort} (where threads come from) and {@link ComputeBudgetPort} (where the
+ * processor budget comes from). The port overloads default every argument that is not supplied to
+ * the legacy behaviour, so a server without a manager keeps the exact same threads, names and
+ * sizes.
  *
  * <p>The returned scheduler is in {@code NEW}. It owns no thread until {@link AsyncComputeScheduler#start()};
  * a scheduler created with {@link ComputeSettings#enabled()} false still starts and moves to
@@ -38,7 +46,7 @@ public final class ComputeSchedulers {
      */
     public static AsyncComputeScheduler create(final ComputeSettings settings) {
         Objects.requireNonNull(settings, "settings");
-        return new AsyncComputeSchedulerImpl(new ComputeEngineImpl(settings, ComputeClock.system()));
+        return create(settings, ComputeClock.system(), ComputeBudgetPort.legacy());
     }
 
     /**
@@ -67,5 +75,50 @@ public final class ComputeSchedulers {
         final int processorBudget
     ) {
         return new AsyncComputeSchedulerImpl(new ComputeEngineImpl(settings, clock, processorBudget));
+    }
+
+    /**
+     * Creates a stopped scheduler whose budget comes from a port, with legacy thread factories.
+     *
+     * <p>The port is asked exactly once, when the engine is built. It owns the reserve arithmetic, so
+     * the engine must not subtract anything from the number again.
+     *
+     * @param settings configuration of the scheduler
+     * @param clock    clock every component must use
+     * @param budget   source of the initial processor budget
+     * @return a scheduler in {@link AsyncComputeScheduler.SchedulerState#NEW}
+     * @throws NullPointerException if an argument is {@code null}
+     */
+    public static AsyncComputeScheduler create(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final ComputeBudgetPort budget
+    ) {
+        return create(settings, clock, budget, ComputeThreadFactoryPort.legacy());
+    }
+
+    /**
+     * Creates a stopped scheduler from both ports.
+     *
+     * <p>This is the manager integration point: threads come from {@code threads}, the initial
+     * processor budget from {@code budget}. Passing the legacy ports gives a scheduler identical to
+     * {@link #create(ComputeSettings, ComputeClock, int)} with the JVM processor count.
+     *
+     * @param settings configuration of the scheduler
+     * @param clock    clock every component must use
+     * @param budget   source of the initial processor budget
+     * @param threads  source of every thread the engine creates
+     * @return a scheduler in {@link AsyncComputeScheduler.SchedulerState#NEW}
+     * @throws NullPointerException if an argument is {@code null}
+     */
+    public static AsyncComputeScheduler create(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final ComputeBudgetPort budget,
+        final ComputeThreadFactoryPort threads
+    ) {
+        Objects.requireNonNull(settings, "settings");
+        Objects.requireNonNull(clock, "clock");
+        return new AsyncComputeSchedulerImpl(new ComputeEngineImpl(settings, clock, budget, threads));
     }
 }
