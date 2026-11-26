@@ -4,10 +4,12 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputeConsumer;
 import kz.bejiihiu.tuff.compute.ComputePriority;
 import kz.bejiihiu.tuff.compute.ComputeTaskType;
+import kz.bejiihiu.tuff.compute.ConsumerMetrics;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -60,6 +62,7 @@ class EngineQuotaTest {
     void raisingTheLimitOnTheFlyLetsQueuedWorkStart() throws Exception {
         final CountDownLatch first = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
+        final AtomicBoolean allowSecondToRun = new AtomicBoolean();
         final AsyncComputeScheduler compute = startedScheduler(
             settings().fixedWorkers(2).build(),
             new EngineTestSupport.FakeClock()
@@ -72,10 +75,16 @@ class EngineQuotaTest {
                 return "first";
             });
             assertTrue(first.await(10L, TimeUnit.SECONDS));
-            final CompletableFuture<String> queued = compute.submit("dynamic", ComputeTaskType.GENERAL, ComputePriority.NORMAL, () -> "second");
-            Thread.sleep(50L);
-            assertFalse(queued.isDone());
-
+            final CompletableFuture<String> queued = compute.submit("dynamic", ComputeTaskType.GENERAL, ComputePriority.NORMAL, () -> {
+                assertTrue(allowSecondToRun.get(), "the second task started while the consumer limit was still one");
+                return "second";
+            });
+            // the body above is the real proof: with the old limit still in force it must not run at all
+            assertEventually("the second task waits for the consumer limit", Duration.ofSeconds(2), () -> {
+                final ConsumerMetrics metric = compute.metrics().consumer("dynamic").orElseThrow();
+                return metric.activeTasks() == 1 && metric.queuedTasks() == 1;
+            });
+            allowSecondToRun.set(true);
             compute.updateConsumerPolicy("dynamic", ConsumerPolicy.absolute(2));
             assertEquals("second", queued.get(10L, TimeUnit.SECONDS));
             release.countDown();
@@ -93,6 +102,7 @@ class EngineQuotaTest {
         final CountDownLatch bothRunning = new CountDownLatch(2);
         final CountDownLatch releaseFirst = new CountDownLatch(1);
         final CountDownLatch releaseSecond = new CountDownLatch(1);
+        final CountDownLatch secondFinished = new CountDownLatch(1);
         final AsyncComputeScheduler compute = startedScheduler(
             settings().fixedWorkers(3).build(),
             new EngineTestSupport.FakeClock()
@@ -106,20 +116,28 @@ class EngineQuotaTest {
             });
             final CompletableFuture<String> second = compute.submit("shrinking", ComputeTaskType.GENERAL, ComputePriority.NORMAL, () -> {
                 bothRunning.countDown();
-                releaseSecond.await();
-                return "second";
+                try {
+                    releaseSecond.await();
+                    return "second";
+                } finally {
+                    secondFinished.countDown();
+                }
             });
             assertTrue(bothRunning.await(10L, TimeUnit.SECONDS));
 
             compute.updateConsumerPolicy("shrinking", ConsumerPolicy.absolute(1));
-            final CompletableFuture<String> third = compute.submit("shrinking", ComputeTaskType.GENERAL, ComputePriority.NORMAL, () -> "third");
+            final CompletableFuture<String> third = compute.submit("shrinking", ComputeTaskType.GENERAL, ComputePriority.NORMAL, () -> {
+                assertEquals(0L, secondFinished.getCount(),
+                    "the third task started while the second still held a permit above the new limit");
+                return "third";
+            });
             assertFalse(third.isDone(), "the consumer is already above its new limit");
             assertFalse(first.isDone());
             assertFalse(second.isDone());
 
             releaseFirst.countDown();
             assertEquals("first", first.get(10L, TimeUnit.SECONDS));
-            Thread.sleep(50L);
+            // no sleep here: third may only run after second's body returned, and its own check proves it
             assertFalse(third.isDone(), "one task still runs above the new limit");
             releaseSecond.countDown();
             assertEquals("second", second.get(10L, TimeUnit.SECONDS));
