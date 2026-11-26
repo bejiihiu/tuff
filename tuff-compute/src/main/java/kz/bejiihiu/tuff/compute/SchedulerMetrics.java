@@ -79,6 +79,32 @@ public interface SchedulerMetrics {
     long expiredTasks();
 
     /**
+     * Returns the number of queued tasks evicted to make room for newer work.
+     *
+     * <p>Eviction is a subset of {@link #cancelledTasks()}: the task is cancelled with
+     * {@link ComputeCancelledException.Reason#EVICTED}. Implementations that do not track evictions
+     * separately return zero, which keeps older snapshots source compatible.
+     *
+     * @return queued tasks dropped by the {@link OverflowPolicy#DROP_OLDEST} policy
+     */
+    default long evictedTasks() {
+        return 0L;
+    }
+
+    /**
+     * Returns cancellations grouped by the reason they happened.
+     *
+     * <p>The counts sum to {@link #cancelledTasks()} when every cancellation is accounted for;
+     * reasons that never happened may be present with a zero count. Implementations without a
+     * breakdown return an empty map.
+     *
+     * @return an immutable map of cancellation reason to count, never {@code null}
+     */
+    default Map<ComputeCancelledException.Reason, Long> cancelledByReason() {
+        return Map.of();
+    }
+
+    /**
      * Returns the number of queued tasks currently waiting.
      *
      * @return current queue depth across all consumers

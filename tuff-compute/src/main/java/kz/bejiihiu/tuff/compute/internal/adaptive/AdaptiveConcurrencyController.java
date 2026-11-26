@@ -71,6 +71,20 @@ public interface AdaptiveConcurrencyController {
     int maxLimit();
 
     /**
+     * Moves the highest limit the controller may pick.
+     *
+     * <p>The engine calls this after a processor budget change, because an automatically sized pool
+     * resolves its ceiling from the budget: without it the controller would keep the budget it saw
+     * at construction and never grow past it. An explicit configured maximum still caps the result.
+     * Lowering the ceiling clamps the current decision; it never interrupts a running task.
+     *
+     * @param workerCeiling new pool ceiling, at least {@code 1}
+     */
+    default void updateCeiling(final int workerCeiling) {
+        // a controller without a mutable ceiling simply keeps its own bounds
+    }
+
+    /**
      * Records one finished task.
      *
      * <p>Samples are aggregated in a fixed size window. Samples for tasks that were cancelled after

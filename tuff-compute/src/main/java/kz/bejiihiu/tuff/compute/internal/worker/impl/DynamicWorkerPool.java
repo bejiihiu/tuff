@@ -1,6 +1,7 @@
 package kz.bejiihiu.tuff.compute.internal.worker.impl;
 
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadFactory;
@@ -61,7 +62,7 @@ public final class DynamicWorkerPool implements WorkerPool {
     private final ThreadFactory threadFactory;
 
     private final int minWorkers;
-    private final int maxWorkers;
+    private volatile int maxWorkers;
     private final int initialWorkers;
     private final boolean automatic;
 
@@ -69,7 +70,7 @@ public final class DynamicWorkerPool implements WorkerPool {
     private final long idleWaitNanos;
 
     private final Object lifecycleLock = new Object();
-    private final Worker[] slots;
+    private volatile Worker[] slots;
     private final Set<Worker> workers = ConcurrentHashMap.newKeySet();
     private final Set<Thread> createdThreads = ConcurrentHashMap.newKeySet();
     private final AtomicInteger liveWorkers = new AtomicInteger();
@@ -346,6 +347,32 @@ public final class DynamicWorkerPool implements WorkerPool {
             this.gate.signalAll();
         }
         this.wakeAll();
+    }
+
+    /**
+     * Changes the hard ceiling of the pool at runtime.
+     *
+     * <p>The engine calls this when a processor budget change moves an automatically sized pool's
+     * upper bound: the construction time budget is not the last word, so the slot array has to make
+     * room for worker indices that did not exist yet. Existing workers keep their index and their
+     * carry slot. A busy worker is never interrupted; shrinking only stops new spawns and lets
+     * {@link #resize(int)} retire the surplus between tasks.
+     *
+     * @param ceiling new hard ceiling, raised to {@code minThreads} when smaller
+     */
+    public void setCeiling(final int ceiling) {
+        Preconditions.checkAtLeast(ceiling, 1, "ceiling");
+        synchronized (this.lifecycleLock) {
+            final int target = Math.max(this.minWorkers, ceiling);
+            if (target > this.slots.length) {
+                this.slots = Arrays.copyOf(this.slots, target);
+            }
+            this.maxWorkers = target;
+            if (this.desiredWorkers.get() > target) {
+                this.desiredWorkers.set(target);
+            }
+        }
+        this.gate.signalAll();
     }
 
     /**

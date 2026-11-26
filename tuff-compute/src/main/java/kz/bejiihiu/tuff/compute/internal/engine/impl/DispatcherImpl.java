@@ -1,8 +1,10 @@
 package kz.bejiihiu.tuff.compute.internal.engine.impl;
 
 import java.util.ArrayList;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.ComputeConsumer;
@@ -49,6 +51,12 @@ final class DispatcherImpl implements Dispatcher {
      * worker loop is hot, so it should not loop forever on a queue full of already cancelled work.
      */
     private static final int MAX_SELECTION_ATTEMPTS = 8;
+
+    /**
+     * Carry slot of the virtual pump. Platform workers use their own worker index as the slot, so
+     * the map key space is {@code -1..workerCeiling-1}.
+     */
+    private static final int VIRTUAL_SLOT = -1;
 
     /**
      * Sink for finished-task samples, implemented by the engine so the dispatcher does not have to
@@ -99,16 +107,19 @@ final class DispatcherImpl implements Dispatcher {
     private final boolean spillEnabled;
 
     /**
-     * Carry slot index of the virtual pump, or {@code -1} when there is no virtual lane.
+     * Whether the dispatcher reserves a carry slot for the virtual pump.
      */
-    private final int virtualIndex;
+    private final boolean virtualSlot;
 
     /**
-     * Number of carry slots that belong to platform workers.
+     * Per slot carry cells: platform worker index or {@link #VIRTUAL_SLOT} as the key.
+     *
+     * <p>A plain array would have to be sized by the worker ceiling as it was known at
+     * construction, and that ceiling can grow when the processor budget does. A map grows with the
+     * pool without ever losing an in flight carry, which an array swap could: a worker that captured
+     * the old array reference would leave its entry invisible to every later scan.
      */
-    private final int platformSlots;
-
-    private final AtomicReferenceArray<QueueEntry> carried;
+    private final ConcurrentHashMap<Integer, AtomicReference<QueueEntry>> carried = new ConcurrentHashMap<>();
     private final ConcurrentLinkedQueue<QueueEntry> orphans = new ConcurrentLinkedQueue<>();
 
     /**
@@ -122,7 +133,6 @@ final class DispatcherImpl implements Dispatcher {
      * @param clock           clock used for expiry checks on carried entries
      * @param accepting       predicate that answers whether the engine still claims new work
      * @param adaptiveSink    sink fed with every finished task
-     * @param workerCeiling   maximum worker index plus one, used to size the carry slots
      * @param platformMask    priority levels a platform worker may take
      * @param virtualLowMask  LOW bit when the virtual lane owns LOW work, otherwise {@code 0}
      * @param spillEnabled    whether NORMAL work may spill onto the virtual lane
@@ -137,7 +147,6 @@ final class DispatcherImpl implements Dispatcher {
         final ComputeClock clock,
         final BooleanSupplier accepting,
         final AdaptiveSampleSink adaptiveSink,
-        final int workerCeiling,
         final int platformMask,
         final int virtualLowMask,
         final boolean spillEnabled,
@@ -156,11 +165,8 @@ final class DispatcherImpl implements Dispatcher {
         this.platformMask = platformMask;
         this.virtualLowMask = virtualLowMask;
         this.spillEnabled = spillEnabled;
-        final int ceiling = Preconditions.checkPositive(workerCeiling, "workerCeiling");
         Preconditions.checkAtLeast(virtualSlots, 0, "virtualSlots");
-        this.virtualIndex = virtualSlots > 0 ? ceiling : -1;
-        this.platformSlots = ceiling;
-        this.carried = new AtomicReferenceArray<>(ceiling + virtualSlots);
+        this.virtualSlot = virtualSlots > 0;
     }
 
     @Override
@@ -180,7 +186,7 @@ final class DispatcherImpl implements Dispatcher {
      * @return the claimed entry with its consumer slot already reserved, or {@code null}
      */
     @Nullable QueueEntry nextVirtual(final boolean spillOpen) {
-        if (this.virtualIndex < 0) {
+        if (!this.virtualSlot) {
             return null;
         }
         int mask = this.virtualLowMask;
@@ -190,7 +196,7 @@ final class DispatcherImpl implements Dispatcher {
         if (mask == 0) {
             return null;
         }
-        return this.claim(this.virtualIndex, LaneAwareQueue.Lane.VIRTUAL, mask);
+        return this.claim(VIRTUAL_SLOT, LaneAwareQueue.Lane.VIRTUAL, mask);
     }
 
     /**
@@ -200,8 +206,8 @@ final class DispatcherImpl implements Dispatcher {
      * and the next lane pump can terminalize or run it.
      */
     void workerStoppedVirtual() {
-        if (this.virtualIndex >= 0) {
-            this.workerStopped(this.virtualIndex);
+        if (this.virtualSlot) {
+            this.workerStopped(VIRTUAL_SLOT);
         }
     }
 
@@ -209,7 +215,7 @@ final class DispatcherImpl implements Dispatcher {
         if (!this.accepting.getAsBoolean()) {
             return null;
         }
-        final QueueEntry carriedEntry = this.carried.getAndSet(index, null);
+        final QueueEntry carriedEntry = this.takeCarried(index);
         if (carriedEntry != null) {
             return this.tryStart(carriedEntry, index, levelMask);
         }
@@ -409,8 +415,8 @@ final class DispatcherImpl implements Dispatcher {
      * @return {@code true} if this call took ownership of the entry
      */
     boolean removeCarried(final QueueEntry entry) {
-        for (int index = 0; index < this.carried.length(); index++) {
-            if (this.carried.compareAndSet(index, entry, null)) {
+        for (final AtomicReference<QueueEntry> cell : this.carried.values()) {
+            if (cell.compareAndSet(entry, null)) {
                 return true;
             }
         }
@@ -433,8 +439,8 @@ final class DispatcherImpl implements Dispatcher {
      * @param deferred whether the future completion may leave the calling thread
      */
     void cancelAllCarried(final ComputeCancelledException.Reason reason, final boolean deferred) {
-        for (int index = 0; index < this.carried.length(); index++) {
-            final QueueEntry entry = this.carried.getAndSet(index, null);
+        for (final AtomicReference<QueueEntry> cell : this.carried.values()) {
+            final QueueEntry entry = cell.getAndSet(null);
             if (entry != null) {
                 this.cancelQueued(entry, reason, deferred);
             }
@@ -456,13 +462,13 @@ final class DispatcherImpl implements Dispatcher {
      * @param reason     cancellation reason
      */
     void cancelCarriedConsumer(final String consumerId, final ComputeCancelledException.Reason reason) {
-        for (int index = 0; index < this.carried.length(); index++) {
-            final QueueEntry entry = this.carried.get(index);
+        for (final AtomicReference<QueueEntry> cell : this.carried.values()) {
+            final QueueEntry entry = cell.get();
             if (entry == null || !entry.consumerId().equals(consumerId)) {
                 continue;
             }
             handleOf(entry).requestCooperativeCancel(reason);
-            if (this.carried.compareAndSet(index, entry, null)) {
+            if (cell.compareAndSet(entry, null)) {
                 this.cancelQueued(entry, reason);
             }
         }
@@ -496,9 +502,9 @@ final class DispatcherImpl implements Dispatcher {
      * @param deferred whether the future completion may leave the calling thread
      */
     void sweepCarried(final long nowNanos, final boolean deferred) {
-        for (int index = 0; index < this.carried.length(); index++) {
-            final QueueEntry entry = this.carried.get(index);
-            if (entry != null && this.isExpired(entry, nowNanos) && this.carried.compareAndSet(index, entry, null)) {
+        for (final AtomicReference<QueueEntry> cell : this.carried.values()) {
+            final QueueEntry entry = cell.get();
+            if (entry != null && this.isExpired(entry, nowNanos) && cell.compareAndSet(entry, null)) {
                 this.cancelQueued(entry, ComputeCancelledException.Reason.QUEUE_EXPIRED, deferred);
             }
         }
@@ -515,7 +521,7 @@ final class DispatcherImpl implements Dispatcher {
      * @param workerIndex index of the exiting worker
      */
     void workerStopped(final int workerIndex) {
-        final QueueEntry entry = this.carried.getAndSet(workerIndex, null);
+        final QueueEntry entry = this.takeCarried(workerIndex);
         if (entry != null) {
             this.orphans.add(entry);
         }
@@ -528,8 +534,8 @@ final class DispatcherImpl implements Dispatcher {
      */
     int carriedEntries() {
         int total = this.orphans.size();
-        for (int index = 0; index < this.carried.length(); index++) {
-            if (this.carried.get(index) != null) {
+        for (final AtomicReference<QueueEntry> cell : this.carried.values()) {
+            if (cell.get() != null) {
                 total++;
             }
         }
@@ -546,8 +552,8 @@ final class DispatcherImpl implements Dispatcher {
      */
     int platformCarriedEntries() {
         int total = 0;
-        for (int index = 0; index < this.platformSlots; index++) {
-            if (this.carried.get(index) != null) {
+        for (final Map.Entry<Integer, AtomicReference<QueueEntry>> slot : this.carried.entrySet()) {
+            if (slot.getKey() != VIRTUAL_SLOT && slot.getValue().get() != null) {
                 total++;
             }
         }
@@ -710,12 +716,21 @@ final class DispatcherImpl implements Dispatcher {
         return (levelMask & (1 << entry.priority().level())) != 0;
     }
 
+    private @Nullable QueueEntry takeCarried(final int slot) {
+        final AtomicReference<QueueEntry> cell = this.carried.get(slot);
+        return cell == null ? null : cell.getAndSet(null);
+    }
+
     private void carry(final int workerIndex, final QueueEntry entry) {
-        if (!this.carried.compareAndSet(workerIndex, null, entry)) {
+        if (!this.cell(workerIndex).compareAndSet(null, entry)) {
             // another thread already left an entry there (only possible after an index reuse), so the
             // orphan pool is the safe owner.
             this.orphans.add(entry);
         }
+    }
+
+    private AtomicReference<QueueEntry> cell(final int slot) {
+        return this.carried.computeIfAbsent(slot, _ -> new AtomicReference<>());
     }
 
     private boolean isExpired(final QueueEntry entry, final long nowNanos) {

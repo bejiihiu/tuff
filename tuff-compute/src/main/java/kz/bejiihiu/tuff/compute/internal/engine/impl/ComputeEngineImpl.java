@@ -68,7 +68,7 @@ import org.jspecify.annotations.Nullable;
  * <p>That is what makes "a {@code NEW} engine has no threads" true even with metrics enabled, and
  * what makes "a {@code TERMINATED} engine has no threads" checkable by thread name.
  *
- * <p>Terminal ownership invariants (the short version, see the report in the module notes):
+ * <p>Terminal ownership invariants:
  * <ul>
  *     <li>only {@link TaskHandle} transitions a task into a terminal state and completes its
  *     future;</li>
@@ -111,17 +111,20 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     private volatile int processorBudget;
 
     /**
-     * Hard ceiling of the pool when it was created. The pool implementation owns this number and it
-     * never grows, so a budget above the construction-time ceiling is clamped to it.
+     * Hard ceiling of the pool for the current processor budget. Not frozen at construction: an
+     * automatically sized pool resolves its ceiling from the budget every time the budget changes
+     * ({@code maxThreads == -1} means "as many as the budget allows"), while an explicit
+     * {@code maxThreads} stays the ceiling and is only clamped by the budget.
      */
-    private final int workerCeiling;
+    private volatile int workerCeiling;
 
     /**
-     * Worker ceiling implied by the current processor budget ({@code resolveMaxThreads(budget)}),
-     * already clamped to {@link #workerCeiling}. Autoscaling and adaptive concurrency use it so a
-     * budget shrink is not immediately undone by the next growth step.
+     * Serializes every writer of the pool size: submission driven growth, janitor autoscaling,
+     * adaptive decisions and budget changes. The pool size, its concurrency gate and the quota
+     * controller's total limit are moved together inside this lock, so a limit can never be left
+     * behind on either side of a resize.
      */
-    private volatile int budgetCeiling;
+    private final Object sizingLock = new Object();
 
     private final ComputeQueue queue;
     private final QuotaController quota;
@@ -183,11 +186,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         this.clock = Preconditions.requireNonNull(clock, "clock");
         Preconditions.checkAtLeast(processorBudget, 1, "processorBudget");
         this.processorBudget = processorBudget;
-        this.workerCeiling = Math.max(
-            1,
-            Math.max(settings.workers().minThreads(), settings.workers().resolveMaxThreads(processorBudget))
-        );
-        this.budgetCeiling = this.workerCeiling;
+        this.workerCeiling = this.ceilingFor(processorBudget);
         final int initialConcurrency = Math.max(1, settings.workers().resolveThreadCount(processorBudget));
         this.platformLevelMask = settings.lanes().virtual().servesLow() ? 0b1110 : 0b1111;
         this.queue = new BoundedComputeQueue(settings, clock);
@@ -484,10 +483,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (limit == this.appliedLimit.get()) {
             return;
         }
-        this.appliedLimit.set(limit);
-        currentPool.resize(limit);
-        currentPool.setConcurrencyLimit(limit);
-        this.quota.updateTotalLimit(limit);
+        this.applyPoolSize(limit);
     }
 
     @Override
@@ -501,29 +497,27 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             return;
         }
         final int previousBudget = this.processorBudget;
+        final int previousCeiling = this.workerCeiling;
+        final int ceiling = this.ceilingFor(processors);
         final int target = this.settings.workers().resolveThreadCount(processors);
         this.processorBudget = processors;
-        this.budgetCeiling = Math.min(
-            this.workerCeiling,
-            Math.max(1, this.settings.workers().resolveMaxThreads(processors))
-        );
+        synchronized (this.sizingLock) {
+            this.workerCeiling = ceiling;
+            // the pool's hard ceiling moves first: a resize can only grow into indices the pool and
+            // the dispatcher already made room for
+            currentPool.setCeiling(ceiling);
+        }
         final AdaptiveConcurrencyController controller = this.adaptive;
         if (controller != null && controller.enabled()) {
-            final int applied = Math.min(this.appliedLimit.get(), target);
-            this.appliedLimit.set(applied);
-            currentPool.resize(applied);
-            currentPool.setConcurrencyLimit(applied);
-            this.quota.updateTotalLimit(applied);
+            // the controller keeps its short-term throttle, but it must not outlive the budget
+            controller.updateCeiling(ceiling);
+            this.applyPoolSize(Math.min(this.appliedLimit.get(), target));
         } else {
-            // resize carries the gate and the quota limit along; there is no adaptive writer here
-            currentPool.resize(target);
-            final int applied = currentPool.concurrencyLimit();
-            this.appliedLimit.set(applied);
-            this.quota.updateTotalLimit(applied);
+            this.applyPoolSize(target);
         }
         LOG.log(System.Logger.Level.INFO,
             "compute processor budget changed from " + previousBudget + " to " + processors
-                + " (target workers " + target + ", ceiling " + this.budgetCeiling + ')');
+                + " (target workers " + target + ", ceiling " + previousCeiling + " -> " + ceiling + ')');
     }
 
     /**
@@ -548,6 +542,26 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         return this.quota.totalLimit();
     }
 
+    /**
+     * Resolves the hard worker ceiling for a processor budget.
+     *
+     * <p>With {@code maxThreads == -1} the ceiling is the budget itself, so raising the budget later
+     * can still grow the pool; an explicit {@code maxThreads} stays the ceiling and is only clamped
+     * by the budget, never widened by it. {@code minThreads} is always the floor, because a pool that
+     * cannot reach its configured minimum would not be sized the way the administrator asked.
+     *
+     * @param budget processors available to the engine, at least {@code 1}
+     * @return the hard worker ceiling for that budget
+     */
+    private int ceilingFor(final int budget) {
+        final ComputeSettings.Workers workers = this.settings.workers();
+        final boolean automaticCeiling = workers.maxThreads() == -1;
+        final int resolved = automaticCeiling
+            ? workers.resolveMaxThreads(budget)
+            : Math.min(workers.maxThreads(), budget);
+        return Math.max(1, Math.max(workers.minThreads(), resolved));
+    }
+
     private void wireRuntime() {
         final JfrRecorder recorder = new FlightJfrRecorder();
         final ComputeSettings.Lanes.Virtual laneConfig = this.settings.lanes().virtual();
@@ -570,7 +584,6 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this.clock,
             this::isClaiming,
             this::recordAdaptiveSample,
-            this.workerCeiling,
             this.platformLevelMask,
             virtualLowMask,
             laneConfig.allowsSpill(),
@@ -887,7 +900,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (currentPool == null || !this.isClaiming()) {
             return;
         }
-        final int ceiling = Math.min(this.workerCeiling, this.budgetCeiling);
+        final int ceiling = this.workerCeiling;
         final int desired = currentPool.desiredWorkers();
         if (desired >= ceiling || currentPool.idleWorkers() > 0 || this.platformBacklog() <= 0) {
             return;
@@ -899,7 +912,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             if (currentPool.desiredWorkers() < ceiling
                 && currentPool.idleWorkers() == 0
                 && this.platformBacklog() > 0) {
-                currentPool.resize(currentPool.desiredWorkers() + 1);
+                this.applyPoolSize(currentPool.desiredWorkers() + 1);
             }
         } finally {
             this.growInFlight.set(false);
@@ -920,7 +933,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (currentPool == null) {
             return;
         }
-        final int ceiling = Math.min(this.workerCeiling, this.budgetCeiling);
+        final int ceiling = this.workerCeiling;
         final int minimum = Math.min(this.settings.workers().minThreads(), ceiling);
         final int backlog = this.platformBacklog()
             + (currentDispatcher == null ? 0 : currentDispatcher.platformCarriedEntries());
@@ -932,7 +945,32 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             target = (int) Math.min(ceiling, Math.max(minimum, wanted));
         }
         if (target != currentPool.desiredWorkers()) {
+            this.applyPoolSize(target);
+        }
+    }
+
+    /**
+     * Moves the pool, its concurrency gate and the quota limit together.
+     *
+     * <p>Every writer of the pool size goes through here, which is what keeps the three numbers from
+     * drifting apart: a pool that grew without its gate and quota would run fewer bodies than it has
+     * workers (the bug autoscaling used to have), and a gate above the worker count would admit work
+     * no worker can pick up, so the queue would grow for no reason.
+     *
+     * @param target requested worker count; the pool clamps it into its own min/max window
+     */
+    private void applyPoolSize(final int target) {
+        final DynamicWorkerPool currentPool = this.pool;
+        if (currentPool == null) {
+            return;
+        }
+        synchronized (this.sizingLock) {
             currentPool.resize(target);
+            // the pool owns the min/max clamp, so the limit follows the applied size, not the request
+            final int applied = currentPool.desiredWorkers();
+            currentPool.setConcurrencyLimit(applied);
+            this.quota.updateTotalLimit(applied);
+            this.appliedLimit.set(applied);
         }
     }
 

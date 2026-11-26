@@ -68,7 +68,7 @@ class EngineProcessorBudgetTest {
     }
 
     @Test
-    void budgetIsClampedByTheContractAndTheConstructionCeiling() throws Exception {
+    void budgetRaisesTheCeilingOfAnAutomaticPool() throws Exception {
         final EngineTestSupport.FakeClock clock = new EngineTestSupport.FakeClock();
         final ComputeEngineImpl engine = engine(
             settings()
@@ -82,17 +82,19 @@ class EngineProcessorBudgetTest {
         final CountDownLatch release = new CountDownLatch(1);
         compute.start();
         try {
-            for (int index = 0; index < 6; index++) {
+            for (int index = 0; index < 8; index++) {
                 compute.submit(() -> {
                     release.await();
                     return 1;
                 });
             }
-            assertEventually("the backlog fills the initial pool", Duration.ofSeconds(5), () -> engine.desiredWorkers() >= 3);
+            assertEventually("the backlog fills the initial budget", Duration.ofSeconds(5), () ->
+                engine.desiredWorkers() == 4);
 
-            engine.applyProcessorBudget(100);
-            assertEventually("the pool never grows above its construction ceiling", Duration.ofSeconds(5), () ->
-                engine.desiredWorkers() == 4 && engine.totalLimit() == 4);
+            // maxThreads is automatic, so the construction budget is not the ceiling any more
+            engine.applyProcessorBudget(7);
+            assertEventually("a raised budget raises the ceiling and the limit follows", Duration.ofSeconds(5), () ->
+                engine.desiredWorkers() == 6 && engine.totalLimit() == 6);
 
             engine.applyProcessorBudget(1);
             assertEventually("a tiny budget shrinks to the contract floor", Duration.ofSeconds(5), () ->

@@ -173,7 +173,14 @@ public final class AimdAdaptiveConcurrencyController implements AdaptiveConcurre
     private final boolean adaptiveEnabled;
     private final boolean workerCountAutomatic;
     private final int minLimit;
-    private final int maxLimit;
+    private volatile int maxLimit;
+
+    /**
+     * Configured adaptive maximum, or {@code -1} when the pool ceiling alone bounds the controller.
+     * Kept so {@link #updateCeiling(int)} can re-resolve the effective maximum instead of freezing
+     * the construction time budget into the controller.
+     */
+    private final int configuredMax;
     private final long windowNanos;
     private final long decisionIntervalNanos;
     private final int minSamples;
@@ -290,9 +297,10 @@ public final class AimdAdaptiveConcurrencyController implements AdaptiveConcurre
         final int workerCeiling = this.workerCountAutomatic
             ? settings.workers().resolveMaxThreads(availableProcessors)
             : settings.workers().threads();
-        final int configuredMax = adaptive.maxConcurrency();
-        final int ceiling = configuredMax == -1 ? workerCeiling : Math.min(configuredMax, workerCeiling);
-        this.maxLimit = Math.max(1, ceiling);
+        final int ceiling = adaptive.maxConcurrency();
+        this.configuredMax = ceiling;
+        final int effectiveMax = ceiling == -1 ? workerCeiling : Math.min(ceiling, workerCeiling);
+        this.maxLimit = Math.max(1, effectiveMax);
         this.minLimit = Math.clamp(
             Math.max(adaptive.minConcurrency(), settings.workers().minThreads()),
             1,
@@ -363,6 +371,22 @@ public final class AimdAdaptiveConcurrencyController implements AdaptiveConcurre
     }
 
     @Override
+    public void updateCeiling(final int workerCeiling) {
+        Preconditions.checkAtLeast(workerCeiling, 1, "workerCeiling");
+        final int resolved = this.configuredMax == -1
+            ? workerCeiling
+            : Math.min(this.configuredMax, workerCeiling);
+        this.decisionLock.lock();
+        try {
+            this.maxLimit = Math.max(this.minLimit, Math.max(1, resolved));
+            this.current = Math.min(this.current, this.maxLimit);
+            this.desired = Math.min(this.desired, this.maxLimit);
+        } finally {
+            this.decisionLock.unlock();
+        }
+    }
+
+    @Override
     public void recordSample(final long queueWaitNanos, final long executionNanos, final boolean failed) {
         if (failed) {
             this.failedSamples.incrementAndGet();
@@ -400,10 +424,11 @@ public final class AimdAdaptiveConcurrencyController implements AdaptiveConcurre
             }
 
             final Window window = this.collectWindow(now);
+            final int before = this.current;
             try {
                 return this.decide(window);
             } finally {
-                this.emitDecision(this.lastReason);
+                this.emitDecision(this.lastReason, before);
             }
         } finally {
             this.decisionLock.unlock();
@@ -628,7 +653,6 @@ public final class AimdAdaptiveConcurrencyController implements AdaptiveConcurre
         this.current = limit;
         this.desired = limit;
         this.lastReason = reason;
-        this.emitDecision(reason);
     }
 
     private boolean isIdleWindow(final Window window, final int active) {
@@ -675,13 +699,13 @@ public final class AimdAdaptiveConcurrencyController implements AdaptiveConcurre
         }
     }
 
-    private void emitDecision(final DecisionReason reason) {
+    private void emitDecision(final DecisionReason reason, final int before) {
         if (!this.jfrEnabled) {
             return;
         }
         try {
             final AdaptiveDecisionEvent event = new AdaptiveDecisionEvent();
-            event.currentLimit = this.current;
+            event.currentLimit = before;
             event.desiredLimit = this.desired;
             event.minLimit = this.minLimit;
             event.maxLimit = this.maxLimit;
