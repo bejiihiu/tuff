@@ -5,7 +5,7 @@
      <!--minecraft sources are decompiled and still maintained as patches, so we don't control their format-->
      <module name="BeforeExecutionExclusionFileFilter">
 -        <property name="fileNamePattern" value="[\\/]paper-server[\\/]src[\\/]minecraft[\\/]"/>
-+        <property name="fileNamePattern" value="[\\/](paper|folia)-server[\\/]src[\\/]minecraft[\\/]"/>
++        <property name="fileNamePattern" value="[\\/](paper|folia|tuff)-server[\\/]src[\\/]minecraft[\\/]"/>
      </module>
      <!--generated sources are written by the generator, so we don't control their format-->
      <module name="BeforeExecutionExclusionFileFilter">
