@@ -10,6 +10,22 @@ dependencies {
     "jmh"(project(":tuff-compute"))
     // note: jmh 1.37 resolves asm 9.0 and still runs on jdk 25 (see benchmarks.md); no asm
     // override is needed. the only jdk 25 complaint is jmh-core touching sun.misc.Unsafe.
+
+    // the root build adds an unversioned junit-platform-launcher to every subproject, so this
+    // module needs a BOM to pin it. there is no src/test here (only src/jmh), so the `test` task
+    // stays NO-SOURCE and never runs junit; this only keeps the runtime classpath resolvable.
+    testRuntimeOnly(platform("org.junit:junit-bom:6.0.3"))
+}
+
+// benchmarks are not shipped and don't follow the server/paper style. checkstyleJmh would
+// otherwise run the full paper ruleset over src/jmh and fail. keep the tasks in the graph but
+// disabled, and give mergeCheckstyleConfigs a valid config so it doesn't fail on a missing file.
+paperCheckstyle {
+    directoriesToSkipFile = layout.projectDirectory.file(".checkstyle/ignored_directories.txt")
+}
+
+tasks.withType<Checkstyle>().configureEach {
+    enabled = false
 }
 
 jmh {
