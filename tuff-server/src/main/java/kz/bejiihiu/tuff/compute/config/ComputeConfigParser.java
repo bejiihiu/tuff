@@ -38,6 +38,7 @@ import org.jspecify.annotations.Nullable;
 final class ComputeConfigParser {
 
     static final String SECTION = "async-compute";
+    private static final String THREAD_MANAGEMENT = "thread-management";
 
     private static final String WORKERS_PATH = SECTION + ".workers";
     private static final String QUEUE_PATH = SECTION + ".queue";
@@ -51,7 +52,7 @@ final class ComputeConfigParser {
     private static final String DEFAULT_CONSUMER = "default";
     private static final String ALLOW_DYNAMIC_REGISTRATION = "allow-dynamic-registration";
 
-    private static final Set<String> ROOT_KEYS = Set.of(SECTION, "thread-management");
+    private static final Set<String> ROOT_KEYS = Set.of(SECTION, THREAD_MANAGEMENT);
     private static final Set<String> SETTINGS_KEYS = Set.of(
         "enabled", "workers", "queue", "scheduling", "consumers", "metrics", "adaptive", "lanes", "shutdown-grace-seconds"
     );
@@ -82,20 +83,23 @@ final class ComputeConfigParser {
     }
 
     /**
-     * Reads and parses a configuration file as UTF-8.
+     * Reads the file as UTF-8 and returns the loaded tree.
      *
-     * @param file     file to read
-     * @param problems problem sink, appended to in place
-     * @return the parsed settings, never {@code null}
+     * <p>Split from {@link #parse(Configuration, List)} so one read can serve both the settings and
+     * the raw {@code thread-management} section the diff needs; the section is owned by another parser
+     * and is not part of {@link ComputeSettings}.
+     *
+     * @param file file to read
+     * @return the loaded configuration, never {@code null}
      * @throws IOException                   if the file cannot be read
      * @throws InvalidConfigurationException if the file is not valid YAML
      */
-    static ComputeSettings read(final Path file, final List<ConfigProblem> problems) throws IOException, InvalidConfigurationException {
+    static YamlConfiguration load(final Path file) throws IOException, InvalidConfigurationException {
         final YamlConfiguration configuration = new YamlConfiguration();
         try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
             configuration.load(reader);
         }
-        return parse(configuration, problems);
+        return configuration;
     }
 
     /**
@@ -142,6 +146,24 @@ final class ComputeConfigParser {
      * @return ordered map of dotted key to display value
      */
     static Map<String, String> flatten(final ComputeSettings settings) {
+        return flatten(settings, null);
+    }
+
+    /**
+     * Renders settings as dotted keys and appends the raw {@code thread-management} section.
+     *
+     * <p>{@link ComputeSettings} does not own the thread section - the thread layer parses it itself -
+     * but the diff still has to see it: the whole section is restart only, and without its keys
+     * {@code /tuff reload} would report "nothing changed" after an administrator edited it. The leaves
+     * are read from the same loaded tree, so no second file read and no second parser are involved.
+     * Values are compared as text; the section has no live reload, so "which exactly" does not matter,
+     * only "any of them".
+     *
+     * @param settings      settings to render
+     * @param configuration loaded file the thread section is read from, or {@code null} to skip it
+     * @return ordered map of dotted key to display value
+     */
+    static Map<String, String> flatten(final ComputeSettings settings, final @Nullable Configuration configuration) {
         final Map<String, String> flat = new LinkedHashMap<>();
         flat.put(SECTION + ".enabled", Boolean.toString(settings.enabled()));
 
@@ -196,7 +218,34 @@ final class ComputeConfigParser {
         flat.put(LANE_VIRTUAL_PATH + ".spill-queue-depth", Integer.toString(virtual.spillQueueDepth()));
 
         flat.put(SECTION + ".shutdown-grace-seconds", formatSeconds(settings.shutdownGracePeriod()));
+        flattenThreadSection(flat, configuration);
         return flat;
+    }
+
+    /**
+     * Adds every leaf of {@code thread-management} from the loaded tree.
+     *
+     * <p>Walking the tree instead of a fixed key list is on purpose: a key the thread layer starts
+     * honouring tomorrow must not silently fall outside the diff. The section is restart only as a
+     * whole, so an unrecognised leaf still only ever produces a restart notice.
+     *
+     * @param flat          map to append to
+     * @param configuration loaded file, or {@code null}
+     */
+    private static void flattenThreadSection(final Map<String, String> flat, final @Nullable Configuration configuration) {
+        if (configuration == null) {
+            return;
+        }
+        final ConfigurationSection section = configuration.getConfigurationSection(THREAD_MANAGEMENT);
+        if (section == null) {
+            return;
+        }
+        for (final String key : section.getKeys(true)) {
+            if (section.isConfigurationSection(key)) {
+                continue;
+            }
+            flat.put(THREAD_MANAGEMENT + "." + key, String.valueOf(section.get(key)));
+        }
     }
 
     private static void flattenPolicy(final Map<String, String> flat, final String path, final ConsumerPolicy policy) {

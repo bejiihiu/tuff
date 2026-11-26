@@ -15,6 +15,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -400,6 +402,58 @@ class TuffComputeConfigTest {
             reader.get();
         }
         assertEquals(25, config.settings().workers().threads());
+    }
+
+    @Test
+    void everyThreadManagementKeyOfTheTemplateNeedsARestartAfterReload() throws IOException {
+        final TuffComputeConfig config = TuffComputeConfig.inDirectory(this.directory);
+        // the bundled template is what an administrator edits, so its leaves are the real key list
+        config.load();
+        final YamlConfiguration template = YamlConfiguration.loadConfiguration(this.file().toFile());
+        final String pristine = template.saveToString();
+        final List<String> keys = threadLeaves(template);
+        assertFalse(keys.isEmpty(), "the template documents the thread-management section");
+        assertTrue(keys.contains("thread-management.execution-pools.compute.managed"),
+            () -> "the compute adapter key is missing from the template: " + keys);
+
+        for (final String key : keys) {
+            final YamlConfiguration changed = YamlConfiguration.loadConfiguration(this.file().toFile());
+            changeValue(changed, key);
+            Files.writeString(this.file(), changed.saveToString(), StandardCharsets.UTF_8);
+
+            final ConfigLoadResult reloaded = config.reload();
+
+            assertEquals(List.of(key), reloaded.diff().changedPaths(), key);
+            assertEquals(List.of(key), reloaded.diff().restartRequiredPaths(), key);
+            assertTrue(reloaded.diff().livePaths().isEmpty(), () -> key + " must not be adopted live");
+
+            Files.writeString(this.file(), pristine, StandardCharsets.UTF_8);
+            config.reload();
+        }
+    }
+
+    private static List<String> threadLeaves(final YamlConfiguration configuration) {
+        final ConfigurationSection section = configuration.getConfigurationSection("thread-management");
+        assertNotNull(section, "the template must carry the thread-management section");
+        final List<String> keys = new ArrayList<>();
+        for (final String key : section.getKeys(true)) {
+            if (!section.isConfigurationSection(key)) {
+                keys.add("thread-management." + key);
+            }
+        }
+        keys.sort(null);
+        return keys;
+    }
+
+    private static void changeValue(final YamlConfiguration configuration, final String key) {
+        final Object value = configuration.get(key);
+        if (value instanceof Boolean bool) {
+            configuration.set(key, !bool);
+        } else if (value instanceof Number number) {
+            configuration.set(key, number.longValue() + 1L);
+        } else {
+            configuration.set(key, String.valueOf(value) + "-changed");
+        }
     }
 
     private Path file() {

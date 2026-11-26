@@ -6,10 +6,12 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.bukkit.configuration.Configuration;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.jspecify.annotations.Nullable;
 
@@ -57,6 +59,7 @@ public final class TuffComputeConfig {
 
     private volatile ConfigLoadResult state;
     private volatile @Nullable ComputeConfigApplyTarget applyTarget;
+    private volatile Map<String, String> flattened = Map.of();
     private boolean loaded;
 
     /**
@@ -215,13 +218,15 @@ public final class TuffComputeConfig {
             final List<ConfigProblem> problems = new ArrayList<>();
             boolean created = false;
             ComputeSettings parsed = null;
+            Configuration configuration = null;
 
             try {
                 if (Files.notExists(this.file)) {
                     ConfigTemplate.writeDefault(this.file);
                     created = true;
                 }
-                parsed = ComputeConfigParser.read(this.file, problems);
+                configuration = ComputeConfigParser.load(this.file);
+                parsed = ComputeConfigParser.parse(configuration, problems);
             } catch (final IOException ex) {
                 problems.add(new ConfigProblem(this.file.toString(), "could not be read (" + ex + "), keeping the previous settings"));
             } catch (final InvalidConfigurationException ex) {
@@ -234,13 +239,20 @@ public final class TuffComputeConfig {
 
             final boolean keptPrevious = parsed == null;
             final ComputeSettings settings = keptPrevious ? previous.settings() : parsed;
+            // the thread section lives outside ComputeSettings, so it is flattened from the same loaded
+            // tree; a failed read must keep the old leaves too, otherwise a broken file would look like
+            // "every thread key changed"
+            final Map<String, String> flattening = keptPrevious
+                ? this.flattened
+                : ComputeConfigParser.flatten(settings, configuration);
             final boolean firstRead = !this.loaded;
             final ConfigDiff diff = firstRead
                 ? ConfigDiff.empty()
-                : ConfigDiff.between(ComputeConfigParser.flatten(previous.settings()), ComputeConfigParser.flatten(settings));
+                : ConfigDiff.between(this.flattened, flattening);
             final ConfigLoadResult result = new ConfigLoadResult(settings, problems, diff, created, keptPrevious);
 
             this.loaded = true;
+            this.flattened = flattening;
             this.state = result;
             this.log(result, initial);
             this.apply(previous.settings(), result);
