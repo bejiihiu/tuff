@@ -2,8 +2,8 @@ package kz.bejiihiu.tuff.benchmarks;
 
 import java.time.Duration;
 import java.util.Locale;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputePriority;
@@ -24,6 +24,7 @@ import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Threads;
+import org.openjdk.jmh.annotations.Timeout;
 import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Blackhole;
 
@@ -38,13 +39,20 @@ import org.openjdk.jmh.infra.Blackhole;
  * throughput number alone.
  *
  * <p>One op is one submitted and executed task.
+ *
+ * <p>The producers run against a bounded in-flight window and a bounded queue: without it the
+ * harness can submit blocking work faster than the lane retires it, the backlog grows across
+ * iterations and the fork dies with an {@link OutOfMemoryError} long before JMH finishes. The
+ * window stays far above the lane's concurrency, so the measured rate is the steady state the lane
+ * sustains, not the maximum the submitter can push into memory.
  */
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.SECONDS)
 @Warmup(iterations = 3, time = 1, timeUnit = TimeUnit.SECONDS)
 @Measurement(iterations = 5, time = 1, timeUnit = TimeUnit.SECONDS)
-@Fork(1)
+@Fork(value = 1, jvmArgsAppend = "-Xmx2G")
+@Timeout(time = 120)
 @Threads(4)
 public class SpillBenchmark {
 
@@ -53,6 +61,12 @@ public class SpillBenchmark {
 
     /** Tasks per producer per invocation. */
     static final int BATCH = 128;
+
+    /** Global queue bound; large enough for the in-flight window, small enough to stay honest. */
+    static final int QUEUE_CAPACITY = 8192;
+
+    /** Submissions allowed to wait for a result at the same time across all producers. */
+    static final int IN_FLIGHT = 4096;
 
     /** Virtual lane hard limit; deliberately far above the quota. */
     static final int MAX_CONCURRENT = 64;
@@ -69,6 +83,7 @@ public class SpillBenchmark {
 
     private AsyncComputeScheduler scheduler;
     private LaneFixtures.WaitSamples waits;
+    private final Semaphore inFlight = new Semaphore(IN_FLIGHT);
     private long lastSpilled;
 
     /**
@@ -78,7 +93,7 @@ public class SpillBenchmark {
     public void setUp() {
         this.scheduler = ComputeSchedulers.create(LaneFixtures.virtual(
             WORKERS,
-            65536,
+            QUEUE_CAPACITY,
             MAX_CONCURRENT,
             this.spill,
             Duration.ofMillis(SPILL_WAIT_MILLIS),
@@ -129,13 +144,21 @@ public class SpillBenchmark {
     @OperationsPerInvocation(BATCH)
     public void ioThroughput(final Blackhole blackhole) throws InterruptedException {
         final CountDownLatch done = new CountDownLatch(BATCH);
-        final CompletableFuture<?>[] futures = new CompletableFuture<?>[BATCH];
         for (int index = 0; index < BATCH; index++) {
-            futures[index] = this.scheduler.submit(ComputePriority.NORMAL,
-                new WaitProbe(System.nanoTime(), this.waits, done));
+            // blocks only when the harness itself outruns the lane, which keeps the backlog bounded
+            this.inFlight.acquire();
+            try {
+                this.scheduler.submit(ComputePriority.NORMAL,
+                    new WaitProbe(System.nanoTime(), this.waits, done, this.inFlight));
+            } catch (RuntimeException rejected) {
+                // a rejection is a fact the harness must count, not hide: the entry never ran
+                this.inFlight.release();
+                done.countDown();
+                blackhole.consume(rejected);
+            }
         }
         done.await();
-        blackhole.consume(futures[BATCH - 1]);
+        blackhole.consume(BATCH);
     }
 
     /**
@@ -144,11 +167,13 @@ public class SpillBenchmark {
      * @param submittedAt when the producer submitted it
      * @param waits       shared sample buffer
      * @param done        batch latch
+     * @param inFlight    submission window released when the task settles
      */
     private record WaitProbe(
         long submittedAt,
         LaneFixtures.WaitSamples waits,
-        CountDownLatch done
+        CountDownLatch done,
+        Semaphore inFlight
     ) implements ComputeTask<Boolean> {
 
         @Override
@@ -158,6 +183,7 @@ public class SpillBenchmark {
                 Thread.sleep(java.time.Duration.ofNanos(LaneFixtures.IO_BLOCK_NANOS));
             } finally {
                 this.done.countDown();
+                this.inFlight.release();
             }
             return Boolean.TRUE;
         }

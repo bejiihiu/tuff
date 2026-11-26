@@ -34,7 +34,7 @@ import org.openjdk.jmh.infra.Blackhole;
  * <p>The lane is held by blocking tasks, then every op enqueues one more task: nothing executes, so
  * the score is validation, handle and entry allocation, the queue insert and the submission signal
  * itself. On the virtual lane that signal is a monitor notify on the pump; on the platform pool it
- * is a gate signal plus an unpark of every parked worker.
+ * is the single idle-worker wake-up the submission path issues, not a wake of the whole pool.
  *
  * <p>The queue is emptied by cancelling the batch in an iteration teardown, which is not measured.
  * One op is one accepted submission.
@@ -75,9 +75,11 @@ public class LaneSubmitCostBenchmark {
     @Setup(Level.Trial)
     public void setUp() throws InterruptedException {
         this.gate = new CountDownLatch(1);
-        // the per consumer quota is resolved against the pool, so a single consumer can never run
-        // more than WORKERS tasks at once across both lanes; holding more than that would block
-        this.blockers = this.lane == Lane.VIRTUAL ? Math.min(this.maxConcurrent, WORKERS) : WORKERS;
+        // hold every lane permit, or every worker for the platform variant: the quota now resolves
+        // against workers plus lane permits, so one consumer can fill the whole lane. Holding only
+        // min(maxConcurrent, WORKERS) would leave the extra permits free and the "full lane" row
+        // would actually measure a draining one.
+        this.blockers = this.lane == Lane.VIRTUAL ? this.maxConcurrent : WORKERS;
         this.scheduler = ComputeSchedulers.create(this.lane == Lane.VIRTUAL
             ? LaneFixtures.virtual(WORKERS, BATCH + 4096, this.maxConcurrent, false, Duration.ZERO, 0)
             : LaneFixtures.platform(WORKERS, BATCH + 4096));
