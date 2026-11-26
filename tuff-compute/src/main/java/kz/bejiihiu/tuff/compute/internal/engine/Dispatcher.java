@@ -26,8 +26,9 @@ public interface Dispatcher {
     /**
      * Claims the next task that may run on the calling worker.
      *
-     * <p>Consults the queue with the quota controller as admission check, preferring the calling
-     * worker's own batch and stealing from others only when work stealing is enabled. Returns
+     * <p>Consults the queue with the quota controller as admission check. When work stealing is
+     * enabled and the normal selection finds nothing runnable, it retries through the steal path,
+     * which walks the other consumers' streams instead of following the dispatch order. Returns
      * {@code null} when nothing is runnable right now, which is a normal situation and not an error.
      *
      * @param workerIndex zero based index of the calling worker

@@ -26,7 +26,7 @@ import org.jspecify.annotations.Nullable;
  * alive across tasks and is only retired by keep-alive, by an explicit shrink or by shutdown. This
  * is also why virtual threads are rejected. They add no parallelism for CPU bound work (JEP 444),
  * they hide the worker from a normal thread dump, and they cannot be pinned to a stable worker index
- * that the dispatcher uses for its own batch and work stealing.
+ * that the dispatcher uses for its carry slot and for work stealing.
  *
  * <p>Lifecycle:
  * <ul>

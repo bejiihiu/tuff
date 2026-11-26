@@ -2,6 +2,8 @@ package kz.bejiihiu.tuff.api.compute;
 
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -26,10 +28,12 @@ import kz.bejiihiu.tuff.compute.ComputeTaskType;
  *
  * <p>A task body runs on a compute worker and therefore must not touch world state. The adapter
  * reports failures of the task body to its failure handler; it never lets them escape into the
- * engine or the caller.
+ * engine or the caller. The handler runs on the thread that completed the task future, normally a
+ * compute worker, so it must not touch world state either; it is meant for logging and for
+ * releasing plugin owned resources.
  *
- * <p>Rejections are normal: the queue may be full, the consumer may be disabled, or the engine may
- * be shutting down. {@link RejectionPolicy} decides what happens then. {@link #shutdown()} only
+ * <p>Rejection is normal: the queue may be full, the consumer may be disabled, or the engine may be
+ * shutting down. {@link RejectionPolicy} decides what happens then. {@link #shutdown()} only
  * detaches this adapter; it never shuts the shared engine down.
  */
 public final class ComputeExecutor implements Executor {
@@ -125,7 +129,10 @@ public final class ComputeExecutor implements Executor {
      * it in.
      *
      * <p>The command may run on a worker thread or, with caller-runs, directly on the calling
-     * thread. It must never touch mutable world state.
+     * thread. It must never touch mutable world state. A failure of the task body is delivered to the
+     * failure handler as the original throwable, with any
+     * {@link CompletionException} or {@link ExecutionException} wrapper removed; the handler runs on
+     * the thread that completed the task future.
      *
      * @param command the work to execute
      * @throws NullPointerException      if {@code command} is {@code null}
@@ -160,7 +167,7 @@ public final class ComputeExecutor implements Executor {
                 return;
             }
             try {
-                this.failureHandler.accept(failure);
+                this.failureHandler.accept(unwrap(failure));
             } catch (final Throwable throwable) {
                 LOGGER.log(System.Logger.Level.ERROR, "The compute executor failure handler threw", throwable);
             }
@@ -226,6 +233,26 @@ public final class ComputeExecutor implements Executor {
 
     private static Consumer<Throwable> logFailure() {
         return throwable -> LOGGER.log(System.Logger.Level.ERROR, "A compute task submitted through ComputeExecutor failed", throwable);
+    }
+
+    /**
+     * Peels {@link CompletionException} and {@link ExecutionException} wrappers so the failure
+     * handler sees the throwable the task actually threw.
+     *
+     * <p>CompletableFuture usually passes the raw throwable, but a stage produced by
+     * {@code thenApply}/{@code join} wraps it, and an adapter must not leak that difference to the
+     * plugin.
+     *
+     * @param throwable failure to unwrap
+     * @return the innermost cause, or the argument when it is not a wrapper
+     */
+    private static Throwable unwrap(final Throwable throwable) {
+        Throwable current = throwable;
+        while ((current instanceof CompletionException || current instanceof ExecutionException)
+            && current.getCause() != null) {
+            current = current.getCause();
+        }
+        return current;
     }
 
     /**

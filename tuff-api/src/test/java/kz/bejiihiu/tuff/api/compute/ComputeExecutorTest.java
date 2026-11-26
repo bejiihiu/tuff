@@ -1,5 +1,7 @@
 package kz.bejiihiu.tuff.api.compute;
 
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -125,6 +127,28 @@ class ComputeExecutorTest {
         });
 
         assertSame(failure, reported.get());
+    }
+
+    @Test
+    void wrappedFailuresAreUnwrappedBeforeTheyReachTheHandler() {
+        final TestScheduler scheduler = new TestScheduler();
+        scheduler.wrapFailuresWith(throwable -> new CompletionException(new ExecutionException(throwable)));
+        final AtomicReference<Throwable> reported = new AtomicReference<>();
+        final ComputeExecutor executor = new ComputeExecutor(
+            scheduler,
+            "unit-test",
+            ComputePriority.NORMAL,
+            ComputeTaskType.GENERAL,
+            ComputeExecutor.RejectionPolicy.CALLER_RUNS,
+            reported::set
+        );
+        final IllegalStateException failure = new IllegalStateException("task failed");
+
+        executor.execute(() -> {
+            throw failure;
+        });
+
+        assertSame(failure, reported.get(), "the handler must see the throwable the task threw");
     }
 
     @Test

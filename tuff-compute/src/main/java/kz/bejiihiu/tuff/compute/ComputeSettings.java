@@ -112,9 +112,10 @@ public record ComputeSettings(
      * Worker pool sizing.
      *
      * <p>{@code threads} is either a fixed worker count or {@code -1} for automatic sizing, in which
-     * case {@code minThreads} is honoured as a floor and {@code maxThreads} as a ceiling. Workers
-     * above the minimum are created lazily when the queue backs up and are retired after
-     * {@code keepAlive} without work.
+     * case {@code minThreads} is honoured as a floor and {@code maxThreads} as a ceiling. A positive
+     * count is still capped by the resolved maximum, which is the processor budget while
+     * {@code maxThreads} is {@code -1}. Workers above the minimum are created lazily when the queue
+     * backs up and are retired after {@code keepAlive} without work.
      *
      * @param threads           fixed worker count, or {@code -1} to size automatically
      * @param minThreads        minimum number of workers kept alive, at least {@code 1}
@@ -267,8 +268,10 @@ public record ComputeSettings(
      * Dispatch strategy and fairness options.
      *
      * @param strategy       how the next task is chosen when several are runnable
-     * @param workStealing   whether an idle worker may take a task that is currently owned by another
-     *                       worker's local batch; only enable once benchmarks show it helps
+     * @param workStealing   whether an idle worker may, when the normal dispatch order has nothing
+     *                       runnable for it, take the next eligible task from another consumer's
+     *                       stream; the queue has no per worker batches. Only enable once benchmarks
+     *                       show it helps
      * @param priorityAging  whether waiting tasks gain effective priority over time so low priority
      *                       work cannot starve
      * @param agingInterval  how long a task waits before it gains one aging step, must be positive
@@ -521,7 +524,8 @@ public record ComputeSettings(
         /**
          * Returns the default adaptive options.
          *
-         * @return disabled, one to pool size, five second window, twenty samples, gentle AIMD steps
+         * @return disabled, one to the worker ceiling, five second window, twenty samples, gentle
+         *     AIMD steps
          */
         public static Adaptive defaults() {
             return new Adaptive(false, 1, -1, Duration.ofSeconds(5), 20, 0.1d, 0.5d, 0.9d);

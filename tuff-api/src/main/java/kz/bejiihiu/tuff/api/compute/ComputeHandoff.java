@@ -105,8 +105,7 @@ public final class ComputeHandoff {
      * @param result   future of the computation
      * @param apply    consumer of the result, runs on the owning region thread
      * @param <T>      type of the computed value
-     * @throws NullPointerException     if an argument is {@code null} or the location has no world
-     * @throws IllegalArgumentException if the location's world is not loaded
+     * @throws NullPointerException if an argument is {@code null} or the location has no world
      */
     public static <T> void toRegion(
         final Plugin plugin,
@@ -130,8 +129,7 @@ public final class ComputeHandoff {
      * @param apply     consumer of the result, runs on the owning region thread
      * @param onFailure handler for a failed computation or a failed delivery
      * @param <T>       type of the computed value
-     * @throws NullPointerException     if an argument is {@code null} or the location has no world
-     * @throws IllegalArgumentException if the location's world is not loaded
+     * @throws NullPointerException if an argument is {@code null} or the location has no world
      */
     public static <T> void toRegion(
         final Plugin plugin,

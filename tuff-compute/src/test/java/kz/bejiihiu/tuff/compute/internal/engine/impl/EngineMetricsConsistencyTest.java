@@ -186,6 +186,22 @@ class EngineMetricsConsistencyTest {
                 () -> compute.submit(() -> "overflow")
             );
             assertEquals(ComputeRejectedException.Reason.QUEUE_FULL, rejected.reason());
+
+            // check the invariant while work is actually in flight, not only in the trivial 0/0 state
+            assertEventually("the blocked body is visible as an active worker", Duration.ofSeconds(5), () -> {
+                final SchedulerMetrics sample = compute.metrics();
+                return sample.activeWorkers() == 1 && sample.queuedTasks() > 0;
+            });
+            final SchedulerMetrics inFlight = compute.metrics();
+            assertEquals(1, inFlight.activeWorkers(), "one worker is inside the blocked body");
+            assertTrue(inFlight.queuedTasks() > 0, "the fillers must still be queued");
+            assertEquals(
+                inFlight.submittedTasks(),
+                inFlight.completedTasks() + inFlight.failedTasks() + inFlight.cancelledTasks()
+                    + inFlight.queuedTasks() + inFlight.activeWorkers(),
+                "the counters must add up while tasks are queued and running"
+            );
+
             blockedRelease.countDown();
             assertEquals("second-blocker", secondBlocker.get(10L, TimeUnit.SECONDS));
             for (final CompletableFuture<String> filler : fillers) {

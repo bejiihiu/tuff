@@ -33,8 +33,12 @@ public record ComputeConsumer(
     /**
      * Validates and freezes the consumer.
      *
-     * @throws IllegalArgumentException if the id or display name is blank, the task types are empty
-     *     or the consumer may not submit anything because its policy is disabled
+     * <p>A disabled policy is legal and does not block registration: the consumer exists and keeps
+     * its metrics, but every submission is rejected with
+     * {@link ComputeRejectedException.Reason#CONSUMER_DISABLED} until the policy is enabled again.
+     *
+     * @throws IllegalArgumentException if the id or display name is blank, or no task type is
+     *     allowed
      * @throws NullPointerException if any argument is {@code null}
      */
     public ComputeConsumer {

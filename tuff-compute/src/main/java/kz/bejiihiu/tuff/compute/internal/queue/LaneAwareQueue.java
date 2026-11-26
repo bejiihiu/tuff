@@ -51,7 +51,10 @@ public interface LaneAwareQueue extends ComputeQueue {
     @Nullable QueueEntry poll(Lane lane, int levelMask, ConsumerAdmission admission);
 
     /**
-     * Steals an eligible entry of another batch for one lane.
+     * Takes an eligible entry outside the normal dispatch order for one lane.
+     *
+     * <p>Same rotation and admission rules as {@link #steal(int, ConsumerAdmission)}, with entries
+     * outside {@code levelMask} skipped as in {@link #poll(Lane, int, ConsumerAdmission)}.
      *
      * @param thiefIndex zero based index of the stealing worker
      * @param lane       lane the caller is dispatching for

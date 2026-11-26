@@ -37,6 +37,7 @@ class EngineShutdownSubmitRaceTest {
         );
         final List<ComputeTaskHandle<Integer>> accepted = new CopyOnWriteArrayList<>();
         final CountDownLatch start = new CountDownLatch(1);
+        final CountDownLatch acceptedAtLeastOne = new CountDownLatch(1);
         final AtomicBoolean shuttingDown = new AtomicBoolean();
         final List<Thread> threads = new CopyOnWriteArrayList<>();
 
@@ -51,6 +52,7 @@ class EngineShutdownSubmitRaceTest {
                             ComputePriority.NORMAL,
                             () -> 1
                         )));
+                        acceptedAtLeastOne.countDown();
                     } catch (ComputeRejectedException | ComputeShutdownException _) {
                         // expected once the queue is full or closed
                     }
@@ -61,7 +63,10 @@ class EngineShutdownSubmitRaceTest {
         }
 
         start.countDown();
-        Thread.sleep(20L);
+        assertTrue(
+            acceptedAtLeastOne.await(30L, TimeUnit.SECONDS),
+            "the producers must accept at least one task before shutdown"
+        );
         compute.shutdown(Duration.ofMillis(100L));
         shuttingDown.set(true);
         for (final Thread thread : threads) {

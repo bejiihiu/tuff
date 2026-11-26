@@ -11,8 +11,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.UnaryOperator;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputeConsumer;
 import kz.bejiihiu.tuff.compute.ComputePriority;
@@ -44,6 +46,7 @@ final class TestScheduler implements AsyncComputeScheduler {
 
     private final AtomicReference<SchedulerState> state = new AtomicReference<>(SchedulerState.RUNNING);
     private final AtomicReference<FailureMode> failureMode = new AtomicReference<>(FailureMode.NONE);
+    private final AtomicReference<UnaryOperator<Throwable>> failureWrapper = new AtomicReference<>(UnaryOperator.identity());
     private final AtomicLong taskIds = new AtomicLong();
     private final List<Submission> submissions = new CopyOnWriteArrayList<>();
     private final Map<String, ComputeConsumer> consumers = new ConcurrentHashMap<>();
@@ -54,6 +57,16 @@ final class TestScheduler implements AsyncComputeScheduler {
 
     void failWith(final FailureMode mode) {
         this.failureMode.set(Objects.requireNonNull(mode, "mode"));
+    }
+
+    /**
+     * Wraps every task failure before completing its future, so tests can prove that an adapter
+     * removes {@link CompletionException} and {@link ExecutionException} layers.
+     *
+     * @param wrapper wrapper applied to the throwable thrown by the task
+     */
+    void wrapFailuresWith(final UnaryOperator<Throwable> wrapper) {
+        this.failureWrapper.set(Objects.requireNonNull(wrapper, "wrapper"));
     }
 
     @Override
@@ -94,7 +107,7 @@ final class TestScheduler implements AsyncComputeScheduler {
         try {
             future.complete(Objects.requireNonNull(task.execute(), "task returned null"));
         } catch (final Throwable throwable) {
-            future.completeExceptionally(throwable);
+            future.completeExceptionally(this.failureWrapper.get().apply(throwable));
         }
         return future;
     }

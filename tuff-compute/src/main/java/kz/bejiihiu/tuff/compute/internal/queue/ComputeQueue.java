@@ -123,16 +123,23 @@ public interface ComputeQueue {
     @Nullable QueueEntry poll(ConsumerAdmission admission);
 
     /**
-     * Steals a task from the batch owned by another worker.
+     * Takes a task outside the normal dispatch order, from another consumer's stream.
      *
-     * <p>Only called when work stealing is enabled. The thief index is used to keep the stealing
-     * order stable, so workers do not all steal from the same victim at the same time. The returned
-     * entry is removed from the queue exactly like with {@link #poll(ConsumerAdmission)}, and the
-     * same admission rules apply.
+     * <p>Only called when work stealing is enabled and {@link #poll(ConsumerAdmission)} found nothing
+     * runnable. There are no per worker batches: every worker draws from the same queue, so this
+     * method walks the registered consumers starting at {@code thiefIndex} modulo the consumer
+     * count and returns at most one entry, in that consumer's own dispatch order, skipping any
+     * consumer whose admission check fails. The rotation only spreads idle thieves over different
+     * consumers; it does not change the order inside a consumer.
      *
-     * @param thiefIndex zero based index of the stealing worker
+     * <p>The returned entry is claimed and unlinked exactly like one returned by
+     * {@link #poll(ConsumerAdmission)}, and its consumer is charged the same dispatch turn.
+     *
+     * @param thiefIndex zero based index of the stealing worker, used only to rotate the starting
+     *                   consumer
      * @param admission  admission check, typically the {@link QuotaController}
-     * @return a stolen entry, or {@code null} if stealing is disabled or nothing is available
+     * @return a stolen entry, or {@code null} if stealing is disabled or nothing is both eligible and
+     *     admitted
      */
     @Nullable QueueEntry steal(int thiefIndex, ConsumerAdmission admission);
 

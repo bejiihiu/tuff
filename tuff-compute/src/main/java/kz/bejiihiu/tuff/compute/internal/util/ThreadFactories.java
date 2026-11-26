@@ -19,8 +19,10 @@ public final class ThreadFactories {
      * Creates a factory for platform threads.
      *
      * @param namePrefix prefix for thread names, must not be blank
-     * @param daemon     whether created threads are daemons; server pools normally use
-     *                   {@code false} so a stuck task is visible in a thread dump
+     * @param daemon     whether created threads are daemons. Production pools pass {@code true}: a
+     *                   worker stuck in user code must not keep the JVM alive once the server has
+     *                   started its own shutdown sequence. Daemon threads still appear in a thread
+     *                   dump, so this flag does not hide a stuck worker from diagnostics
      * @return the factory
      */
     public static ThreadFactory platform(final String namePrefix, final boolean daemon) {
@@ -37,8 +39,8 @@ public final class ThreadFactories {
      * Creates a factory for virtual threads.
      *
      * <p>Virtual threads are a poor fit for CPU bound compute because they do not add parallelism,
-     * they only make blocking cheaper. The factory exists for experiments and for pools that mix
-     * compute with blocking IO; the default scheduler configuration never uses it.
+     * they only make blocking cheaper. The compute engine uses this factory for its bounded virtual
+     * lane, which carries LOW and spilled NORMAL work, and never for platform workers.
      *
      * @param namePrefix prefix for thread names, must not be blank
      * @return the factory
