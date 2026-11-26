@@ -42,7 +42,7 @@ public final class FoliaRegionTickProvider implements RegionTickProvider {
     private final LongSupplier nanoTime;
     private final Object lock = new Object();
 
-    private List<RegionReading> last = List.of();
+    private volatile List<RegionReading> last = List.of();
     private long lastReadNanos = Long.MIN_VALUE;
 
     /**
