@@ -4,14 +4,11 @@ import ca.spottedleaf.moonrise.common.util.MoonriseCommon;
 import io.papermc.paper.threadedregions.TickRegionScheduler;
 import io.papermc.paper.threadedregions.TickRegions;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import kz.bejiihiu.tuff.api.compute.TuffCompute;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
-import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.config.ComputeThreadBudget;
 import kz.bejiihiu.tuff.compute.config.ConfigDiff;
 import kz.bejiihiu.tuff.compute.config.ConfigLoadResult;
@@ -49,13 +46,13 @@ import org.jspecify.annotations.Nullable;
 public final class ComputeBootstrap {
 
     private static final Logger LOGGER = LogManager.getLogger("Tuff/Compute");
-    private static final String CONSUMER_PREFIX = "async-compute.consumers.";
 
     private static final Object LOCK = new Object();
 
     private static volatile ComputeStatus status = ComputeStatus.notInitialised();
     private static volatile @Nullable TuffComputeConfig config;
     private static volatile List<String> lastAppliedConsumers = List.of();
+    private static volatile List<String> lastDeferredConsumers = List.of();
 
     private ComputeBootstrap() {
     }
@@ -197,27 +194,42 @@ public final class ComputeBootstrap {
         if (loaded == null || !status.isRunning()) {
             return null;
         }
+        lastAppliedConsumers = List.of();
+        lastDeferredConsumers = List.of();
         final ConfigLoadResult result = loaded.reload();
-        final List<String> restartRequired = result.diff().restartRequiredPaths();
-        final List<String> deferred = new ArrayList<>();
-        for (final String path : result.diff().changedPaths()) {
-            if (restartRequired.contains(path) || !path.startsWith(CONSUMER_PREFIX)) {
-                deferred.add(path);
-            }
-        }
-        return new ReloadReport(result, lastAppliedConsumers, deferred);
+        final List<String> applied = lastAppliedConsumers;
+        final List<String> deferredConsumers = lastDeferredConsumers;
+        return new ReloadReport(
+            result,
+            applied,
+            deferredConsumers,
+            ConsumerReload.deferredPaths(result.diff(), applied, deferredConsumers)
+        );
     }
 
     private static void startEngine(final ComputeSettings settings) {
         final int budget = ComputeThreadBudget.resolve(Runtime.getRuntime().availableProcessors());
+        final ComputeSettings.Workers workers = settings.workers();
+        final int resolved = workers.resolveThreadCount(budget);
         @Nullable AsyncComputeScheduler scheduler = null;
         try {
             scheduler = ComputeSchedulers.create(settings, ComputeClock.system(), budget);
             scheduler.start();
-            TuffCompute.install(scheduler);
-            status = ComputeStatus.running(scheduler);
-            LOGGER.info("Tuff compute enabled: {} worker(s) (processor budget {}), queue capacity {}, scheduling {}",
-                settings.workers().resolveThreadCount(budget), budget, settings.queue().capacity(), settings.scheduling().strategy());
+            final LimitedConsumerScheduler guarded = LimitedConsumerScheduler.wrap(scheduler);
+            TuffCompute.install(guarded);
+            status = ComputeStatus.running(guarded);
+            final String requested = workers.automaticThreadCount() ? "auto" : Integer.toString(workers.threads());
+            LOGGER.info("Tuff compute enabled: {} worker(s) (requested {}, processor budget {}), queue capacity {}, scheduling {}",
+                resolved, requested, budget, settings.queue().capacity(), settings.scheduling().strategy());
+            if (settings.consumers().allowDynamicRegistration()) {
+                LOGGER.info("Tuff compute: consumer ids registered on demand are capped at {} (configured ids are not counted)",
+                    LimitedConsumerScheduler.MAX_DYNAMIC_CONSUMERS);
+            }
+            if (budgetClampsRequestedThreads(workers, budget)) {
+                LOGGER.warn("Tuff compute: {} worker(s) were requested, but the processor budget of {} and max-threads ({}) "
+                        + "leave room for {}; the pool runs with {} worker(s). /tuff shows the requested and the live count.",
+                    workers.threads(), budget, workers.maxThreads() == -1 ? "auto" : workers.maxThreads(), resolved, resolved);
+            }
         } catch (final Throwable ex) {
             status = ComputeStatus.failed();
             LOGGER.error("The Tuff compute engine failed to start; the server runs without it", ex);
@@ -228,12 +240,29 @@ public final class ComputeBootstrap {
     }
 
     /**
+     * Checks whether the configured {@code workers.threads} is lowered by the pool ceiling.
+     *
+     * <p>The ceiling comes from {@code max-threads} when it is set, otherwise from the processor
+     * budget. This is the predicate behind the startup warning; it never touches the engine.
+     *
+     * @param workers configured workers section
+     * @param budget  processors the pool may use
+     * @return {@code true} when the effective count is lower than the requested one
+     */
+    static boolean budgetClampsRequestedThreads(final ComputeSettings.Workers workers, final int budget) {
+        return workers.threads() > 0 && workers.resolveThreadCount(budget) < workers.threads();
+    }
+
+    /**
      * Applies one configuration snapshot to a running engine.
      *
      * <p>Only consumer policies can change on a live pool: {@code AsyncComputeScheduler} keeps its
      * settings as an immutable snapshot, so worker sizing, queue capacity and the metrics switches are
      * baked into the engine created at startup. Those keys are reported as "after a restart" instead
-     * of being silently ignored. Called with the configuration lock held, so it must stay cheap.
+     * of being silently ignored. Even among consumers, only the ones whose configured policy really
+     * changed are touched, and a policy a plugin passed to {@code registerConsumer} stays unless the
+     * file has an explicit override for that id. Called with the configuration lock held, so it must
+     * stay cheap.
      *
      * @param previous the settings the engine was running with
      * @param updated  the newly published settings
@@ -241,29 +270,22 @@ public final class ComputeBootstrap {
      */
     private static void applyLive(final ComputeSettings previous, final ComputeSettings updated, final ConfigDiff diff) {
         lastAppliedConsumers = List.of();
+        lastDeferredConsumers = List.of();
         final @Nullable AsyncComputeScheduler scheduler = status.engine().orElse(null);
         if (scheduler == null) {
             return;
         }
-        final List<String> applied = new ArrayList<>();
-        for (final String consumerId : scheduler.consumerIds()) {
-            final ConsumerPolicy before = previous.consumers().policyFor(consumerId);
-            final ConsumerPolicy after = updated.consumers().policyFor(consumerId);
-            if (before.equals(after)) {
-                continue;
-            }
-            try {
-                scheduler.updateConsumerPolicy(consumerId, after);
-                applied.add(consumerId);
-            } catch (IllegalArgumentException _) {
-                // the consumer was unregistered between listing and updating; nothing to apply
-            }
+        final ConsumerReload.Outcome outcome = ConsumerReload.apply(scheduler, previous, updated);
+        lastAppliedConsumers = outcome.applied();
+        lastDeferredConsumers = outcome.deferred();
+        if (!lastAppliedConsumers.isEmpty()) {
+            LOGGER.info("Tuff compute: applied new consumer policies to {}", String.join(", ", lastAppliedConsumers));
         }
-        applied.sort(Comparator.naturalOrder());
-        lastAppliedConsumers = List.copyOf(applied);
-        if (!applied.isEmpty()) {
-            LOGGER.info("Tuff compute: applied new consumer policies to {}", String.join(", ", applied));
+        if (!lastDeferredConsumers.isEmpty()) {
+            LOGGER.info("Tuff compute: kept the new consumer policies for ids that are not registered yet: {}",
+                String.join(", ", lastDeferredConsumers));
         }
+        LOGGER.debug("Tuff compute reload changed {}", diff.summary());
     }
 
     private static void shutdownQuietly(final AsyncComputeScheduler scheduler) {

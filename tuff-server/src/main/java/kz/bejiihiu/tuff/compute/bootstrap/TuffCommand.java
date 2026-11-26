@@ -23,8 +23,9 @@ import org.jspecify.annotations.Nullable;
  * <p>Registered through the Bukkit command map next to {@code /tps}, so it survives {@code /reload}
  * and works from the console and from players alike. Reading metrics is lock free and can happen on
  * whatever thread the sender is on; the reload hops to the global tick thread because it mutates
- * shared engine state, exactly like the Paper reload command does. A disabled engine is never an
- * error: the command says so and returns.
+ * shared engine state, exactly like the Paper reload command does. Flight Recorder operations run on
+ * their own service thread and report back when they finish, so a dump never stalls the region that
+ * ran the command. A disabled engine is never an error: the command says so and returns.
  *
  * <p>Permission {@code tuff.command.compute}, granted to operators by default.
  */
@@ -145,7 +146,8 @@ public final class TuffCommand extends Command implements TabCompleter {
                     + "recording would stay empty. Enable them and restart the server first.", NamedTextColor.RED));
             return;
         }
-        this.sendResult(sender, ComputeJfr.start());
+        sender.sendMessage(Component.text("Starting the JFR recording...", NamedTextColor.GRAY));
+        ComputeJfr.start(result -> this.sendResult(sender, result));
     }
 
     private void controlRecording(final CommandSender sender, final boolean stop) {
@@ -154,7 +156,13 @@ public final class TuffCommand extends Command implements TabCompleter {
             this.send(sender, ComputeReport.unavailable(status));
             return;
         }
-        this.sendResult(sender, stop ? ComputeJfr.stop() : ComputeJfr.dump());
+        sender.sendMessage(Component.text(
+            stop ? "Stopping the JFR recording..." : "Dumping the JFR recording...", NamedTextColor.GRAY));
+        if (stop) {
+            ComputeJfr.stop(result -> this.sendResult(sender, result));
+        } else {
+            ComputeJfr.dump(result -> this.sendResult(sender, result));
+        }
     }
 
     private void sendResult(final CommandSender sender, final ComputeJfr.Result result) {

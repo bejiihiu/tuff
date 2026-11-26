@@ -85,7 +85,7 @@ public final class ComputeReport {
         lines.add(INDENT + "execution: avg " + formatDuration(metrics.averageExecutionTime())
             + ", longest " + formatDuration(metrics.longestExecutionTime()));
         lines.add(INDENT + "cpu: " + formatCpu(metrics.cpuUtilization()));
-        lines.add(INDENT + "settings: workers " + describeWorkers(settings.workers())
+        lines.add(INDENT + "settings: workers " + describeWorkers(settings.workers(), metrics.totalWorkers())
             + ", queue " + settings.queue().capacity() + " " + settings.queue().overflowPolicy()
             + ", scheduling " + settings.scheduling().strategy());
         return List.copyOf(lines);
@@ -155,6 +155,11 @@ public final class ComputeReport {
             if (!report.appliedConsumerIds().isEmpty()) {
                 lines.add(INDENT + "applied now: consumer policies for " + String.join(", ", report.appliedConsumerIds()));
             }
+            if (!report.deferredConsumerIds().isEmpty()) {
+                lines.add(INDENT + "saved for a consumer id that is not registered yet: "
+                    + String.join(", ", report.deferredConsumerIds())
+                    + " (the policy applies when that consumer registers)");
+            }
             if (!report.deferredPaths().isEmpty()) {
                 lines.add(INDENT + "takes effect after a restart: " + String.join(", ", report.deferredPaths()));
             }
@@ -212,10 +217,10 @@ public final class ComputeReport {
         return state.name().toLowerCase(Locale.ROOT).replace('_', ' ');
     }
 
-    private static String describeWorkers(final ComputeSettings.Workers workers) {
-        final String count = workers.automaticThreadCount() ? "auto" : Integer.toString(workers.threads());
+    private static String describeWorkers(final ComputeSettings.Workers workers, final int liveWorkers) {
+        final String requested = workers.automaticThreadCount() ? "auto" : Integer.toString(workers.threads());
         final String maximum = workers.maxThreads() == -1 ? "auto" : Integer.toString(workers.maxThreads());
-        return count + " (min " + workers.minThreads() + ", max " + maximum
+        return "requested " + requested + ", " + liveWorkers + " live (min " + workers.minThreads() + ", max " + maximum
             + ", keep-alive " + workers.keepAlive().toSeconds() + "s)";
     }
 

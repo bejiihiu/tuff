@@ -78,7 +78,7 @@ class ComputeReportTest {
             assertTrue(report.contains("queue wait: avg "), report);
             assertTrue(report.contains("execution: avg "), report);
             assertTrue(report.contains("cpu: "), report);
-            assertTrue(report.contains("settings: workers 2 (min 1, max 2"), report);
+            assertTrue(report.contains("settings: workers requested 2, 2 live (min 1, max 2"), report);
             assertTrue(report.contains("queue " + QUEUE_CAPACITY + " REJECT"), report);
         } finally {
             stopScheduler(scheduler);
@@ -134,6 +134,7 @@ class ComputeReportTest {
         final ReloadReport report = new ReloadReport(
             result,
             List.of("default"),
+            List.of(),
             List.of("async-compute.queue.capacity", "async-compute.workers.threads")
         );
 
@@ -150,7 +151,7 @@ class ComputeReportTest {
     void aReloadWithoutChangesSaysSo() {
         final ConfigLoadResult result = new ConfigLoadResult(
             ComputeSettings.defaults(), List.of(), ConfigDiff.empty(), false, false);
-        final List<String> lines = ComputeReport.reload(new ReloadReport(result, List.of(), List.of()));
+        final List<String> lines = ComputeReport.reload(new ReloadReport(result, List.of(), List.of(), List.of()));
 
         assertEquals(1, lines.size());
         assertTrue(lines.get(0).contains("nothing changed"), lines.get(0));
@@ -160,7 +161,7 @@ class ComputeReportTest {
     void aReloadThatCouldNotReadTheFileKeepsThePreviousSettings() {
         final ConfigLoadResult result = new ConfigLoadResult(
             ComputeSettings.defaults(), List.of(), ConfigDiff.empty(), false, true);
-        final List<String> lines = ComputeReport.reload(new ReloadReport(result, List.of(), List.of()));
+        final List<String> lines = ComputeReport.reload(new ReloadReport(result, List.of(), List.of(), List.of()));
 
         assertTrue(lines.get(0).contains("could not be read"), lines.get(0));
         assertTrue(lines.get(0).contains("previous settings stay in effect"), lines.get(0));
@@ -172,9 +173,23 @@ class ComputeReportTest {
             List.of("async-compute.queue.capacity"), List.of("async-compute.queue.capacity"));
         final ConfigLoadResult result = new ConfigLoadResult(ComputeSettings.defaults(), List.of(), diff, false, false);
         final String report = String.join("\n", ComputeReport.reload(
-            new ReloadReport(result, List.of(), List.of("async-compute.queue.capacity"))));
+            new ReloadReport(result, List.of(), List.of(), List.of("async-compute.queue.capacity"))));
 
         assertFalse(report.contains("applied now"), report);
+    }
+
+    @Test
+    void aReloadForAnUnregisteredConsumerIsReportedAsSavedNotApplied() {
+        final ConfigDiff diff = new ConfigDiff(
+            List.of("async-compute.consumers.ghost.max-concurrent"), List.of());
+        final ConfigLoadResult result = new ConfigLoadResult(ComputeSettings.defaults(), List.of(), diff, false, false);
+
+        final String report = String.join("\n", ComputeReport.reload(
+            new ReloadReport(result, List.of(), List.of("ghost"), List.of())));
+
+        assertFalse(report.contains("applied now"), report);
+        assertTrue(report.contains("saved for a consumer id that is not registered yet: ghost"), report);
+        assertFalse(report.contains("takes effect after a restart"), report);
     }
 
     @Test

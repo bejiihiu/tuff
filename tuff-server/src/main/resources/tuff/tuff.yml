@@ -21,7 +21,9 @@ async-compute:
 
   workers:
     # Worker threads. -1 sizes the pool from the CPU budget left after the region, chunk and IO
-    # threads already running on the machine; a positive number is used as is.
+    # threads already running on the machine. A positive number is requested, but the pool ceiling
+    # can still lower it: max-threads when it is set, otherwise the processor budget. The startup
+    # log warns when that happens, and /tuff shows both the requested and the live count.
     threads: -1
     # Workers kept alive while idle. At least 1.
     min-threads: 2
@@ -61,7 +63,9 @@ async-compute:
 
   consumers:
     # Whether a submission under an unknown consumer id registers that consumer on the fly with the
-    # policy from "default". When false such submissions are rejected as unknown.
+    # policy from "default". When false such submissions are rejected as unknown. At most 256 ids
+    # can be registered this way at the same time; further unknown ids are rejected, and a
+    # configured consumer section is never counted against that limit.
     allow-dynamic-registration: true
 
     # Policy for consumers without a section of their own, and the base for the overrides below:
@@ -131,7 +135,8 @@ async-compute:
     enabled: false
     # Lowest limit the controller may pick. At least 1.
     min-concurrency: 1
-    # Highest limit, or -1 for the current pool size.
+    # Highest limit, or -1 for the whole worker pool with no adaptive-specific cap. The controller
+    # never asks the pool for more than it can run, so -1 is not "current size".
     max-concurrency: -1
     # Seconds over which samples are aggregated before a decision. Must be positive.
     sample-window-seconds: 5

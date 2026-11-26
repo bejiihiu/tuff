@@ -308,7 +308,17 @@ final class ComputeConfigParser {
         }
         final boolean enabled = readBoolean(section, "enabled", fallback.enabled(), ADAPTIVE_PATH + ".enabled", problems);
         final int minConcurrency = readInt(section, "min-concurrency", fallback.minConcurrency(), ADAPTIVE_PATH + ".min-concurrency", problems);
-        final int maxConcurrency = readInt(section, "max-concurrency", fallback.maxConcurrency(), ADAPTIVE_PATH + ".max-concurrency", problems);
+        int maxConcurrency = readInt(section, "max-concurrency", fallback.maxConcurrency(), ADAPTIVE_PATH + ".max-concurrency", problems);
+        if (maxConcurrency != -1 && maxConcurrency < minConcurrency) {
+            // -1 is "the whole pool, no personal cap"; anything else must leave room for the floor,
+            // otherwise the record would throw and take every other adaptive key down with it
+            problems.add(new ConfigProblem(
+                ADAPTIVE_PATH + ".max-concurrency",
+                "must be -1 (the whole worker pool, no personal cap) or at least min-concurrency ("
+                    + minConcurrency + "), got " + maxConcurrency + "; using " + describeConcurrency(fallback.maxConcurrency())
+            ));
+            maxConcurrency = fallback.maxConcurrency();
+        }
         final Duration window = readSeconds(section, "sample-window-seconds", fallback.sampleWindow(), false, ADAPTIVE_PATH + ".sample-window-seconds", problems);
         final int minSamples = readInt(section, "min-samples", fallback.minSamples(), ADAPTIVE_PATH + ".min-samples", problems);
         final double increase = readDouble(section, "increase-step", fallback.increaseStep(), ADAPTIVE_PATH + ".increase-step", problems);
@@ -449,6 +459,10 @@ final class ComputeConfigParser {
             case final ConsumerPolicy.AbsoluteLimit absolute -> Integer.toString(absolute.permits());
             case final ConsumerPolicy.RelativeLimit relative -> Double.toString(relative.fraction());
         };
+    }
+
+    private static String describeConcurrency(final int maxConcurrency) {
+        return maxConcurrency == -1 ? "-1 (the whole pool)" : Integer.toString(maxConcurrency);
     }
 
     private static ComputeSettings.Scheduling.Strategy readStrategy(

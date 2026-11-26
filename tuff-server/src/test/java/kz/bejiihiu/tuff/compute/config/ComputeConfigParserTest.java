@@ -415,6 +415,33 @@ class ComputeConfigParserTest {
         assertThrows(IllegalArgumentException.class, () -> settings.workers().resolveThreadCount(0));
     }
 
+    @Test
+    void adaptiveMaxConcurrencyMinusOneMeansTheWholePool() {
+        final Parsed minusOne = parse("""
+            async-compute:
+              adaptive:
+                max-concurrency: -1
+            """);
+
+        assertTrue(minusOne.problems().isEmpty(), () -> "unexpected problems " + minusOne.problems());
+        assertEquals(-1, minusOne.settings().adaptive().maxConcurrency());
+    }
+
+    @Test
+    void adaptiveMaxConcurrencyBelowTheFloorIsReportedAtItsKey() {
+        for (final int broken : new int[] {-5, 0}) {
+            final Parsed parsed = parse("""
+                async-compute:
+                  adaptive:
+                    max-concurrency: %d
+                """.formatted(broken));
+
+            assertEquals(-1, parsed.settings().adaptive().maxConcurrency(),
+                "the default of -1 must stay in effect for " + broken);
+            assertProblem(parsed.problems(), "async-compute.adaptive.max-concurrency", "must be -1");
+        }
+    }
+
     private static void assertRelative(final double fraction, final ComputeSettings settings, final String consumerId) {
         final ConsumerPolicy policy = settings.consumers().overrides().get(consumerId);
         assertNotNull(policy, consumerId + " must be configured");
