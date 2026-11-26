@@ -8,6 +8,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import kz.bejiihiu.tuff.compute.ComputeSettings;
+import kz.bejiihiu.tuff.compute.bootstrap.ComputeUtmiAdapter;
 import kz.bejiihiu.tuff.threads.CoverageLevel;
 import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.PoolSnapshot;
@@ -96,6 +98,55 @@ class ThreadsBootstrapTest {
         assertEquals(ThreadsStatus.State.RUNNING, bootstrap.currentStatus().state());
         assertTrue(bootstrap.regionPoolRegistered());
         bootstrap.shutdown();
+    }
+
+    @Test
+    void theComputeAdapterFollowsTheManagedFlag() throws IOException {
+        final ThreadsBootstrap managed = new ThreadsBootstrap();
+        managed.startWith(new ThreadsConfig(this.write("""
+            thread-management:
+              enabled: true
+              execution-pools:
+                compute:
+                  managed: true
+            """)));
+
+        final ComputeUtmiAdapter adapter = managed.adapterFor(ComputeSettings.defaults());
+        assertNotNull(adapter, "a running layer must serve the engine");
+        assertTrue(adapter.isManaged());
+        assertEquals("utmi", adapter.source());
+        final PoolSnapshot compute = managed.currentStatus().snapshot().pool(PoolId.COMPUTE).orElseThrow();
+        assertEquals(CoverageLevel.L4, compute.coverage());
+        assertEquals(ComputeSettings.defaults().workers().minThreads(), compute.spec().minThreads());
+        managed.shutdown();
+    }
+
+    @Test
+    void anObserveOnlyLayerStillServesTheAdapterButNotThePorts() throws IOException {
+        final ThreadsBootstrap observe = new ThreadsBootstrap();
+        observe.startWith(new ThreadsConfig(this.write("""
+            thread-management:
+              enabled: true
+            """)));
+
+        final ComputeUtmiAdapter adapter = observe.adapterFor(ComputeSettings.defaults());
+        assertNotNull(adapter, "the pool is observed, which needs the probe");
+        assertFalse(adapter.isManaged());
+        final PoolSnapshot compute = observe.currentStatus().snapshot().pool(PoolId.COMPUTE).orElseThrow();
+        assertEquals(CoverageLevel.L1, compute.coverage(), "no flag means the engine keeps its own threads");
+        observe.shutdown();
+    }
+
+    @Test
+    void aDisabledLayerHasNoComputeAdapter() throws IOException {
+        final ThreadsBootstrap disabled = new ThreadsBootstrap();
+        disabled.startWith(new ThreadsConfig(this.write("""
+            thread-management:
+              enabled: false
+            """)));
+
+        assertNull(disabled.adapterFor(ComputeSettings.defaults()));
+        disabled.shutdown();
     }
 
     @Test

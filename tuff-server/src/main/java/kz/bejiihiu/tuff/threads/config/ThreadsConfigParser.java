@@ -36,6 +36,7 @@ final class ThreadsConfigParser {
     private static final String POOLS_PATH = SECTION + ".execution-pools";
     private static final String NETWORK_PATH = POOLS_PATH + ".network";
     private static final String CHUNK_PATH = POOLS_PATH + ".chunk-system";
+    private static final String COMPUTE_POOL_PATH = POOLS_PATH + ".compute";
     private static final String METRICS_PATH = SECTION + ".metrics";
 
     private static final Set<String> SETTINGS_KEYS = Set.of(
@@ -130,6 +131,8 @@ final class ThreadsConfigParser {
         flat.put(NETWORK_PATH + ".preserve-specialization", Boolean.toString(pools.network().preserveSpecialization()));
         flat.put(CHUNK_PATH + ".managed", Boolean.toString(pools.chunkSystem().managed()));
         flat.put(CHUNK_PATH + ".preserve-specialization", Boolean.toString(pools.chunkSystem().preserveSpecialization()));
+        flat.put(COMPUTE_POOL_PATH + ".managed", Boolean.toString(pools.compute().managed()));
+        flat.put(COMPUTE_POOL_PATH + ".preserve-specialization", Boolean.toString(pools.compute().preserveSpecialization()));
 
         final ThreadManagementSettings.Metrics metrics = settings.metrics();
         flat.put(METRICS_PATH + ".enabled", Boolean.toString(metrics.enabled()));
@@ -242,7 +245,10 @@ final class ThreadsConfigParser {
         final ThreadManagementSettings.PoolSettings chunk = parsePool(
             readSection(section, "chunk-system", CHUNK_PATH, problems), fallback.chunkSystem(), CHUNK_PATH, problems
         );
-        return new ThreadManagementSettings.Pools(network, chunk);
+        final ThreadManagementSettings.PoolSettings compute = parsePool(
+            readSection(section, "compute", COMPUTE_POOL_PATH, problems), fallback.compute(), COMPUTE_POOL_PATH, problems
+        );
+        return new ThreadManagementSettings.Pools(network, chunk, compute);
     }
 
     private static ThreadManagementSettings.PoolSettings parsePool(
@@ -401,9 +407,10 @@ final class ThreadsConfigParser {
         if (pools == null) {
             return;
         }
-        reportUnknownIn(pools, POOLS_PATH, Set.of("network", "chunk-system"), problems);
+        reportUnknownIn(pools, POOLS_PATH, Set.of("network", "chunk-system", "compute"), problems);
         reportUnknownIn(pools.getConfigurationSection("network"), NETWORK_PATH, POOL_KEYS, problems);
         reportUnknownIn(pools.getConfigurationSection("chunk-system"), CHUNK_PATH, POOL_KEYS, problems);
+        reportUnknownIn(pools.getConfigurationSection("compute"), COMPUTE_POOL_PATH, POOL_KEYS, problems);
     }
 
     private static void reportUnknownIn(

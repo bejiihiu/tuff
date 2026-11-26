@@ -301,7 +301,7 @@ public final class ThreadManagerImpl implements UnifiedThreadManager {
                 yield managed;
             }
             case COMPUTE, VIRTUAL -> {
-                final boolean managed = this.settings.asyncCompute().managed();
+                final boolean managed = this.settings.computeManaged();
                 if (!managed) {
                     reasons.add(DegradedReason.FEATURE_DISABLED);
                 } else if (!spec.coverage().managesThreads()) {
