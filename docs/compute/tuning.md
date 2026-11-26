@@ -32,7 +32,8 @@ The virtual lane is for blocking and IO-bound work, and as a deadlock breaker. I
 a CPU-bound task on the lane competes with the platform workers for the same cores.
 
 - Size `lanes.virtual.max-concurrent` to the downstream limit (database pool, HTTP connection pool, file
-  handles), not to the CPU count. `64` is a ceiling for blocking work, not a target.
+  handles), not to the CPU count. The default `64` is a starting point, not a ceiling: on blocking work the
+  lane keeps scaling with the limit until the downstream system or the consumer quota caps it.
 - Keep CPU-bound work on `NORMAL`/`HIGH` and set `normal-spill: false` if `NORMAL` is CPU-heavy.
 - Use `LOW` for work that may wait and may block (prefetch, cache warm-up, webhooks). Do not use `LOW` for a
   CPU render or a structure search.
@@ -41,11 +42,14 @@ a CPU-bound task on the lane competes with the platform workers for the same cor
   up to `max-concurrent` blocking tasks on the lane while platform work continues on the workers.
   `absolute(N)` is exactly `N` across both lanes, and `max-concurrent` is a hard cap on virtual bodies.
 
-Measured expectations on the test machine: for blocking work at the same concurrency the lane matches the
-platform pool (about 3.6k against 4.0k ops/s at eight 1 ms blocks); for CPU work it is about 2.3x slower;
-`NORMAL` spill was rare (~0.05% of tasks) and did not raise throughput. The lane's value is isolation — a
-blocked virtual task does not hold a platform worker — not extra throughput. See
-[Benchmarks § Execution lanes](benchmarks.md#execution-lanes).
+Measured expectations on the test machine (1 ms `Thread.sleep` body, eight platform workers): blocking
+throughput rises with the lane limit — **3 404 / 13 030 / 44 976 ops/s at `max-concurrent` 8 / 32 / 128**,
+against 3 730 ops/s for the eight-worker platform pool. At equal concurrency the lane matches the pool
+(3.4k against 3.7k), and above the worker count it keeps going instead of stopping. The limit is real
+capacity, not free: at 128 the run reached about three quarters of the `128 / 2.13 ms` ceiling, and a real
+deployment stops at the downstream system. For CPU work virtual threads add no parallelism and the lane is
+about **2.0x slower** than the platform pool at equal concurrency (57 k against 113 k ops/s).
+See [Benchmarks § Execution lanes](benchmarks.md#execution-lanes).
 
 ## Presets
 
@@ -267,7 +271,7 @@ may wait; if it is CPU-bound, `LOW` sends it to virtual threads and makes tick j
 | --- | --- | --- | --- |
 | Blocking IO: HTTP, database, disk, plugin APIs that wait | `LOW` | virtual | `lanes.virtual.max-concurrent` to the downstream pool; `spill-wait-millis` low if `NORMAL` IO also needs the lane |
 | CPU compute: rendering, pathfinding, structure search, serialisation | `NORMAL` (or `HIGH` when it gates a region) | platform | `workers.max-threads`/`threads` against the budget; `normal-spill: false` |
-| Bursty work: login waves, world events | `NORMAL` | platform, with spill as a tail valve | `queue.capacity`, per-consumer `max-queued-tasks`, `max-queue-wait-seconds`, modest spill depth |
+| Bursty work: login waves, world events | `NORMAL` | platform, spill as an escape hatch for blocking bursts | `queue.capacity`, per-consumer `max-queued-tasks`, `max-queue-wait-seconds`, modest spill depth |
 | Latency-critical: a player is waiting now | `CRITICAL`/`HIGH` | platform, never spill | `min-threads` high enough for the expected concurrency; do not rely on the lane |
 | Disposable cache warm-up, speculative prefetch | `LOW` | virtual | `max-concurrent` and `max-queue-wait-seconds`; rejects or expiry are acceptable |
 
@@ -276,15 +280,20 @@ only when a person is actually waiting.
 
 ## Spill thresholds
 
-Spill is a tail valve for `NORMAL` work, opened only while the platform lane is saturated. It uses two
-OR-ed triggers: the queue depth (`spill-queue-depth`) and the age of the oldest queued `NORMAL` task
+Spill is the `NORMAL` escape hatch, opened only while the platform lane is saturated. It uses two OR-ed
+triggers: the queue depth (`spill-queue-depth`) and the age of the oldest queued `NORMAL` task
 (`spill-wait-millis`).
 
-The measured effect was small: 1-3 spilled tasks per second (~0.05%) at a saturated eight-worker pool and no
-throughput change. That run predates the quota change that counts lane permits in the consumer capacity, so
-treat the rate as a lower bound rather than a property of the lane. The shape does not change: spill is a
-pressure valve for blocking work, not a second CPU pool and not a capacity plan. For blocking throughput,
-size `max-concurrent` to the downstream limit; for CPU work, add platform workers or remove work.
+On blocking `NORMAL` work it is a working fuse and an accelerator, not a last resort. With eight workers,
+`max-concurrent: 64`, `spill-wait-millis: 5` and `spill-queue-depth: 32`, a saturated single-consumer pool
+spilled **21 000–27 000 of ~32 000 tasks per iteration (~85%)**, and throughput went from 3 590 to
+26 672 ops/s (7.4x) while queue wait p50 dropped from 105–113 ms to 12.2 ms. The mechanism: the consumer
+quota counts lane permits, so the pump can claim `NORMAL` work the platform pool is queued behind.
+
+Treat those numbers as the shape, not as a promise. Spill is capped by `max-concurrent` and by the system the
+tasks block on, and it only helps because the tasks block. A CPU-bound `NORMAL` backlog gains nothing from
+virtual threads — same cores, extra hand-off — so keep `normal-spill: false` for CPU-heavy consumers. Under a
+very deep backlog, expect the spilled work to wait in the lane for a permit like any other queue.
 
 | Workload | `normal-spill` | `spill-wait-millis` | `spill-queue-depth` | Why |
 | --- | --- | --- | --- | --- |
@@ -310,7 +319,7 @@ to remove `NORMAL` spill entirely. `HIGH` and `CRITICAL` never spill regardless 
 | `virtual` counters stay at zero on a busy server | No `LOW` work and no spill condition | Expected for CPU-only loads; check `low-priority` and the spill keys if IO work exists |
 | Exactly two workers in idle | `min-threads: 2` | Normal; not a leak |
 | One consumer at `active / limit` while queue grows | Its own `consumers.<id>.max-concurrent` caps it, and virtual tasks also hold those slots | Raise that consumer's limit or split the work across consumer ids |
-| An empty `LOW` task costs ~0.1–0.2 ms even on an idle lane | Virtual thread launch and pump hand-off | Expected; keep latency-critical work on the platform lane and CPU work off the virtual lane |
+| An empty `LOW` task costs ~0.06–0.1 ms even on an idle lane | Virtual thread launch and pump hand-off | Expected; keep latency-critical work on the platform lane and CPU work off the virtual lane |
 
 ## Anti-patterns
 
@@ -319,8 +328,8 @@ to remove `NORMAL` spill entirely. `HIGH` and `CRITICAL` never spill regardless 
 - **Huge `max-concurrent` "just in case".** Virtual threads do not add CPU. A large limit for CPU-bound work
   increases contention; a large limit for blocking work overwhelms the database or HTTP pool.
 - **Using `LOW` for CPU work.** `LOW` is routed to the virtual lane and will compete with tick threads.
-- **Leaving `normal-spill: true` for CPU-bound `NORMAL` work.** The spill is a tail valve for blocking work,
-  not a second CPU pool.
+- **Leaving `normal-spill: true` for CPU-bound `NORMAL` work.** The spill is a capacity valve for blocking
+  work, not a second CPU pool.
 - **`DROP_OLDEST` where losing work is not acceptable.** It cancels the oldest queued task of that consumer;
   use `REJECT` and backpressure instead.
 - **Removing the bounded queue by setting an enormous capacity.** Capacity protects the heap; a queue of

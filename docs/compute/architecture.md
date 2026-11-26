@@ -249,7 +249,10 @@ tasks stay in the shared queue and the ordinary capacity, expiry and overflow ru
 back: while the lane serves it, the platform mask excludes it. `NORMAL` spill is different — it adds the
 virtual lane as an additional eligible executor; the platform mask still includes `NORMAL`, so whichever lane
 claims the task first runs it. Besides submission signals, the pump re-evaluates spill every 25 ms, because
-the platform lane can become saturated after a task was queued.
+the platform lane can become saturated after a task was queued. For a saturated *blocking* backlog this
+changes the shape of the load rather than trimming a tail: the measured spill run sent ~85% of `NORMAL` tasks
+to the lane, lifting throughput 3 590 → 26 672 ops/s and dropping queue wait p50 from ~110 ms to ~12 ms. A
+CPU-bound backlog gains nothing from the same setting, because the lane runs on the same cores.
 
 The configured strategy, aging and fair share still apply inside a lane: the queue skips excluded priority
 buckets per consumer head but keeps sequence, submission timestamps and virtual service time, so a task that
@@ -272,9 +275,15 @@ daemons.
 The virtual lane never changes the platform pool size, the processor budget or the adaptive concurrency
 limit. It has no CPU parallelism: a CPU-bound task placed on the lane competes with the platform workers for
 the same cores and can make tick times worse. The lane is for blocking or IO-bound work and for breaking a
-dependency where a platform worker would otherwise wait on something only that lane can finish. Measured, it
-matches the platform pool at equal concurrency on blocking work and is slower on CPU work; the benefit is
-isolation — a blocked virtual task does not hold a platform worker — not extra throughput. Numbers are in
+dependency where a platform worker would otherwise wait on something only that lane can finish.
+
+Measured, blocking throughput scales with the lane limit until the downstream system or the consumer quota
+caps it: 3 404 / 13 030 / 44 976 ops/s at `max-concurrent` 8 / 32 / 128 against 3 730 ops/s for an eight-worker
+platform pool. At equal concurrency the two lanes match (3.4k against 3.7k); above the worker count the lane
+keeps going, which is why the limit, not the pool size, is the number to size. CPU work on the lane is about
+2.0x slower at equal concurrency. The lane is therefore both an isolation mechanism (a blocked virtual task
+does not hold a platform worker) and extra concurrency for work that blocks — bounded by `max-concurrent`,
+the resolved consumer limit and the downstream system, never by the worker count. Numbers are in
 [Benchmarks](benchmarks.md#execution-lanes).
 
 ## Bounded queue and the three failure paths

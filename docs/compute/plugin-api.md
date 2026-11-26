@@ -427,7 +427,7 @@ on the caller if that is safe.
 | `submit(String, ComputeTaskType, ComputePriority, ComputeTask<T>)` | Fully specified, returns the future |
 | `enqueue(ComputeRequest<T>)` | Fully specified, returns the handle |
 | `registerConsumer(ComputeConsumer)` | Idempotent by id |
-| `unregisterConsumer(String)` | Cancels queued work of that consumer and flags running work |
+| `unregisterConsumer(String)` | Cancels queued work of that consumer; running work finishes and delivers its result |
 | `updateConsumerPolicy(String, ConsumerPolicy)` | Consumer must exist |
 | `consumer(String)` / `consumerIds()` | Introspection |
 | `metrics()` | Snapshot of counters and gauges |

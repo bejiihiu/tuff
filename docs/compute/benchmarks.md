@@ -510,7 +510,7 @@ CPU column on a quiet machine before treating the 32-worker number as healthy.
   and an idle lane (0.06-0.1 ms round trip against ~20 us on the platform).
 - **Cannot do what it looks like it can do.** `maxConcurrent` is a hard cap on virtual bodies, and a
   relative consumer limit is resolved against workers plus those permits, so a value above the lane
-  cap or above the consumer's resolved limit is inert. Spill is a tail valve for *blocking* `NORMAL`
+  cap or above the consumer's resolved limit is inert. Spill is a capacity valve for *blocking* `NORMAL`
   work; for CPU-bound `NORMAL` work it is still pure overhead.
 
 ## Observations and suspected defects

@@ -224,23 +224,36 @@ regression tracking, not as server SLAs:
 
 - The wrapper costs roughly **0.4 µs per task** over a bare `execute(Runnable)`: 0.57 µs against 0.16 µs for
   an empty task, but only about 8% on a 4–6 µs body. Priorities, quotas, fair share and metrics are what that
-  buys.
-- Submit-only is ~219 ns; submit + execute of an empty task is ~0.8 µs. Both are memory-latency bound and
-  degrade when another build shares the machine.
-- Throughput scaled almost linearly from 1 to 8 workers on the test laptop with a 4–6 µs body. That says the
-  pool does not serialise, not that eight workers fit your CPU budget.
-- Dispatch out of a deep queue costs ~0.8–1.3 µs per task; 16 consumers add ~0.4 µs because selection is
-  `O(consumers)` per poll.
-- `WEIGHTED_FAIR` costs ~0.2–0.35 µs per task over FIFO at four consumers; aging is not measurable.
-- A refused submission costs ~6 µs (the handle and entry are allocated before the refusal), and a queued
-  cancellation ~2.7 µs. Rejection-heavy or cancel-heavy designs pay this per call.
-- Idle latency is no longer capped by `scheduling.idle-wait-millis`: a submission signals an idle worker.
-  On one worker, an empty task on an idle pool measures p50 ~22 µs, p90 ~36 µs and p99 ~190 µs at the 50 ms
-  default. The p99 tail is operating-system wake-up latency, not a scheduler decision, and the same tail
-  appears with much shorter idle waits. A `LOW` task pays another ~0.1–0.2 ms for the virtual-thread start.
+  buys. Those two rows are from an earlier, unthrottled run; the latest run did not re-measure them.
+- Submission alone is **278 ns** against a deep queue with the worker busy. Against a completely full target
+  it is **195–207 ns** on the platform pool and about **1 µs** on the virtual lane (one notify to the pump);
+  the cost does not grow with the pool size.
+- Throughput on one worker (submit + execute) read 414 k ops/s for an empty body and 289 k for a ~0.6 µs body
+  in the latest run, which is the throttled floor, not the scheduler: the same binary read 1.24 M and 849 k
+  before the machine hit its power limit.
+- CPU-bound scaling from 1 to 8 workers is **not usable from this run**: the first two warmup seconds read
+  218 k / 1.04 M ops/s, every measured second read 58–114 k. Blocking work does scale with workers, because it
+  is a `Thread.sleep` lane: 1 808 / 3 730 / 7 553 / 15 740 ops/s at 4 / 8 / 16 / 32 workers.
+- Dispatch out of a deep queue costs **0.80–0.91 µs** per task at 1/4/16 consumers; 16 consumers add about
+  **0.1 µs** because selection is `O(consumers)` per poll.
+- `WEIGHTED_FAIR` costs ~0.1–0.2 µs per task over FIFO at four consumers; aging is not measurable.
+- A refused submission costs **4.9 µs** with `REJECT` and **7.6 µs** with `DROP_OLDEST` (the handle and entry
+  are allocated before the refusal, and eviction adds a cancellation). Queued cancellation is **1.53 µs** per
+  handle, running cancellation ~3 µs p50 / ~20 µs p99, and a lane submit-and-evict **56 µs**. Rejection-heavy
+  or cancel-heavy designs pay this per call.
+- Idle latency is not capped by `scheduling.idle-wait-millis`: a submission signals an idle worker. On one
+  worker, an empty task on an idle pool measures p50 **18–19 µs**, p90 **32–35 µs** and p99 **211–228 µs**,
+  identical at 1 µs, 50 µs and 50 ms idle waits. The p99 tail is operating-system wake-up latency, not a
+  scheduler decision. A `LOW` task pays another **0.06–0.1 ms** for the virtual-thread start.
+- The virtual lane is throughput on blocking work, not only isolation: **3 404 / 13 030 / 44 976 ops/s** at
+  `max-concurrent` 8 / 32 / 128 against 3 730 for eight platform workers, and a saturated blocking `NORMAL`
+  backlog goes from 3 590 to 26 672 ops/s when spill is on. CPU work on the lane is ~2.0x slower.
 
-The suite ran on one machine, one fork, one run per scenario; multi-threaded figures moved by 3–10x when
-another build was active. Re-run on a quiet machine before using absolute values.
+The suite ran on one machine (a hot laptop), one fork, one run per scenario, and **the machine
+power-throttled during the run** — inside a single fork the first warmup seconds are up to 3.7x faster than
+every measured second. Compare rows inside one run only; do not carry absolute CPU rates between runs or
+machines. `UnderLoadLatencyBenchmark` is excluded from the trusted set because both attempts stalled for over
+fifteen minutes without output.
 
 ## Tuning playbook
 
@@ -255,7 +268,7 @@ version.
 | One consumer monopolises turns | `weighted-fair` + weights | Per-consumer `max-concurrent` | Weights only order dispatch while both queues have work |
 | Rejections under bursts | `consumers.*.max-queued-tasks`, `queue.capacity` | Client-side shedding, `drop-oldest` for disposable work | Capacity is memory, not throughput; restart required to change it |
 | Stale work runs too late | `max-queue-wait-seconds` | `drop-oldest` for the consumer | Expiry granularity is the janitor tick, 10–100 ms |
-| Empty `LOW` task latency | `max-concurrent`/lane routing | Move latency-critical work to `CRITICAL`/`HIGH` on the platform lane | A virtual-thread start costs ~0.1–0.2 ms even on an idle lane; `idle-wait-millis` no longer caps platform latency |
+| Empty `LOW` task latency | `max-concurrent`/lane routing | Move latency-critical work to `CRITICAL`/`HIGH` on the platform lane | A virtual-thread start costs ~0.06–0.1 ms even on an idle lane; `idle-wait-millis` no longer caps platform latency |
 | Latency spikes at constant load | `adaptive.enabled` | `target-utilization`, `decrease-factor` | Adaptive needs `threads: -1` and only moves once per window |
 | Pool shrinks too aggressively | `adaptive.decrease-factor` | `min-concurrency` | The floor is `max(min-concurrency, min-threads)` |
 | Need per-task detail | `metrics.jfr: true` | A JFR recording around the incident | JFR adds allocation only while events are enabled |
@@ -268,17 +281,20 @@ seconds or a consumer policy capping itself.
 These are deliberate, with the technical reason:
 
 - **The virtual lane gives no CPU parallelism.** Virtual threads make blocking cheaper, not computation
-  faster; CPU-bound work on the lane competes with the platform workers for the same cores and measured
-  about 2.3x slower than the platform pool. At equal concurrency, blocking throughput is about the same as
-  the platform pool: the lane buys isolation, not throughput. Virtual threads also do not appear in a normal
-  thread dump, so use the lane metrics rather than `jcmd Thread.print`.
+  faster; CPU-bound work on the lane competes with the platform workers for the same cores and measured about
+  2.0x slower than the platform pool at equal concurrency. On blocking work the lane is real capacity:
+  throughput rises with `max-concurrent` (3 404 / 13 030 / 44 976 ops/s at 8 / 32 / 128) and stops only at the
+  lane limit, the resolved consumer limit or the downstream system. At equal concurrency it matches the
+  platform pool; above the worker count it keeps scaling where blocking is the bottleneck. Virtual threads
+  also do not appear in a normal thread dump, so use the lane metrics rather than `jcmd Thread.print`.
 - **Virtual tasks are not platform workers.** They do not count in `totalWorkers()` / `activeWorkers()`, do
   not hold a gate permit and do not feed the adaptive controller. They do hold the same consumer quota slot
   as platform work, and they wait in the same bounded queue, so capacity, expiry and overflow apply to them.
 - **Lane concurrency can exceed the worker count.** `max-concurrent` is a hard cap on virtual bodies, and a
-  relative consumer limit is resolved against platform workers plus those permits. The real bounds are
-  `max-concurrent`, the resolved consumer limit (a share of that capacity, or an absolute count) and the
-  downstream system the tasks block on.
+  relative consumer limit is resolved against platform workers plus those permits. The measured peak body
+  count equals the limit — 8 / 32 / 128 bodies at limits 8 / 32 / 128 — while the JVM platform thread count
+  stays flat. The real bounds are `max-concurrent`, the resolved consumer limit (a share of that capacity, or
+  an absolute count) and the downstream system the tasks block on.
 - **`HIGH` and `CRITICAL` never spill.** Only `LOW` (when the lane serves it) and saturated `NORMAL` can use
   the virtual lane.
 - **Lane settings are startup-only.** The lane is created with the scheduler; every `lanes.*` key needs a
