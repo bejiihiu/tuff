@@ -39,8 +39,42 @@ jobs:
           git config --global user.email "no-reply@github.com"
           git config --global user.name "GitHub Actions"
 
+      # static invariants: no stray folia-* paths, checkstyle regex still covers
+      # tuff-server/src/minecraft, all four hooks still present in the patches.
+      - name: Guard patch invariants
+        run: bash .github/scripts/guard-repo.sh
+
       - name: Apply patches
         run: ./gradlew applyAllPatches --stacktrace
+
+      # applied-tree invariants: hooks occupy the right place (not just "somewhere
+      # that compiles") and the generated checkstyle config still skips NMS.
+      - name: Guard applied tree
+        run: bash .github/scripts/guard-applied.sh
+
+      # Rebuilding from the applied sources must reproduce the committed patches.
+      # A diff means applied sources and .patch files disagree (applied edited
+      # without rebuild, or a .patch hand-edited); the next upstream sync then
+      # applies a patch that no longer matches what was tested.
+      - name: Verify patches reproduce from applied sources
+        timeout-minutes: 30
+        run: |
+          # checkoutPaperRepo already produced the upstream clone in the apply step.
+          # Excluding it dodges a paperweight/Gradle 9 implicit-dependency validation
+          # error: the rebuild tasks read that clone without declaring the dependency.
+          ./gradlew rebuildPaperApiPatches rebuildPaperCheckstylePatches \
+            rebuildPaperCheckstyleConfigPatches :tuff-server:rebuildAllServerPatches \
+            -x checkoutPaperRepo --stacktrace
+          dirs="tuff-api/paper-patches tuff-server/paper-patches tuff-server/minecraft-patches tuff-checkstyle"
+          dirty=$(git status --porcelain -- $dirs)
+          if [ -n "$dirty" ]; then
+            echo "::error::rebuilding the patch set changed it - applied sources and .patch files disagree"
+            printf '%s\n' "$dirty"
+            git --no-pager diff --stat -- $dirs
+            git --no-pager diff -- $dirs | head -200
+            exit 1
+          fi
+          echo "patches are reproducible from the applied sources"
 
       # build == check (checkstyle + tests of every module) and the paperclip jar is a separate task.
       # javadoc tasks are not part of build, but they run on publish - fail here instead of on a release tag.

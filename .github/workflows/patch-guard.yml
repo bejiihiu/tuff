@@ -1,0 +1,29 @@
+name: Patch guard
+
+# build.yml skips ver/26.3.x on push on purpose: a full apply + build is ~20 min
+# and direct pushes to the fork branch are frequent. This keeps the committed
+# patch invariants checked in seconds; upstream conflicts are the weekly
+# upstream-drift workflow's job.
+on:
+  push:
+    branches:
+      - ver/26.3.x
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: patch-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check patch invariants
+        run: bash .github/scripts/guard-repo.sh

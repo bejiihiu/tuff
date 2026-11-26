@@ -1,0 +1,112 @@
+name: Upstream drift
+
+# Weekly probe. Being behind PaperMC/Folia is information, not a failure; a merge
+# that conflicts is a failure, because that is what will bite on release day.
+# Runs on the default branch but pins ver/26.3.x, and can be dispatched by hand.
+
+on:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays, 04:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ver/26.3.x
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/PaperMC/Folia.git 2>/dev/null || true
+          git fetch --no-tags --prune upstream ver/26.3.x
+
+      - name: Measure drift
+        id: drift
+        run: |
+          set -euo pipefail
+          base=$(git merge-base HEAD upstream/ver/26.3.x)
+          behind=$(git rev-list --count "$base..upstream/ver/26.3.x")
+          ahead=$(git rev-list --count "$base..HEAD")
+          patch_files=$(git diff --name-only "$base" upstream/ver/26.3.x | grep -cE '/patches/.*\.patch$' || true)
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Upstream drift - Folia ver/26.3.x"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| behind | **$behind** commit(s) |"
+            echo "| our commits since merge base | **$ahead** |"
+            echo "| upstream patch files changed | **$patch_files** |"
+            echo "| newest upstream | \`$(git log -1 --format='%h %s' upstream/ver/26.3.x)\` |"
+            echo ""
+            if [ "$behind" -gt 0 ]; then
+              echo "### Incoming commits (last 20)"
+              echo '```'
+              git log --oneline --no-decorate -20 "$base..upstream/ver/26.3.x"
+              echo '```'
+              echo ""
+              echo "### Files touched upstream (top 15)"
+              echo '```'
+              git diff --stat "$base" upstream/ver/26.3.x | tail -15
+              echo '```'
+            else
+              echo "Up to date with upstream."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Dry merge only: no commit, no push, no gradle. Catches the conflicts early.
+      - name: Dry-run merge
+        if: steps.drift.outputs.behind != '0'
+        run: |
+          set -uo pipefail
+          git config user.email "no-reply@github.com"
+          git config user.name "GitHub Actions"
+          status=0
+          git merge --no-commit --no-ff upstream/ver/26.3.x > merge.log 2>&1 || status=$?
+          conflicts=$(git diff --name-only --diff-filter=U)
+          {
+            echo ""
+            echo "## Merge dry run"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$conflicts" ]; then
+            {
+              echo "**Conflicts in:**"
+              echo '```'
+              printf '%s\n' "$conflicts"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$status" -eq 0 ]; then
+            echo "Merge applies cleanly." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # never leave a half-merged tree behind
+          if [ -f .git/MERGE_HEAD ]; then
+            git merge --abort
+          fi
+          if [ -n "$conflicts" ]; then
+            echo "::error::upstream merge conflicts: $(printf '%s' "$conflicts" | tr '\n' ' ')"
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "**Merge failed without file conflicts:**"
+              echo '```'
+              tail -50 merge.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            cat merge.log >&2
+            exit 1
+          fi
+          echo "merge dry run ok"
