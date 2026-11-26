@@ -80,7 +80,8 @@ public final class ComputeMetricsCollector implements MetricsCollector {
 
     private static final System.Logger LOG = System.getLogger(ComputeMetricsCollector.class.getName());
 
-    private static final String SAMPLER_THREAD_PREFIX = "Tuff Compute Metrics";
+    // the probe in the server module scans by this name, so the public constant stays the only copy
+    private static final String SAMPLER_THREAD_PREFIX = ComputeSettings.METRICS_THREAD_PREFIX;
 
     /**
      * Capacity source for collectors that are not attached to a running engine; {@code 0} means

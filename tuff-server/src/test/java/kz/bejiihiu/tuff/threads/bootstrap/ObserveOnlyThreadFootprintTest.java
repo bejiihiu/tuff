@@ -5,10 +5,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 import kz.bejiihiu.tuff.threads.LeaseRequest;
 import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.PoolKind;
@@ -35,13 +37,14 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Proves the observe-only layer is, from the process' point of view, a no-op.
+ * Proves the observe-only layer creates exactly one thread and takes it away again.
  *
  * <p>Observe-only is a promise about side effects, not about code paths: the layer may read the
- * thread table, register pool descriptions and build snapshots, but it must not create a thread, start
- * a sampler and must not outlive its own stop. These tests look at exactly that: the JVM wide thread
- * table before and after, the pool count, the lifecycle state and the "every mutation is refused after
- * shutdown" rule.
+ * thread table, register pool descriptions and build snapshots. The one exception is the background
+ * refresher, because Folia runs console commands on a region tick thread and the heavy reads have to
+ * live somewhere else. So the contract tested here is: starting the layer creates the sampler and
+ * nothing else, the sampler is accounted to the service pool, and stopping the layer leaves no thread
+ * behind - neither a leak nor a half stopped loop.
  *
  * <p>Threads are compared as a delta (id to name) of {@link Thread#getAllStackTraces()}, filtered to
  * names this project owns. A delta instead of an absolute set, because the test JVM is shared with the
@@ -72,7 +75,7 @@ class ObserveOnlyThreadFootprintTest {
     }
 
     @Test
-    void observeOnlyAddsNoThreadWhileItLivesOrAfterItStops() throws IOException {
+    void observeOnlyAddsOnlyTheRefresherAndRemovesItOnStop() throws IOException {
         final SortedMap<Long, String> before = ourThreads();
 
         this.layer = this.start("""
@@ -84,14 +87,18 @@ class ObserveOnlyThreadFootprintTest {
         assertEquals(ThreadsStatus.State.RUNNING, running.state());
         assertTrue(this.layer.regionPoolRegistered(), "observe-only still registers the region pool");
         final ResourceSnapshot snapshot = running.snapshot();
-        assertNotNull(snapshot, "a running layer produces a snapshot without an extra thread");
-        assertEquals(0, snapshot.totalThreads(), "nothing is registered as created by the layer");
+        assertNotNull(snapshot, "a running layer publishes the first sample before start returns");
         assertEquals(7, snapshot.pools().size(), "the canonical pool set is described, not created");
 
-        assertEquals(Map.of(), newOurThreads(before), "starting and sampling the layer must not create a thread");
+        final Map<Long, String> added = newOurThreads(before);
+        assertEquals(1, added.size(), "the refresher is the only thread the layer creates: " + added);
+        assertTrue(added.values().iterator().next().startsWith("Tuff Threads Sampler"), added.toString());
+        assertEquals(1, snapshot.pool(PoolId.SERVICE).orElseThrow().aliveThreads(),
+            "the refresher is accounted to the service pool");
 
         this.layer.shutdown();
 
+        assertTrue(waitForNoSampler(5_000L), "stopping the layer must take the refresher down");
         assertEquals(Map.of(), newOurThreads(before), "stopping the layer must not leave a thread behind");
         assertEquals(ThreadsStatus.State.NOT_INITIALISED, this.layer.currentStatus().state());
         assertFalse(this.layer.regionPoolRegistered());
@@ -118,7 +125,7 @@ class ObserveOnlyThreadFootprintTest {
     }
 
     @Test
-    void startingTwiceRegistersTheSamePoolsOnceAndCreatesNoThread() throws IOException {
+    void startingTwiceRegistersTheSamePoolsOnceAndKeepsOneRefresher() throws IOException {
         final SortedMap<Long, String> before = ourThreads();
         this.layer = new ThreadsBootstrap();
         final ThreadsConfig config = new ThreadsConfig(this.write("""
@@ -133,11 +140,12 @@ class ObserveOnlyThreadFootprintTest {
         final ThreadsStatus status = this.layer.currentStatus();
         assertEquals(ThreadsStatus.State.RUNNING, status.state());
         assertEquals(7, status.snapshot().pools().size(), "a repeated start must not register a second pool set");
-        assertEquals(Map.of(), newOurThreads(before));
+        assertEquals(1, newOurThreads(before).size(), "a repeated start must not spawn a second refresher");
 
         this.layer.shutdown();
         this.layer.shutdown();
         assertEquals(ThreadsStatus.State.NOT_INITIALISED, this.layer.currentStatus().state());
+        assertTrue(waitForNoSampler(5_000L), "the first shutdown must stop the refresher");
         assertEquals(Map.of(), newOurThreads(before));
 
         // the instance is reusable, but nothing stale comes back: start after stop builds a fresh
@@ -147,6 +155,10 @@ class ObserveOnlyThreadFootprintTest {
             "a stopped layer must start again instead of silently ignoring the request");
         assertTrue(this.layer.regionPoolRegistered(), "the fresh runtime registers the canonical pools");
         assertEquals(7, this.layer.currentStatus().snapshot().pools().size());
+        assertEquals(1, newOurThreads(before).size(), "the restart brings exactly one refresh thread back");
+
+        this.layer.shutdown();
+        assertTrue(waitForNoSampler(5_000L), "the second shutdown must stop the refresher too");
         assertEquals(Map.of(), newOurThreads(before), "restarting must not leave a thread behind either");
     }
 
@@ -284,5 +296,40 @@ class ObserveOnlyThreadFootprintTest {
             }
         }
         return false;
+    }
+
+    /**
+     * Waits until no refresher thread is alive.
+     *
+     * <p>The shutdown path never joins, so the test is the one that has to wait. Polling is fine here:
+     * the interrupt ends the sleep immediately and the loop exits on the next check.
+     *
+     * @param millis how long to wait
+     * @return {@code true} when the refresher is gone
+     */
+    private static boolean waitForNoSampler(final long millis) {
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
+        while (System.nanoTime() < deadline) {
+            if (samplerThreads().isEmpty()) {
+                return true;
+            }
+            try {
+                Thread.sleep(20L);
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+                return samplerThreads().isEmpty();
+            }
+        }
+        return samplerThreads().isEmpty();
+    }
+
+    private static List<Thread> samplerThreads() {
+        final List<Thread> found = new ArrayList<>();
+        for (final Thread thread : Thread.getAllStackTraces().keySet()) {
+            if (thread.getName().startsWith("Tuff Threads Sampler")) {
+                found.add(thread);
+            }
+        }
+        return found;
     }
 }

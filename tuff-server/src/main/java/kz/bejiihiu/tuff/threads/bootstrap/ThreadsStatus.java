@@ -13,14 +13,19 @@ import org.jspecify.annotations.Nullable;
  * instead of half a snapshot.
  *
  * <p>{@code settings} and {@code snapshot} are absent when the runtime does not exist (disabled, not
- * started yet, failed). {@code unregisteredThreads} follows the module-wide convention that {@code -1}
- * means "we did not look": a disabled metrics section is not the same statement as "zero unknown
- * threads".
+ * started yet, failed) or when the refresher has not published a pass yet. {@code unregisteredThreads}
+ * follows the module-wide convention that {@code -1} means "we did not look": a disabled metrics
+ * section is not the same statement as "zero unknown threads".
+ *
+ * <p>{@code sampleAgeMillis} is the age of the cached sample at the moment the status was built, not
+ * the age of the snapshot object: the command reads only the cache, so the age is how long ago the
+ * refresher last measured.
  *
  * @param state               lifecycle state of the thread layer
  * @param settings            effective settings, or {@code null} when there is no runtime
  * @param snapshot            latest resource snapshot, or {@code null} when there is no runtime
  * @param unregisteredThreads threads no pool accounts for, or {@code -1} when not measured
+ * @param sampleAgeMillis     age of the cached sample, or {@code -1} when there is none
  * @param metricsEnabled      whether the runtime samples pool and thread state at all
  */
 public record ThreadsStatus(
@@ -28,6 +33,7 @@ public record ThreadsStatus(
     @Nullable ThreadManagementSettings settings,
     @Nullable ResourceSnapshot snapshot,
     int unregisteredThreads,
+    long sampleAgeMillis,
     boolean metricsEnabled
 ) {
 
@@ -35,13 +41,18 @@ public record ThreadsStatus(
      * Validates the status.
      *
      * @throws NullPointerException     if {@code state} is {@code null}
-     * @throws IllegalArgumentException if the count is below {@code -1}
+     * @throws IllegalArgumentException if the count or the age is below {@code -1}
      */
     public ThreadsStatus {
         Objects.requireNonNull(state, "state");
         if (unregisteredThreads < -1) {
             throw new IllegalArgumentException(
                 "unregisteredThreads must be -1 or non negative, got " + unregisteredThreads
+            );
+        }
+        if (sampleAgeMillis < -1L) {
+            throw new IllegalArgumentException(
+                "sampleAgeMillis must be -1 or non negative, got " + sampleAgeMillis
             );
         }
     }
@@ -52,7 +63,7 @@ public record ThreadsStatus(
      * @return the not-initialised status
      */
     public static ThreadsStatus notInitialised() {
-        return new ThreadsStatus(State.NOT_INITIALISED, null, null, -1, false);
+        return new ThreadsStatus(State.NOT_INITIALISED, null, null, -1, -1L, false);
     }
 
     /**
@@ -69,6 +80,7 @@ public record ThreadsStatus(
             settings,
             null,
             -1,
+            -1L,
             settings.metrics().enabled() && settings.lifecycle().monitorThreads()
         );
     }
@@ -81,7 +93,9 @@ public record ThreadsStatus(
      * @throws NullPointerException if {@code settings} is {@code null}
      */
     public static ThreadsStatus disabled(final ThreadManagementSettings settings) {
-        return new ThreadsStatus(State.DISABLED, Objects.requireNonNull(settings, "settings"), null, -1, false);
+        return new ThreadsStatus(
+            State.DISABLED, Objects.requireNonNull(settings, "settings"), null, -1, -1L, false
+        );
     }
 
     /**
@@ -90,23 +104,30 @@ public record ThreadsStatus(
      * @return the failed status
      */
     public static ThreadsStatus failed() {
-        return new ThreadsStatus(State.FAILED, null, null, -1, false);
+        return new ThreadsStatus(State.FAILED, null, null, -1, -1L, false);
     }
 
     /**
-     * Returns a copy that carries a measured snapshot.
+     * Returns a copy that carries a measured snapshot and its age.
      *
      * @param snapshot            the snapshot to publish
      * @param unregisteredThreads the unaccounted thread count, or {@code -1} when metrics are disabled
+     * @param sampleAgeMillis     how long ago the refresher took the sample
      * @return the copy
-     * @throws NullPointerException if {@code snapshot} is {@code null}
+     * @throws NullPointerException     if {@code snapshot} is {@code null}
+     * @throws IllegalArgumentException if the age is below {@code -1}
      */
-    public ThreadsStatus withSnapshot(final ResourceSnapshot snapshot, final int unregisteredThreads) {
+    public ThreadsStatus withSnapshot(
+        final ResourceSnapshot snapshot,
+        final int unregisteredThreads,
+        final long sampleAgeMillis
+    ) {
         return new ThreadsStatus(
             this.state,
             this.settings,
             Objects.requireNonNull(snapshot, "snapshot"),
             unregisteredThreads,
+            sampleAgeMillis,
             this.metricsEnabled
         );
     }

@@ -18,45 +18,51 @@ players. It is a subcommand of `/tuff`, not a separate command, and it takes no 
 | Not started yet | `The Tuff thread layer has not been initialized yet.` |
 | `enabled: false` | Where the switch is and what to do; no pools, no numbers |
 | Startup failed | That the server runs without the layer, and to look for the `Tuff/Threads` logger |
-| Running, no snapshot yet | That the sampler has not completed a pass; retry in a second |
+| Running, no sample yet (`warming up (no sample yet)`) | That the refresher has not published a pass; retry in a second |
 | Running | The summary below |
 
 A running server with default settings prints something like this:
 
 ```
 Tuff thread layer: running, all pools observed only
-  processors: 11 usable, 1 reserved; 4 registered thread(s) (peak 4)
+  cores: 11 usable after the reserve, 1 reserved; 3 registered thread(s) (peak 3)
+  sample: taken 412 ms ago
   pools: 7 registered
-    chunk-io          L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
-    chunk-worker      L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
-    compute           L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
-    compute-virtual   L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
-    network           L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
-    region-execution  L1  alive 4  active 0  idle 4  [FEATURE_DISABLED, OBSERVE_ONLY]
-      regions 12 / avg MSPT 4.2 ms / min TPS 19.4 / lag 8% (1 of 12)
-      ticks: 5s max 9.5 ms, 15s avg 4.4 ms max 12.0 ms; entities 8123 / players 4 / chunks 3951
-    service           L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
+    chunk-io          L1  alive 0  active 0  idle 0  cpu 0%
+    chunk-worker      L1  alive 0  active 0  idle 0  cpu 0%
+    compute           L1  alive 4  active 0  idle 3  cpu 0%
+    compute-virtual   L1  alive 1  active 0  idle 0  cpu 0%
+    network           L1  alive 0  active 0  idle 0  cpu 0%
+    region-execution  L1  alive 2  active 1  idle 1  cpu 0%
+      regions 1 / avg MSPT 4.2 ms / min TPS 20.0 / lag 0% (0 of 1)
+      ticks: 5s max 9.5 ms, 15s avg 4.4 ms max 12.0 ms; entities 8123 / players 0 / chunks 441
+    service           L2  alive 1  active 0  idle 0  cpu 0%
   degraded: FEATURE_DISABLED, OBSERVE_ONLY
   unknown threads: 37
-  settings: reserve 1 core(s), region scheduler edf, region threads auto; changes take effect after a restart
+  settings: reserve 1 core(s), region scheduler edf, region threads unknown; changes take effect after a restart
 ```
 
 How to read it:
 
 - **`running, all pools observed only`** comes from the configuration (`anyManagementEnabled()`
   derived from the `managed` flags), not from the measured coverage.
-- **`processors: N usable, R reserved`** is the snapshot's `usableCores`, which is the budget ledger's
-  `usable`: `floor(processors × 0.8)` minus the deducted lanes and the effective reserve, floored at one.
-  `R` is the configured reserve before that floor. The raw subtraction and every term are in the
-  snapshot's `budgetLedger`, the same line `ThreadResourceController.budgetLedger()` returns, so there is
-  no second "usable" number to compare against.
-- **`N registered thread(s)`** is the sum of per-pool `alive`. It includes threads a probe reports,
-  not only threads the registry created, so it can be non-zero while no thread has gone through the
-  factory.
-- **Per-pool line**: id, coverage level, `alive`, `active`, `idle`, and the pool's degraded reasons in
-  brackets. `unknown` is printed for `active` and `idle` when a value could not be measured. Queue
-  depth is deliberately not printed: without a probe it is `-1`, and a printed `0` would look like an
-  empty queue rather than an unmeasured one.
+- **`cores: N usable after the reserve, R reserved`** is the snapshot's `usableCores`, which is the
+  budget ledger's `usable`: `floor(processors × 0.8)` minus the deducted lanes and the effective reserve,
+  floored at one. `R` is the configured reserve before that floor. The raw subtraction and every term are
+  in the snapshot's `budgetLedger`, the same line `ThreadResourceController.budgetLedger()` returns, so
+  there is no second "usable" number to compare against.
+- **`sample: taken ... ago`** is the age of the cached sample the refresher published. The command never
+  measures; a value of `unknown` means no sample exists yet and the summary is the `warming up` line.
+- **`N registered thread(s)`** is the sum of per-pool `alive`. It includes threads a probe reports and
+  the refresher itself, not only threads the engine's registry created, so it is non-zero on an idle
+  observe-only server.
+- **Per-pool line**: id, coverage level, `alive`, `active`, `idle` and `cpu`. Reasons are not printed
+  per pool; they are summarised once in `degraded:`. `active` and `idle` print `unknown` when the value
+  could not be measured. Queue depth is deliberately not printed: without a probe it is `-1`, and a
+  printed `0` would look like an empty queue rather than an unmeasured one.
+- **`service L2 alive 1`** is the refresher thread (`Tuff Threads Sampler`), accounted like any other
+  Tuff thread. It is the only thread the layer creates; `L2` here means "created through the factory",
+  not "managed region ticks".
 - **Region lines** appear under the pool that ticks regions, and only when the probe reported something:
   `regions N / avg MSPT X / min TPS Y / lag Z% (K of N)` on the first line, then the 15-second figure,
   the worst single tick and the entity, player and chunk totals. `unknown` replaces a value that could
@@ -66,10 +72,12 @@ How to read it:
   still `RUNNING`. Observe-only is a statement of coverage, not a failure, and only reasons such as
   `BUDGET_EXHAUSTED`, `SCHEDULER_LIMITATION`, `CONFIG_CONFLICT` or `THREAD_CREATION_FAILED` move the
   manager state to `DEGRADED`.
-- **`unknown threads:`** is a count, or `n/a (metrics collection is disabled)` when metrics are off.
-  The report does not list their names; the snapshot does.
+- **`unknown threads:`** is a count, `n/a (no sample yet)` before the first pass, or
+  `n/a (metrics collection is disabled)` when metrics are off. The report does not list their names;
+  the snapshot does.
 - **`settings:`** repeats the three values that most often explain a surprise: the reserve, the region
-  scheduler and the configured region thread count. Every key of the section needs a restart.
+  scheduler and the configured region thread count (`unknown` when the config says "auto"). Every key of
+  the section needs a restart.
 
 ## What a snapshot contains
 
@@ -153,26 +161,34 @@ exactly 18 does not.
 
 Only the 5 s and 15 s windows are read. The 1 m, 5 m and 15 m reports copy and sort one record per tick
 over the whole window - milliseconds and garbage per region, acceptable for `/tps`, wrong for a layer
-that samples. Reads are throttled to one walk per second, so a second command in the same second gets the
-previous reading. A read triggered from a region tick thread (a player running the command) does not take
-the regioniser lock at all; it answers with the last reading. The aggregation itself is a pure function
-over per-region readings and is tested without a server, including empty and unmeasured reports.
+that samples. Reads are throttled to one walk per second, so even the refresher cannot walk twice in a
+second. A read from a region tick thread does not take the regioniser lock at all; it answers with the
+last list the refresher produced. The aggregation itself is a pure function over per-region readings and
+is tested without a server, including empty and unmeasured reports.
 
 ## Sampling cost
 
-There is no sampling thread. A pass runs when something reads a snapshot — the command — and only if
-the sampling interval (one second) has elapsed; a concurrent read gets the previous snapshot instead
-of waiting. A pass is one walk over registered threads, one `observe()` per attached probe, one CPU
-read per thread and a handful of JVM counters. With a few dozen threads this is tens of microseconds;
-the expensive operations are deliberately elsewhere:
+Folia executes console commands on the global region tick thread, so the command cannot take the
+regioniser lock or enumerate the thread table itself. One daemon thread does that work instead:
 
-- `Thread.getAllStackTraces()` is not part of the live path: the unaccounted-thread scan walks thread
-  groups, is throttled to once per 30 seconds and is a diagnostic, not part of the pass.
+- the refresher is named `Tuff Threads Sampler` (the factory appends `-<n>`) and is created through the
+  `ThreadFactoryProvider`, so it appears in the `service` pool (raised to `L2`) and never counts as an
+  unknown thread;
+- it takes one pass per second and publishes an immutable sample; a pass is one walk over registered
+  threads, one `observe()` per attached probe, one CPU read per thread and a handful of JVM counters;
+- `/tuff threads` only copies that sample and prints its age. A command from the console or from a
+  player is therefore a handful of volatile reads, not a measurement;
+- before the first pass finished the command says `warming up (no sample yet)` instead of printing an
+  empty table.
+
+The expensive operations stay away from the tick threads:
+
+- `Thread.getAllStackTraces()` is not used at all: the unaccounted-thread scan walks thread groups and
+  takes no stacks. The refresher asks for it once per second, and the scan itself is throttled to once
+  per 30 seconds.
 - Region tick reports (`5m`, `15m`) are never read by this layer: they allocate and sort one record per
-  tick over the window. Region reads take the 5 s and 15 s reports only, and the provider throttles the
-  walk to once per second.
-- No probe runs from a tick thread. When a player runs the command, the region provider notices the tick
-  thread and answers from its previous reading instead of taking the regioniser lock inside a tick.
+  tick over the window. Region reads take the 5 s and 15 s reports only.
+- No probe runs from a tick thread. A probe call only ever happens inside the refresher's pass.
 
 ## Unknown threads
 
@@ -186,8 +202,9 @@ Two honest caveats:
   netty's threads are not in the registry. A high count is the normal state, not a leak. The number
   becomes meaningful as pools move to L2.
 - It is a count in the command and one `tuff.threads.UnknownThreads` event per finding during the
-  scan, not a per-thread live metric. The scan is what costs; making it a metric would make the
-  sampler expensive.
+  scan, not a per-thread live metric. The scan runs on the refresher and is throttled, so the console
+  never pays for it. A thread the refresher itself owns is registered under `service` and is not
+  counted as unknown.
 
 ## JFR
 
@@ -258,16 +275,18 @@ never zero, and a pool that ticks no regions has no region metrics at all. For o
 Do not sample in the window between Folia setting `running = false` and `hasStopped = true`. The tick
 counter is frozen while the watchdog is still armed, so a join, an await or a heavy scan in that
 window looks exactly like a hung server: the watchdog fires, marks the exit abnormal and the process
-ends with a failure code on a healthy shutdown. The layer therefore takes no snapshot in that window,
-has no shutdown hook of its own and does no blocking work while stopping. If you are writing an
-integration that reads this data, obey the same rule.
+ends with a failure code on a healthy shutdown. The layer therefore has no shutdown hook of its own,
+stops the refresher with a flag and an interrupt and does not join it, and does no blocking work while
+stopping. A pass that races the stop finds the sampler closed and keeps the last values. If you are
+writing an integration that reads this data, obey the same rule.
 
 ## Reading a report: a short troubleshooting table
 
 | Symptom | Likely cause | Where to look |
 | --- | --- | --- |
-| All pools show `alive 0` | The layer is observe-only and only the region pool has a probe | Expected in this build; see [architecture](architecture.md#current-matrix) |
+| Every pool except `service` shows `alive 0` | The layer is observe-only and only the region and compute probes report threads | Expected in this build; see [architecture](architecture.md#current-matrix) |
 | `region-execution alive 0` on a running server | The region scheduler does not exist yet (very early startup) or already halted (shutdown) | Lifecycle, not a leak |
+| `warming up (no sample yet)` for longer than a second | The refresher thread did not start; the log has the reason under the `Tuff/Threads` logger | Look for `Tuff Threads Sampler` in a thread dump |
 | `unknown threads` in the hundreds | Normal for observe-only: Folia, netty and plugin threads are not registered | The number drops as pools reach L2 |
 | `degraded:` lists reasons while the layer says running | `OBSERVE_ONLY` and `FEATURE_DISABLED` are coverage statements | Only `BUDGET_EXHAUSTED`, `CONFIG_CONFLICT`, `SCHEDULER_LIMITATION` and creation failures mean degraded |
 | `queued` unknown on every pool | No probe is attached | Expected; queue depth needs an owner getter |

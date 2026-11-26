@@ -42,6 +42,15 @@ public record ComputeSettings(
 ) {
 
     /**
+     * Name prefix of the engine's metrics sampler thread.
+     *
+     * <p>The sampler is not a worker, but it is a thread of the compute pool and operators look for
+     * this name in dumps and probes. It is public because the thread layer's probe scans by name and
+     * must agree with the engine on it instead of carrying a second copy.
+     */
+    public static final String METRICS_THREAD_PREFIX = "Tuff Compute Metrics";
+
+    /**
      * Validates the settings tree.
      *
      * @throws NullPointerException     if any section is {@code null}

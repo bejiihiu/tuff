@@ -8,6 +8,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.bootstrap.ComputeUtmiAdapter;
 import kz.bejiihiu.tuff.threads.CoverageLevel;
@@ -48,6 +49,10 @@ class ThreadsBootstrapTest {
         final PoolSnapshot region = snapshot.pool(PoolId.REGION_EXECUTION).orElseThrow();
         assertEquals(CoverageLevel.L1, region.coverage(), "the default is observation only");
         assertEquals(0, region.spec().minThreads());
+        final PoolSnapshot service = snapshot.pool(PoolId.SERVICE).orElseThrow();
+        assertEquals(CoverageLevel.L2, service.coverage(), "the refresher needs an L2 pool to exist in");
+        assertTrue(service.aliveThreads() >= 1, "the refresher is accounted to the service pool");
+        assertTrue(status.sampleAgeMillis() >= 0L, "the first pass runs before start returns");
 
         bootstrap.shutdown();
         assertEquals(ThreadsStatus.State.NOT_INITIALISED, bootstrap.currentStatus().state());
@@ -143,8 +148,10 @@ class ThreadsBootstrapTest {
         assertNotNull(adapter, "a running layer must serve the engine");
         assertTrue(adapter.isManaged());
         assertEquals("utmi", adapter.source());
+        // the command reads the cached sample, so a registration made after the last pass becomes
+        // visible on the next one (at most a second later)
+        assertEquals(CoverageLevel.L4, awaitCoverage(managed, PoolId.COMPUTE, CoverageLevel.L4));
         final PoolSnapshot compute = managed.currentStatus().snapshot().pool(PoolId.COMPUTE).orElseThrow();
-        assertEquals(CoverageLevel.L4, compute.coverage());
         assertEquals(ComputeSettings.defaults().workers().minThreads(), compute.spec().minThreads());
         managed.shutdown();
     }
@@ -163,6 +170,46 @@ class ThreadsBootstrapTest {
         final PoolSnapshot compute = observe.currentStatus().snapshot().pool(PoolId.COMPUTE).orElseThrow();
         assertEquals(CoverageLevel.L1, compute.coverage(), "no flag means the engine keeps its own threads");
         observe.shutdown();
+    }
+
+    /**
+     * Waits for the cached sample to show a pool at the expected coverage.
+     *
+     * <p>The command path never samples, so a registration done after the last pass is visible only on
+     * the next one. Polling is the honest way for a test to wait for that instead of reaching into the
+     * refresher.
+     *
+     * @param bootstrap running layer
+     * @param pool      pool to watch
+     * @param expected  coverage the test is waiting for
+     * @return the last observed coverage
+     */
+    private static CoverageLevel awaitCoverage(
+        final ThreadsBootstrap bootstrap,
+        final PoolId pool,
+        final CoverageLevel expected
+    ) {
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5L);
+        CoverageLevel seen = null;
+        while (System.nanoTime() < deadline) {
+            final ResourceSnapshot snapshot = bootstrap.currentStatus().snapshot();
+            if (snapshot != null) {
+                final PoolSnapshot current = snapshot.pool(pool).orElse(null);
+                if (current != null) {
+                    seen = current.coverage();
+                    if (seen == expected) {
+                        return seen;
+                    }
+                }
+            }
+            try {
+                Thread.sleep(20L);
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+                return seen;
+            }
+        }
+        return seen;
     }
 
     @Test
@@ -194,7 +241,7 @@ class ThreadsBootstrapTest {
                 Thread.State.RUNNABLE, false, Thread.NORM_PRIORITY, -1L)
         );
 
-        assertEquals(1, ThreadsBootstrap.countUnknown(unregistered, snapshot));
+        assertEquals(1, ThreadsSampler.countUnknown(unregistered, snapshot));
     }
 
     private Path write(final String contents) throws IOException {

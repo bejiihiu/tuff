@@ -1,19 +1,13 @@
 package kz.bejiihiu.tuff.threads.bootstrap;
 
-import ca.spottedleaf.moonrise.common.util.TickThread;
 import java.time.Duration;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
-import java.util.Set;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.bootstrap.ComputeUtmiAdapter;
 import kz.bejiihiu.tuff.compute.config.ConfigProblem;
 import kz.bejiihiu.tuff.threads.PoolId;
-import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
-import kz.bejiihiu.tuff.threads.ThreadSnapshot;
 import kz.bejiihiu.tuff.threads.UnifiedThreadManager;
 import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
 import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
@@ -32,11 +26,11 @@ import org.jspecify.annotations.Nullable;
  *     <li>{@link #start()} runs first, at the top of {@code ComputeBootstrap.start()}. The runtime is
  *     built from {@code thread-management} and started; starting it registers the canonical pools at
  *     their configured coverage. The region pool is then attached to a probe, because the manager cannot
- *     see threads it did not create.</li>
+ *     see threads it did not create, and the background refresher takes over every heavy read.</li>
  *     <li>{@link #stop()} runs last, at the bottom of {@code ComputeBootstrap.stop()}. The compute engine
- *     stops first: its workers get their grace period, and only then does the accounting layer go away.
- *     The runtime's shutdown does not join, sleep or interrupt anything, so it is safe inside the
- *     shutdown window.</li>
+ *     stops first, then the refresher is signalled and only then does the accounting layer go away.
+ *     Nothing joins, sleeps or interrupts a blocking call, so the hooks are safe inside the shutdown
+ *     window.</li>
  * </ol>
  *
  * <p>With {@code thread-management.enabled: false} no runtime is created at all: no pool is registered,
@@ -67,6 +61,7 @@ public final class ThreadsBootstrap {
     private final Object lock = new Object();
     private volatile ThreadsStatus status = ThreadsStatus.notInitialised();
     private volatile @Nullable ThreadManagerRuntime runtime;
+    private volatile @Nullable ThreadsSampler sampler;
     private volatile @Nullable ComputeUtmiAdapter computeAdapter;
     private boolean started;
 
@@ -89,8 +84,8 @@ public final class ThreadsBootstrap {
      * Stops the thread layer during server shutdown.
      *
      * <p>Called at the end of the existing compute stop hook, after the compute engine is down. The
-     * manager owns no executor and no thread of its own, so this is bookkeeping only: detach the probes,
-     * close the sampler, refuse further registration. Nothing here waits for game work.
+     * refresher is signalled first, then the runtime closes its probes and sampler. Nothing here waits
+     * for game work or joins a thread: this path runs inside the shutdown window.
      */
     public static void stop() {
         SERVER.shutdown();
@@ -152,11 +147,20 @@ public final class ThreadsBootstrap {
                 // the probe is attached after start, because start is what registers the pools; attaching
                 // earlier would be rejected by the probe registry with "pool is not registered"
                 created.attachProbe(new RegionPoolProbe());
+                // every heavy read (region walk, thread table, probes) happens on this thread from now
+                // on: the console command is itself on a region tick thread in Folia and must not do it
+                final ThreadsSampler createdSampler = ThreadsSampler.start(created);
                 this.runtime = created;
+                this.sampler = createdSampler;
                 this.status = ThreadsStatus.running(settings);
                 logStarted(created.manager());
             } catch (final Throwable ex) {
                 this.runtime = null;
+                final ThreadsSampler partial = this.sampler;
+                this.sampler = null;
+                if (partial != null) {
+                    partial.stop();
+                }
                 this.status = ThreadsStatus.failed();
                 if (created != null) {
                     shutdownQuietly(created);
@@ -176,11 +180,18 @@ public final class ThreadsBootstrap {
     void shutdown() {
         synchronized (this.lock) {
             final ThreadManagerRuntime current = this.runtime;
+            final ThreadsSampler currentSampler = this.sampler;
             final ThreadsStatus previous = this.status;
             this.runtime = null;
+            this.sampler = null;
             this.computeAdapter = null;
             this.started = false;
             this.status = ThreadsStatus.notInitialised();
+            // flag + interrupt, no join: this runs in the window where the watchdog is still armed and
+            // a blocking wait would look like a hung server. The thread is a daemon and exits on its own
+            if (currentSampler != null) {
+                currentSampler.stop();
+            }
             if (current == null) {
                 // one line even when there is nothing to stop, otherwise an operator cannot tell the hook
                 // ran at all (the disabled start already logged its own reason)
@@ -224,58 +235,26 @@ public final class ThreadsBootstrap {
     }
 
     /**
-     * Returns the current status, taking a snapshot when the runtime exists.
+     * Returns the current status from the cached sample.
+     *
+     * <p>This is the only read the command path does, and it is safe on any thread: Folia runs console
+     * commands on the global region tick thread, so snapshotting here would put a region walk and a
+     * thread enumeration inside a tick. The refresher owns those reads; this method only copies the
+     * last published sample and stamps its age.
      *
      * @return an immutable status, never {@code null}
      */
     ThreadsStatus currentStatus() {
-        final ThreadManagerRuntime current = this.runtime;
         final ThreadsStatus base = this.status;
-        if (current == null || !base.isRunning()) {
+        if (!base.isRunning()) {
             return base;
         }
-        final UnifiedThreadManager manager = current.manager();
-        try {
-            final ResourceSnapshot snapshot = manager.snapshot();
-            // the unaccounted report takes one JVM wide stack dump, which must never happen on a
-            // region tick thread; a player running the command gets the pool numbers without it
-            final boolean measured = manager.metrics().enabled() && !TickThread.isTickThread();
-            final int unknown = measured
-                ? countUnknown(manager.metrics().unregisteredThreads(), snapshot)
-                : -1;
-            return base.withSnapshot(snapshot, unknown);
-        } catch (final RuntimeException ex) {
-            LOGGER.warn("Could not read the Tuff thread snapshot", ex);
+        final ThreadsSampler current = this.sampler;
+        final ThreadsSampler.@Nullable Sample sample = current == null ? null : current.sample();
+        if (sample == null) {
             return base;
         }
-    }
-
-    /**
-     * Counts threads that are neither registered nor listed by a pool probe.
-     *
-     * <p>The module's registry only knows threads the manager created, so a thread that an observe-only
-     * probe lists (Folia's region pool) is still "unregistered" from the registry's point of view. The
-     * command must not call those unknown: the probe did account for them, just not through the factory.
-     *
-     * @param unregistered the raw unaccounted thread report
-     * @param snapshot     the snapshot whose per thread list contains probe observations
-     * @return how many reported threads no pool accounted for
-     */
-    static int countUnknown(final List<ThreadSnapshot> unregistered, final ResourceSnapshot snapshot) {
-        if (unregistered.isEmpty()) {
-            return 0;
-        }
-        final Set<Long> observed = new HashSet<>(snapshot.threads().size() * 2);
-        for (final ThreadSnapshot thread : snapshot.threads()) {
-            observed.add(thread.threadId());
-        }
-        int count = 0;
-        for (final ThreadSnapshot thread : unregistered) {
-            if (!observed.contains(thread.threadId())) {
-                count++;
-            }
-        }
-        return count;
+        return base.withSnapshot(sample.snapshot(), sample.unknownThreads(), sample.ageMillis());
     }
 
     /**

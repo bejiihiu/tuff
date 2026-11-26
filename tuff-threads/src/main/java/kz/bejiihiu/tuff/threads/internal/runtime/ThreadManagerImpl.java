@@ -187,9 +187,10 @@ public final class ThreadManagerImpl implements UnifiedThreadManager {
     /**
      * Scans the JVM for threads that no pool accounts for.
      *
-     * <p>This is the command path, not a metric: one pass walks the root thread group and allocates one
-     * record per finding. It must never be called from a region tick thread, and it is intentionally not
-     * part of the regular snapshot - the sampler stays away from thread enumeration for a reason.
+     * <p>One pass walks the root thread group and allocates one record per finding, without stack
+     * traces. The thread layer's background refresher calls it once per second; it must never be called
+     * from a region tick thread, and the regular snapshot is still built without it, so a caller that
+     * only needs pools pays nothing for the enumeration.
      *
      * @return an immutable list in thread id order, possibly empty
      */

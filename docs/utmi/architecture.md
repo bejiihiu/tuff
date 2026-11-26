@@ -60,7 +60,7 @@ flowchart TB
 | `BudgetPlanner` | Divides the processor headroom into per-pool budgets, once per ledger | [`BudgetPlanner.java`](../../tuff-threads/src/main/java/kz/bejiihiu/tuff/threads/internal/impl/budget/BudgetPlanner.java) |
 | `ThreadFactoryProvider` | Creates platform threads from a spec, or wraps a body for threads someone else constructed | [`ThreadFactoryProviderImpl.java`](../../tuff-threads/src/main/java/kz/bejiihiu/tuff/threads/internal/impl/factory/ThreadFactoryProviderImpl.java) |
 | `ThreadRegistry` | Live threads by pool, monotonic creation and termination counters, per-thread snapshots | [`ThreadRegistryImpl.java`](../../tuff-threads/src/main/java/kz/bejiihiu/tuff/threads/internal/impl/registry/ThreadRegistryImpl.java) |
-| `ResourceSampler` | One sampling pass over registry, probes and JVM counters; no sampling thread | [`ResourceSampler.java`](../../tuff-threads/src/main/java/kz/bejiihiu/tuff/threads/internal/impl/metrics/ResourceSampler.java) |
+| `ResourceSampler` | One sampling pass over registry, probes and JVM counters; driven by the bootstrap's refresher thread | [`ResourceSampler.java`](../../tuff-threads/src/main/java/kz/bejiihiu/tuff/threads/internal/impl/metrics/ResourceSampler.java) |
 | `JfrThreadSink` | `tuff.threads.*` events, gated on `EventType.isEnabled()` | [`JfrThreadSink.java`](../../tuff-threads/src/main/java/kz/bejiihiu/tuff/threads/internal/impl/events/JfrThreadSink.java) |
 | `ThreadsBootstrap` | Server seam: reads the config, starts and stops the runtime, takes the snapshot the command prints | [`ThreadsBootstrap.java`](../../tuff-server/src/main/java/kz/bejiihiu/tuff/threads/bootstrap/ThreadsBootstrap.java) |
 | `RegionPoolProbe` | Observe-only reading of Folia's region tick pool | [`RegionPoolProbe.java`](../../tuff-server/src/main/java/kz/bejiihiu/tuff/threads/probe/RegionPoolProbe.java) |
@@ -183,7 +183,7 @@ Two limits of the current build are worth stating plainly:
    and IO counts and a fixed network reserve. The two formulas share the 80% rule and nothing else.
 
 There is exactly one `usable` number. `ThreadResourceController.usableCores()` returns the plan's
-`usable`, the snapshot publishes that same value, and `/tuff threads` prints it on its `processors:`
+`usable`, the snapshot publishes that same value, and `/tuff threads` prints it on its `cores:`
 line. `reservedCores` next to it is the configured reserve, before the plan floors it at one. The raw
 subtraction, which may be zero or negative, is visible in the printable ledger
 (`ThreadResourceController.budgetLedger()`, also carried by the snapshot as `budgetLedger`) rather than
@@ -211,10 +211,12 @@ The module is designed so that a command, a probe or a shutdown can never block 
 - **The registry is lock-light.** Concurrent maps, monotonic counters, unregister in a `finally` so a
   dead thread is not counted. A registration that lands after the registry stopped is rejected rather
   than resurrecting accounting.
-- **The sampler has no thread.** A pass runs when a snapshot is read and the sampling interval has
-  elapsed; a concurrent read gets the previous snapshot instead of waiting. One pass is one walk over
-  registered threads, one `observe()` per attached probe and one CPU read per thread. The
-  unaccounted-thread scan is a separate, throttled diagnostic and never part of the pass.
+- **One refresher thread owns the expensive reads.** Folia runs console commands on a global region
+  tick thread, so the command cannot walk regions or enumerate threads. The `Tuff Threads Sampler`
+  daemon takes one pass per second (one walk over registered threads, one `observe()` per attached
+  probe, one CPU read per thread) and publishes an immutable sample; the command only copies it and
+  prints its age. The unaccounted-thread scan runs on the same thread and is throttled by its own
+  interval.
 - **Lifecycle under one monitor.** Start, shutdown and `awaitTermination` share a single monitor.
   Shutdown never joins, sleeps or interrupts; `awaitTermination` is the only call allowed to block
   and the bootstrap caps it at one second.

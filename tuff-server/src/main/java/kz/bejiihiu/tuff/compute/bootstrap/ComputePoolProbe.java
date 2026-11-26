@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.function.Supplier;
+import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolObservation;
@@ -21,8 +22,10 @@ import org.jspecify.annotations.Nullable;
  *
  * <p>The thread list is a name scan, not a registry read: at L4 the layer already knows the workers,
  * but at L1 it does not, and a snapshot without threads is exactly the case where an operator cannot
- * see CPU per worker. Virtual threads are skipped - they do not show up in a thread dump and the lane
- * reports its own live count.
+ * see CPU per worker. The engine's metrics sampler ({@link ComputeSettings#METRICS_THREAD_PREFIX}) is
+ * part of the platform pool too, so it is matched as well - otherwise it belongs to no pool and shows
+ * up as an unknown thread even though the engine owns it. Virtual threads are skipped - they do not
+ * show up in a thread dump and the lane reports its own live count.
  *
  * <p>Never throws: a stopped engine, a null snapshot or a dying thread all degrade to zeros.
  */
@@ -100,11 +103,12 @@ final class ComputePoolProbe implements PoolProbe {
     }
 
     /**
-     * Collects the live platform threads whose name starts with the worker prefix.
+     * Collects the live platform threads of the compute pool.
      *
-     * <p>The virtual lane's pump and the completion threads also match the prefix but belong to
-     * {@link PoolId#COMPUTE_VIRTUAL}, so they are filtered out here instead of showing up under the
-     * platform pool.
+     * <p>A thread belongs to the platform pool when it is named with the worker prefix or when it is
+     * the engine's metrics sampler. The virtual lane's pump and the completion threads also match the
+     * prefix but belong to {@link PoolId#COMPUTE_VIRTUAL}, so they are filtered out here instead of
+     * showing up under the platform pool.
      *
      * @param prefix worker name prefix
      * @return the matching threads, possibly empty
@@ -126,13 +130,19 @@ final class ComputePoolProbe implements PoolProbe {
             if (thread == null || thread.isVirtual()) {
                 continue;
             }
-            final String name = thread.getName();
-            if (!name.startsWith(prefix) || name.startsWith(prefix + "-virtual") || name.startsWith(prefix + "-completion")) {
-                continue;
+            if (belongsToPlatformPool(thread.getName(), prefix)) {
+                found.add(thread);
             }
-            found.add(thread);
         }
         return found;
+    }
+
+    private static boolean belongsToPlatformPool(final String name, final String prefix) {
+        if (name.startsWith(prefix + "-virtual") || name.startsWith(prefix + "-completion")) {
+            // lane threads match the worker prefix but are accounted under the virtual pool
+            return false;
+        }
+        return name.startsWith(prefix) || name.startsWith(ComputeSettings.METRICS_THREAD_PREFIX);
     }
 
     /**

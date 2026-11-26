@@ -42,10 +42,10 @@ class ThreadsReportTest {
     }
 
     @Test
-    void aRunningLayerWithoutASnapshotSaysToRetry() {
+    void aRunningLayerWithoutASampleSaysItIsWarmingUp() {
         final ThreadsStatus status = ThreadsStatus.running(ThreadManagementSettings.defaults());
 
-        assertContains(ThreadsReport.overview(status), "no snapshot has been taken yet");
+        assertContains(ThreadsReport.overview(status), "warming up (no sample yet)");
     }
 
     @Test
@@ -61,7 +61,9 @@ class ThreadsReportTest {
         assertTrue(text.contains("idle 5"), text);
         assertTrue(text.contains("OBSERVE_ONLY"), text);
         assertTrue(text.contains("unknown threads: 12"), text);
+        assertTrue(text.contains("sample: taken 412 ms ago"), text);
         assertTrue(text.contains("after a restart"), text);
+        assertFalse(text.contains("["), "reasons are summarised in degraded:, not per pool: " + text);
     }
 
     @Test
@@ -77,7 +79,7 @@ class ThreadsReportTest {
             Instant.EPOCH, 8, 1, 4, 0, 0, 4, 0.0d, 0.0d, -1.0d, List.of(pool), List.of(), Set.of(), Optional.empty()
         );
         final ThreadsStatus status = new ThreadsStatus(
-            ThreadsStatus.State.RUNNING, ThreadManagementSettings.defaults(), snapshot, 0, true
+            ThreadsStatus.State.RUNNING, ThreadManagementSettings.defaults(), snapshot, 0, 10L, true
         );
 
         final String text = String.join("\n", ThreadsReport.overview(status));
@@ -91,7 +93,7 @@ class ThreadsReportTest {
     void disabledMetricsReportTheUnknownThreadCountAsUnavailable() {
         final String text = String.join("\n", ThreadsReport.overview(runningStatus(-1, false)));
 
-        assertTrue(text.contains("unknown threads: n/a (not measured"), text);
+        assertTrue(text.contains("unknown threads: n/a (metrics collection is disabled)"), text);
         assertTrue(text.contains("metrics: disabled"), text);
         assertTrue(text.contains("degraded: unknown (metrics are disabled)"), text);
     }
@@ -112,7 +114,7 @@ class ThreadsReportTest {
             Set.of(DegradedReason.OBSERVE_ONLY)
         );
         final ThreadsStatus status = new ThreadsStatus(
-            ThreadsStatus.State.RUNNING, ThreadManagementSettings.defaults(), snapshot, 0, true
+            ThreadsStatus.State.RUNNING, ThreadManagementSettings.defaults(), snapshot, 0, 10L, true
         );
 
         final String text = String.join("\n", ThreadsReport.overview(status));
@@ -174,6 +176,7 @@ class ThreadsReportTest {
             ThreadManagementSettings.defaults(),
             snapshot,
             unregisteredThreads,
+            412L,
             metricsEnabled
         );
     }

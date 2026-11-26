@@ -22,10 +22,14 @@ import org.jspecify.annotations.Nullable;
  * per region - acceptable for a command that asks for it, not for a layer that samples. Per-region entity,
  * player and chunk counts come from {@code RegionStats}, which are acquire reads.
  *
- * <p>Two limits protect the server. Reads are throttled to one per second here, not only in the sampler:
- * a second command in the same second gets the previous list instead of a second walk over every region.
- * And a read from a region tick thread never takes the regioniser lock - it answers with the last list,
- * because the sampler can be triggered by a player running {@code /tuff threads}.
+ * <p>The thread layer's refresher is the reader: it runs off the tick threads, calls this once per
+ * second and stores the list. The command only reads the sample the refresher published, so no console
+ * command and no player ever triggers a walk here.
+ *
+ * <p>Two limits protect the server anyway. Reads are throttled to one per second, so even a caller that
+ * asks twice in a second gets the previous list instead of a second walk over every region. And a read
+ * from a region tick thread never takes the regioniser lock - it answers with the last list the
+ * refresher produced; that guard stays as a belt, not as the only path to the data.
  *
  * <p>A region whose windows are empty (just created, just reactivated after a merge or split) is reported
  * with {@code -1} measurements instead of being dropped: the pool does tick it, there is just nothing to

@@ -23,6 +23,10 @@ import org.jspecify.annotations.Nullable;
  * only, and the summary's degraded reasons say why a pool is not managed. Queue depth is left out on
  * purpose - observe-only pools report {@code -1} until their owner exposes it, and a printed "0" would
  * look like an empty queue.
+ *
+ * <p>The report is a pure function of a status the refresher already measured, so it is safe to build on
+ * the global region tick thread Folia runs console commands on. When there is no sample yet it says so
+ * instead of printing an empty table.
  */
 public final class ThreadsReport {
 
@@ -63,17 +67,21 @@ public final class ThreadsReport {
         final @Nullable ThreadManagementSettings settings = status.settings();
         if (snapshot == null || settings == null) {
             return List.of(
-                "Tuff thread layer: running, but no snapshot has been taken yet.",
-                INDENT + "Try again in a second; the metrics sampler takes at most one pass per second."
+                "Tuff thread layer: warming up (no sample yet).",
+                INDENT + "The refresher takes one pass per second; run the command again in a moment."
             );
         }
 
         final List<String> lines = new ArrayList<>();
-        lines.add("Tuff thread layer: " + (anyPoolManaged(snapshot) ? "running, some pools managed"
+        // the header is the configuration's statement, not the measured coverage: the refresher's
+        // service pool is L2 because the manager creates that thread, and calling that "managed" would
+        // tell an operator that Folia's region ticks are managed when they are not
+        lines.add("Tuff thread layer: " + (settings.anyManagementEnabled() ? "running, some pools managed"
             : "running, all pools observed only"));
         lines.add(INDENT + "cores: " + snapshot.usableCores() + " usable after the reserve, "
             + snapshot.reservedCores() + " reserved; " + snapshot.totalThreads()
             + " registered thread(s) (peak " + snapshot.peakThreads() + ')');
+        lines.add(INDENT + "sample: taken " + describeAge(status.sampleAgeMillis()));
         lines.add(INDENT + "pools: " + snapshot.pools().size() + " registered");
 
         final int width = idWidth(snapshot.pools());
@@ -94,21 +102,13 @@ public final class ThreadsReport {
         lines.add(INDENT + "degraded: " + (status.metricsEnabled()
             ? describeReasons(snapshot.degradedReasons())
             : "unknown (metrics are disabled)"));
-        lines.add(INDENT + "unknown threads: " + describeUnregistered(status.unregisteredThreads()));
+        lines.add(INDENT + "unknown threads: "
+            + describeUnregistered(status.unregisteredThreads(), status.metricsEnabled()));
         lines.add(INDENT + "settings: reserve " + settings.resources().reserveCores() + " core(s), region scheduler "
             + formatScheduler(settings.regionExecution().scheduler())
             + ", region threads " + describeCount(settings.regionExecution().threads())
             + "; changes take effect after a restart");
         return List.copyOf(lines);
-    }
-
-    private static boolean anyPoolManaged(final ResourceSnapshot snapshot) {
-        for (final PoolSnapshot pool : snapshot.pools()) {
-            if (pool.coverage().managesThreads()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private static String describePool(final PoolSnapshot pool, final int width) {
@@ -180,11 +180,23 @@ public final class ThreadsReport {
         return count < 0 ? "unknown" : Integer.toString(count);
     }
 
-    private static String describeUnregistered(final int count) {
-        if (count < 0) {
-            return "n/a (not measured; it needs a JVM wide stack dump, so run it from the console)";
+    private static String describeUnregistered(final int count, final boolean metricsEnabled) {
+        if (count >= 0) {
+            return Integer.toString(count);
         }
-        return Integer.toString(count);
+        return metricsEnabled
+            ? "n/a (no sample yet)"
+            : "n/a (metrics collection is disabled)";
+    }
+
+    private static String describeAge(final long millis) {
+        if (millis < 0L) {
+            return "unknown";
+        }
+        if (millis < 1_000L) {
+            return millis + " ms ago";
+        }
+        return String.format(Locale.ROOT, "%.1f s ago", millis / 1_000.0d);
     }
 
     private static String describeReasons(final Collection<DegradedReason> reasons) {

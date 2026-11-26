@@ -202,9 +202,13 @@ class ComputeUtmiAdapterTest {
         assertTrue(reading.aliveThreads() >= 1);
         assertFalse(reading.threads().isEmpty(), "the probe must list the workers it counted");
         for (final Thread thread : reading.threads()) {
+            // workers and the engine's own metrics sampler are the platform pool; the lane threads are
+            // filtered out by the scan. Anything else is a foreign thread and a real bug
+            final String name = thread.getName();
             assertTrue(
-                thread.getName().startsWith(settings.workers().threadNamePrefix()),
-                () -> "a foreign thread leaked into the compute pool listing: " + thread.getName()
+                name.startsWith(settings.workers().threadNamePrefix())
+                    || name.startsWith(ComputeSettings.METRICS_THREAD_PREFIX),
+                () -> "a foreign thread leaked into the compute pool listing: " + name
             );
         }
     }
