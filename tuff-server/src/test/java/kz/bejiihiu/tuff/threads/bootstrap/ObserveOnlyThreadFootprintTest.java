@@ -1,0 +1,287 @@
+package kz.bejiihiu.tuff.threads.bootstrap;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.SortedMap;
+import java.util.TreeMap;
+import kz.bejiihiu.tuff.threads.LeaseRequest;
+import kz.bejiihiu.tuff.threads.PoolId;
+import kz.bejiihiu.tuff.threads.PoolKind;
+import kz.bejiihiu.tuff.threads.PoolSpec;
+import kz.bejiihiu.tuff.threads.ResourceSnapshot;
+import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
+import kz.bejiihiu.tuff.threads.ThreadSpec;
+import kz.bejiihiu.tuff.threads.UnifiedThreadManager;
+import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
+import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
+import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
+import kz.bejiihiu.tuff.threads.observe.TuffErrorLogCapture;
+import org.jspecify.annotations.Nullable;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Proves the observe-only layer is, from the process' point of view, a no-op.
+ *
+ * <p>Observe-only is a promise about side effects, not about code paths: the layer may read the
+ * thread table, register pool descriptions and build snapshots, but it must not create a thread, start
+ * a sampler and must not outlive its own stop. These tests look at exactly that: the JVM wide thread
+ * table before and after, the pool count, the lifecycle state and the "every mutation is refused after
+ * shutdown" rule.
+ *
+ * <p>Threads are compared as a delta (id to name) of {@link Thread#getAllStackTraces()}, filtered to
+ * names this project owns. A delta instead of an absolute set, because the test JVM is shared with the
+ * test runner and with other tests of the same suite, and those bring their own threads.
+ */
+@Timeout(180)
+class ObserveOnlyThreadFootprintTest {
+
+    /**
+     * Prefixes and suffixes that mark a thread as ours. Compute names its workers
+     * {@code Tuff Compute Worker-1}, the service threads {@code <prefix>-janitor} and the lane threads
+     * {@code <prefix>-virtual-pump} / {@code <prefix>-completion-pool-1}.
+     */
+    private static final List<String> OWN_PREFIXES = List.of("Tuff", "tuff-threads");
+    private static final List<String> OWN_INFIXES = List.of("-janitor", "-virtual", "-completion");
+
+    @TempDir
+    Path directory;
+
+    private @Nullable ThreadsBootstrap layer;
+
+    @AfterEach
+    void stopWhateverStarted() {
+        if (this.layer != null) {
+            this.layer.shutdown();
+            this.layer = null;
+        }
+    }
+
+    @Test
+    void observeOnlyAddsNoThreadWhileItLivesOrAfterItStops() throws IOException {
+        final SortedMap<Long, String> before = ourThreads();
+
+        this.layer = this.start("""
+            thread-management:
+              enabled: true
+            """);
+
+        final ThreadsStatus running = this.layer.currentStatus();
+        assertEquals(ThreadsStatus.State.RUNNING, running.state());
+        assertTrue(this.layer.regionPoolRegistered(), "observe-only still registers the region pool");
+        final ResourceSnapshot snapshot = running.snapshot();
+        assertNotNull(snapshot, "a running layer produces a snapshot without an extra thread");
+        assertEquals(0, snapshot.totalThreads(), "nothing is registered as created by the layer");
+        assertEquals(7, snapshot.pools().size(), "the canonical pool set is described, not created");
+
+        assertEquals(Map.of(), newOurThreads(before), "starting and sampling the layer must not create a thread");
+
+        this.layer.shutdown();
+
+        assertEquals(Map.of(), newOurThreads(before), "stopping the layer must not leave a thread behind");
+        assertEquals(ThreadsStatus.State.NOT_INITIALISED, this.layer.currentStatus().state());
+        assertFalse(this.layer.regionPoolRegistered());
+    }
+
+    @Test
+    void aDisabledLayerCreatesNoRuntimeAndNoThread() throws IOException {
+        final SortedMap<Long, String> before = ourThreads();
+
+        this.layer = this.start("""
+            thread-management:
+              enabled: false
+            """);
+
+        final ThreadsStatus status = this.layer.currentStatus();
+        assertEquals(ThreadsStatus.State.DISABLED, status.state());
+        assertEquals(-1, status.unregisteredThreads(), "a disabled layer measured nothing");
+        assertFalse(status.metricsEnabled());
+        assertFalse(this.layer.regionPoolRegistered(), "no runtime means no registered pool");
+        assertEquals(Map.of(), newOurThreads(before), "the kill switch must not create a thread");
+
+        this.layer.shutdown();
+        assertEquals(Map.of(), newOurThreads(before), "shutting a disabled layer down changes nothing");
+    }
+
+    @Test
+    void startingTwiceRegistersTheSamePoolsOnceAndCreatesNoThread() throws IOException {
+        final SortedMap<Long, String> before = ourThreads();
+        this.layer = new ThreadsBootstrap();
+        final ThreadsConfig config = new ThreadsConfig(this.write("""
+            thread-management:
+              enabled: true
+            """));
+
+        this.layer.startWith(config);
+        this.layer.startWith(config);
+        this.layer.startWith(config);
+
+        final ThreadsStatus status = this.layer.currentStatus();
+        assertEquals(ThreadsStatus.State.RUNNING, status.state());
+        assertEquals(7, status.snapshot().pools().size(), "a repeated start must not register a second pool set");
+        assertEquals(Map.of(), newOurThreads(before));
+
+        this.layer.shutdown();
+        this.layer.shutdown();
+        assertEquals(ThreadsStatus.State.NOT_INITIALISED, this.layer.currentStatus().state());
+        assertEquals(Map.of(), newOurThreads(before));
+
+        // the lifecycle is one shot per process on purpose: the server calls start once and stop once,
+        // and a stale runtime must never come back to life because a command or a test asked again
+        this.layer.startWith(config);
+        assertEquals(ThreadsStatus.State.NOT_INITIALISED, this.layer.currentStatus().state(),
+            "a stopped layer is not restarted behind the server's back");
+        assertFalse(this.layer.regionPoolRegistered());
+        assertEquals(Map.of(), newOurThreads(before));
+    }
+
+    @Test
+    void aStoppedRuntimeRefusesPoolsLeasesAndThreadCreation() throws InterruptedException {
+        final ThreadManagerRuntime runtime = new DefaultThreadManagerFactory()
+            .create(ThreadManagementSettings.defaults());
+        final UnifiedThreadManager manager = runtime.manager();
+
+        runtime.start();
+        runtime.start();
+        assertEquals(UnifiedThreadManager.State.RUNNING, manager.state());
+        assertEquals(7, manager.pools().ids().size(), "a second start must not add pools");
+
+        runtime.shutdown(Duration.ZERO);
+        runtime.shutdown(Duration.ZERO);
+        assertTrue(runtime.awaitTermination(Duration.ofSeconds(10)));
+        assertEquals(UnifiedThreadManager.State.STOPPED, manager.state());
+
+        assertThrows(
+            IllegalStateException.class,
+            () -> manager.pools().register(PoolSpec.observeOnly(PoolId.SERVICE, PoolKind.SERVICE, "test", "late")),
+            "a stopped layer must not accept a pool"
+        );
+        assertThrows(
+            IllegalStateException.class,
+            () -> manager.threadFactory().newThread(
+                ThreadSpec.of(PoolId.COMPUTE, "late-thread", (thread, failure) -> { }),
+                () -> { }
+            ),
+            "a stopped layer must not create a thread"
+        );
+        assertThrows(
+            IllegalStateException.class,
+            () -> manager.resources().acquire(
+                LeaseRequest.immediate(PoolId.COMPUTE, System.nanoTime() + 1_000_000_000L)
+            ),
+            "a stopped layer must not hand out a lease"
+        );
+        assertThrows(IllegalStateException.class, runtime::start, "a stopped runtime does not restart");
+    }
+
+    @Test
+    void aLayerWithMetricsOffReportsDisabledAndPrintsNoSentinel() throws IOException {
+        this.layer = this.start("""
+            thread-management:
+              enabled: true
+              metrics:
+                enabled: false
+            """);
+
+        final ThreadsStatus status = this.layer.currentStatus();
+        assertEquals(ThreadsStatus.State.RUNNING, status.state());
+        assertFalse(status.metricsEnabled());
+        assertEquals(-1, status.unregisteredThreads(),
+            "the unaccounted report must be skipped, not measured, when collection is off");
+        assertNotNull(status.snapshot());
+
+        final String text = String.join("\n", ThreadsReport.overview(status));
+
+        assertTrue(text.contains("metrics: disabled"), text);
+        assertTrue(text.contains("unknown threads: n/a"), text);
+        assertTrue(text.contains("region-execution"), "the registered pools are still listed: " + text);
+        assertFalse(text.contains("-1"), "a sentinel must never be printed as a number:\n" + text);
+        assertFalse(text.contains("unknown -1"), text);
+    }
+
+    @Test
+    void observeOnlyLogsNoError() throws IOException {
+        final @Nullable TuffErrorLogCapture capture = TuffErrorLogCapture.attach();
+        Assumptions.assumeTrue(capture != null, "no log4j2 core on the test classpath");
+        try (capture) {
+            this.layer = this.start("""
+                thread-management:
+                  enabled: true
+                """);
+            this.layer.currentStatus();
+
+            assertTrue(capture.errors().isEmpty(), () -> "observe-only logged an error: " + capture.errors());
+
+            this.layer.shutdown();
+            assertTrue(capture.errors().isEmpty(), () -> "stopping the layer logged an error: " + capture.errors());
+        }
+    }
+
+    private ThreadsBootstrap start(final String yaml) throws IOException {
+        final ThreadsBootstrap bootstrap = new ThreadsBootstrap();
+        bootstrap.startWith(new ThreadsConfig(this.write(yaml)));
+        return bootstrap;
+    }
+
+    private Path write(final String contents) throws IOException {
+        final Path file = this.directory.resolve("tuff.yml");
+        Files.writeString(file, contents, StandardCharsets.UTF_8);
+        return file;
+    }
+
+    /**
+     * Snapshot of every live thread this project owns.
+     *
+     * @return thread id to name, sorted by id
+     */
+    private static SortedMap<Long, String> ourThreads() {
+        final SortedMap<Long, String> found = new TreeMap<>();
+        for (final Thread thread : Thread.getAllStackTraces().keySet()) {
+            final String name = thread.getName();
+            if (isOurs(name)) {
+                found.put(thread.threadId(), name);
+            }
+        }
+        return found;
+    }
+
+    /**
+     * Threads that appeared after {@code before} and belong to this project.
+     *
+     * @param before snapshot taken before the action
+     * @return id to name of the new threads, empty when nothing was created
+     */
+    private static Map<Long, String> newOurThreads(final Map<Long, String> before) {
+        final SortedMap<Long, String> created = new TreeMap<>(ourThreads());
+        created.keySet().removeAll(before.keySet());
+        return created;
+    }
+
+    private static boolean isOurs(final String name) {
+        for (final String prefix : OWN_PREFIXES) {
+            if (name.startsWith(prefix)) {
+                return true;
+            }
+        }
+        for (final String marker : OWN_INFIXES) {
+            if (name.contains(marker)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
