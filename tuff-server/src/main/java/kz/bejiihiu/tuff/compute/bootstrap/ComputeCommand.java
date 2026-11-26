@@ -19,6 +19,7 @@ import org.jspecify.annotations.Nullable;
  *     <li>{@code /tuff compute tasks [n]} - running tasks and the slowest recent completions;</li>
  *     <li>{@code /tuff compute reload} - re-read {@code config/tuff.yml};</li>
  *     <li>{@code /tuff compute jfr start|stop|dump} - Flight Recorder control;</li>
+ *     <li>{@code /tuff threads} - pools, coverage and degraded reasons of the thread layer;</li>
  *     <li>{@code /tuff status} and {@code /tuff reload} - shorthands for the two commands above.</li>
  * </ul>
  */
@@ -28,7 +29,7 @@ public final class ComputeCommand {
      * Usage line shown on argument errors and in {@code /help}.
      */
     public static final String USAGE =
-        "/tuff [compute] [consumers|tasks [n]|reload|jfr <start|stop|dump>]";
+        "/tuff [compute] [consumers|tasks [n]|reload|jfr <start|stop|dump>] | /tuff threads";
 
     /**
      * Number of tasks {@code /tuff compute tasks} shows when no count is given.
@@ -40,7 +41,7 @@ public final class ComputeCommand {
      */
     public static final int MAX_TASK_LIMIT = 50;
 
-    private static final List<String> ROOT = List.of("compute", "status", "reload");
+    private static final List<String> ROOT = List.of("compute", "status", "reload", "threads");
     private static final List<String> COMPUTE = List.of("consumers", "tasks", "reload", "jfr");
     private static final List<String> JFR = List.of("start", "stop", "dump");
 
@@ -60,6 +61,7 @@ public final class ComputeCommand {
         return switch (args[0].toLowerCase(Locale.ROOT)) {
             case "status" -> exactly(args, 1, Action.SUMMARY);
             case "reload" -> exactly(args, 1, Action.RELOAD);
+            case "threads" -> exactly(args, 1, Action.THREADS);
             case "compute" -> parseCompute(args);
             default -> Request.error("Unknown subcommand '" + args[0] + "'. Usage: " + USAGE);
         };
@@ -177,6 +179,11 @@ public final class ComputeCommand {
          * Re-read {@code config/tuff.yml} and apply what the running engine can adopt.
          */
         RELOAD,
+
+        /**
+         * Pools, coverage, degradation and unknown threads of the unified thread layer.
+         */
+        THREADS,
 
         /**
          * Start a Flight Recorder recording that includes the compute events.

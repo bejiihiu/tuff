@@ -82,6 +82,10 @@ class ThreadManagerRuntimeImplTest {
         final ResourceSnapshot snapshot = this.sample(manager);
         assertEquals(7, snapshot.pools().size());
         assertEquals(0, snapshot.totalThreads());
+        assertEquals(manager.resources().usableCores(), snapshot.usableCores(),
+            "the manager snapshot must publish the controller's usable");
+        assertEquals(manager.resources().budgetLedger(), snapshot.budgetLedger().orElseThrow(),
+            "the command path gets the same printable ledger the controller uses");
 
         runtime.shutdown(Duration.ZERO);
     }

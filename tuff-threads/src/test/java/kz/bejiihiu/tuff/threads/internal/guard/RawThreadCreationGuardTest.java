@@ -139,11 +139,6 @@ class RawThreadCreationGuardTest {
             "tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/internal/util/ThreadFactories.java",
             "compute's own factory, the legacy single creation point"
         );
-        // legacy virtual pump thread of compute; the virtual lane is adopted in phase 3
-        allowlist.put(
-            "tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/internal/engine/impl/VirtualLane.java",
-            "legacy compute virtual lane pump"
-        );
         // legacy compute engine: completion executor, janitor, timer and workers live here today
         allowlist.put(
             "tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/internal/engine/impl/ComputeEngineImpl.java",

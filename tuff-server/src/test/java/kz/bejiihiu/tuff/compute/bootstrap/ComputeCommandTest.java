@@ -94,8 +94,14 @@ class ComputeCommandTest {
     }
 
     @Test
+    void threadsSubcommandShowsThePoolSummary() {
+        assertAction(ComputeCommand.Action.THREADS, "threads");
+        assertAction(ComputeCommand.Action.THREADS, "THREADS");
+    }
+
+    @Test
     void completionsWalkDownTheArgumentTree() {
-        assertEquals(List.of("compute", "status", "reload"), completions(""));
+        assertEquals(List.of("compute", "status", "reload", "threads"), completions(""));
         assertEquals(List.of("compute"), completions("c"));
         assertEquals(List.of("consumers", "tasks", "reload", "jfr"), completions("compute", ""));
         assertEquals(List.of("tasks"), completions("compute", "t"));

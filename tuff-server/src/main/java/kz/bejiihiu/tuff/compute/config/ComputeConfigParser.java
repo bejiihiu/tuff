@@ -51,7 +51,7 @@ final class ComputeConfigParser {
     private static final String DEFAULT_CONSUMER = "default";
     private static final String ALLOW_DYNAMIC_REGISTRATION = "allow-dynamic-registration";
 
-    private static final Set<String> ROOT_KEYS = Set.of(SECTION);
+    private static final Set<String> ROOT_KEYS = Set.of(SECTION, "thread-management");
     private static final Set<String> SETTINGS_KEYS = Set.of(
         "enabled", "workers", "queue", "scheduling", "consumers", "metrics", "adaptive", "lanes", "shutdown-grace-seconds"
     );

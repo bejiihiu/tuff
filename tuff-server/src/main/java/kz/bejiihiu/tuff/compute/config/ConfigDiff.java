@@ -20,7 +20,7 @@ import java.util.TreeSet;
  * startup-only: worker sizing, queue capacity, scheduling, metrics, adaptive control, the lanes and
  * the shutdown grace period all need a restart even though the file keeps the new value for the next
  * start. Only consumer policies (and {@code queue.overflow-policy}, which feeds them) can change on
- * a live pool.
+ * a live pool. The whole {@code thread-management} section is startup-only as well.
  *
  * @param changedPaths         every key whose effective value differs, sorted
  * @param restartRequiredPaths the subset that a running scheduler cannot adopt safely, sorted
@@ -43,7 +43,9 @@ public record ConfigDiff(List<String> changedPaths, List<String> restartRequired
         "async-compute.scheduling.",
         "async-compute.metrics.",
         "async-compute.adaptive.",
-        "async-compute.lanes."
+        "async-compute.lanes.",
+        // the thread layer reads its whole section once, when it starts: no key of it is live
+        "thread-management."
     );
 
     /**

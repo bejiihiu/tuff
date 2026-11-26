@@ -48,7 +48,7 @@ class TuffComputeConfigTest {
         final String written = Files.readString(this.file(), StandardCharsets.UTF_8);
         assertTrue(written.contains("async-compute:"), "file must contain the section");
         assertTrue(written.contains("Tuff Compute Worker"), "file must contain the shipped defaults");
-        assertTrue(written.contains("Tuff - compute scheduler configuration"), "file must start with a header");
+        assertTrue(written.contains("Tuff - server configuration"), "file must start with a header");
 
         final ConfigLoadResult second = config.load();
         assertFalse(second.createdFile());
@@ -63,7 +63,7 @@ class TuffComputeConfigTest {
         config.load();
 
         final String created = Files.readString(this.file(), StandardCharsets.UTF_8);
-        assertTrue(created.contains("Tuff - compute scheduler configuration"), "created file must carry the banner comment");
+        assertTrue(created.contains("Tuff - server configuration"), "created file must carry the banner comment");
 
         Files.writeString(this.file(), """
             # Конфигурация движка вычислений Tuff

@@ -62,4 +62,18 @@ public interface ThreadManagerRuntime {
      * @throws IllegalArgumentException if {@code timeout} is negative
      */
     boolean awaitTermination(Duration timeout) throws InterruptedException;
+
+    /**
+     * Attaches an observation probe to a registered pool.
+     *
+     * <p>The seam exists because the probe registry is internal while pool owners live outside this
+     * module: a subsystem that is only observed (Folia's region pool, for example) still wants its
+     * thread list and counters in the snapshot. The pool has to be registered first; attaching a second
+     * probe to the same pool replaces the first, so calling this again after a reload is harmless.
+     *
+     * @param probe the probe, bound to one pool id
+     * @throws NullPointerException  if {@code probe} is {@code null}
+     * @throws IllegalStateException if the pool is not registered or the runtime is shutting down
+     */
+    void attachProbe(PoolProbe probe);
 }

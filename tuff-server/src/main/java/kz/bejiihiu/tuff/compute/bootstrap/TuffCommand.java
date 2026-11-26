@@ -3,6 +3,8 @@ package kz.bejiihiu.tuff.compute.bootstrap;
 import io.papermc.paper.threadedregions.RegionizedServer;
 import java.util.List;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
+import kz.bejiihiu.tuff.threads.bootstrap.ThreadsBootstrap;
+import kz.bejiihiu.tuff.threads.bootstrap.ThreadsReport;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
@@ -17,8 +19,8 @@ import org.bukkit.plugin.PluginManager;
 import org.jspecify.annotations.Nullable;
 
 /**
- * The {@code /tuff} server command: engine summary, per consumer breakdown, configuration reload and
- * Flight Recorder control.
+ * The {@code /tuff} server command: engine summary, per consumer breakdown, configuration reload,
+ * Flight Recorder control and the thread layer summary.
  *
  * <p>Registered through the Bukkit command map next to {@code /tps}, so it survives {@code /reload}
  * and works from the console and from players alike. Reading metrics is lock free and can happen on
@@ -50,14 +52,14 @@ public final class TuffCommand extends Command implements TabCompleter {
         super("tuff", "Inspects and controls the Tuff compute engine.", ComputeCommand.USAGE, List.of());
         this.setPermission(PERMISSION);
         this.permissionMessage(Component.text(
-            "You do not have permission to inspect the Tuff compute engine.", NamedTextColor.RED));
+            "You do not have permission to use the Tuff command.", NamedTextColor.RED));
     }
 
     @Override
     public boolean execute(final CommandSender sender, final String commandLabel, final String[] args) {
         if (!this.testPermissionSilent(sender)) {
             sender.sendMessage(Component.text(
-                "You do not have permission to inspect the Tuff compute engine.", NamedTextColor.RED));
+                "You do not have permission to use the Tuff command.", NamedTextColor.RED));
             return true;
         }
         final ComputeCommand.Request request = ComputeCommand.parse(args);
@@ -74,6 +76,7 @@ public final class TuffCommand extends Command implements TabCompleter {
             case SUMMARY -> this.send(sender, ComputeReport.overview(ComputeBootstrap.status()));
             case CONSUMERS -> this.send(sender, ComputeReport.consumers(ComputeBootstrap.status()));
             case TASKS -> this.send(sender, ComputeReport.tasks(ComputeBootstrap.status(), request.limit()));
+            case THREADS -> this.send(sender, ThreadsReport.overview(ThreadsBootstrap.status()));
             case RELOAD -> this.reload(sender);
             case JFR_START -> this.startRecording(sender);
             case JFR_STOP, JFR_DUMP -> this.controlRecording(sender, action == ComputeCommand.Action.JFR_STOP);
@@ -188,7 +191,7 @@ public final class TuffCommand extends Command implements TabCompleter {
         }
         pluginManager.addPermission(new Permission(
             PERMISSION,
-            "Allows inspecting, reloading and profiling the Tuff compute engine.",
+            "Allows inspecting, reloading and profiling the Tuff compute engine and thread layer.",
             PermissionDefault.OP
         ));
     }

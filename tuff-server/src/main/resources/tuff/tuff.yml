@@ -1,9 +1,10 @@
-# Tuff - compute scheduler configuration.
+# Tuff - server configuration.
 #
-# The compute scheduler is a shared worker pool for server side work that must not touch world state
-# from a foreign thread: chunk generation, pathfinding, AI planning and anything a plugin wants to
-# offload. Workers never own entities or chunks; results are handed back to the region thread that
-# asked for them.
+# Two subsystems read this file. "thread-management" is the unified thread layer: it observes (and
+# later manages) the thread pools the server already runs. "async-compute" is the shared worker pool
+# for server side work that must not touch world state from a foreign thread: chunk generation,
+# pathfinding, AI planning and anything a plugin wants to offload. Workers never own entities or
+# chunks; results are handed back to the region thread that asked for them.
 #
 # Values marked "-1" mean "let the scheduler choose". Durations are written in the unit named in the
 # key. Keys you leave out keep their default, unknown keys are reported in the console and ignored,
@@ -11,9 +12,87 @@
 # server.
 #
 # The file is read at startup and re-read by /tuff reload. Most settings are baked into the running
-# pool (enabled, workers, queue capacity, scheduling, metrics, adaptive, dynamic registration, lanes
-# and the shutdown grace period); the reload log lists them as "takes effect after a restart". Only
-# consumer policies can change on a live pool.
+# pools (enabled, workers, queue capacity, scheduling, metrics, adaptive, dynamic registration, lanes,
+# the shutdown grace period and the whole thread-management section); the reload log lists them as
+# "takes effect after a restart". Only compute consumer policies can change on a live pool.
+
+thread-management:
+  # Master switch of the unified thread layer. When false no runtime is created at all: no pool is
+  # registered, no metrics are sampled and no thread is started. /tuff threads still answers and says
+  # where the switch is. Changing it needs a restart.
+  enabled: true
+
+  resources:
+    # Size pools from the platform's real processor count and container limits instead of a static
+    # table. Keep this on unless you are diagnosing a wrong topology reading.
+    cpu-aware: true
+    # Processors never handed to managed pools, kept for GC, JIT, the kernel and unexpected work.
+    # Zero is legal but risky on small machines. Changes here need a restart.
+    reserve-cores: 1
+    # Global cap on concurrently executing leased tasks, or -1 for no cap. Pools still apply their
+    # own limits on top.
+    max-concurrent-tasks: -1
+
+  lifecycle:
+    # New server owned threads must come from the central factory. This is a policy statement that
+    # code review and the static guard enforce; it does not change threads that already exist.
+    centralized-thread-factory: true
+    # Sample thread states, CPU time and creation/termination rates. Turning this off keeps the layer
+    # running but leaves the counters empty; /tuff threads then says that metrics are disabled.
+    monitor-threads: true
+
+  region-execution:
+    # Let the thread layer create Folia's region tick threads and account their lifecycle. Off is
+    # observation only: Folia keeps its scheduler, its thread class and its order. Managed mode is a
+    # separate, reviewed step and needs its own load test, so the default is off.
+    managed: false
+    # Must stay true. Folia owns tick order, catch up and region ownership; turning this off is
+    # rejected at startup instead of being silently ignored.
+    preserve-folia-scheduling: true
+    # Region scheduler variant:
+    #   edf           - Folia's earliest deadline first, cannot be resized while running (default)
+    #   work-stealing - Folia's alternative, supports live resize
+    #   kairos        - Tuff's experimental elastic scheduler, also needs kairos-unstable: true
+    scheduler: edf
+    # Region tick threads, or -1 for Folia's own formula. A fixed count needs a restart; EDF cannot
+    # change it while the server runs.
+    threads: -1
+    # Region grid exponent, between 0 and 31. Smaller regions split the world more finely. Restart
+    # only.
+    grid-exponent: 4
+    # Explicit opt in for the experimental Kairos scheduler. Never enabled implicitly; turning it on
+    # without its own A/B run is not supported.
+    kairos-unstable: false
+
+  async-compute:
+    # Let the thread layer own the compute engine's platform pool capacity. Off keeps the engine's
+    # own sizing and its own queue; the engine is observed at L1 either way. Needs a restart.
+    managed: false
+    # Ceiling for that pool, or -1 to keep the engine's configured maximum.
+    max-threads: -1
+
+  execution-pools:
+    network:
+      # Influence the network event loop pools. Off observes them only; their sizing, ordering and
+      # affinity stay netty's.
+      managed: false
+      # Must stay true. Network loops cannot be merged or reshaped without changing their semantics;
+      # turning this off is rejected at startup.
+      preserve-specialization: true
+    chunk-system:
+      # Influence the chunk generation and chunk IO pools. Off observes them only.
+      managed: false
+      # Must stay true, for the same reason as above.
+      preserve-specialization: true
+
+  metrics:
+    # Collect pool and thread state at all. With collection off the other flags have no effect,
+    # snapshots carry zeros and /tuff threads says that metrics are disabled.
+    enabled: true
+    # Publish per pool counters and saturation.
+    per-pool: true
+    # Publish the per thread list. Disabling it keeps pool totals but removes individual threads.
+    per-thread: true
 
 async-compute:
   # Master switch. When false the scheduler starts no worker threads and every submission is

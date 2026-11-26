@@ -16,6 +16,7 @@ import kz.bejiihiu.tuff.compute.config.ConfigLoadResult;
 import kz.bejiihiu.tuff.compute.config.TuffComputeConfig;
 import kz.bejiihiu.tuff.compute.internal.engine.impl.ComputeSchedulers;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.threads.bootstrap.ThreadsBootstrap;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jspecify.annotations.Nullable;
@@ -77,6 +78,13 @@ public final class ComputeBootstrap {
         synchronized (LOCK) {
             if (config != null) {
                 return;
+            }
+            // the thread layer goes first: it only registers pools and attaches probes, so the compute
+            // engine already sees a registered world when it starts and asks for a budget
+            try {
+                ThreadsBootstrap.start();
+            } catch (final Throwable ex) {
+                LOGGER.error("Could not start the Tuff thread layer; the compute engine starts without it", ex);
             }
             final TuffComputeConfig loaded = TuffComputeConfig.serverWide();
             config = loaded;
@@ -150,6 +158,20 @@ public final class ComputeBootstrap {
         ComputeJfr.shutdown();
         TuffCompute.uninstall();
 
+        try {
+            stopEngine();
+        } finally {
+            // reverse of startup: compute is down, only then does the accounting layer go away. it owns
+            // no executor, so this cannot outlive the shutdown budget
+            try {
+                ThreadsBootstrap.stop();
+            } catch (final Throwable ex) {
+                LOGGER.error("Could not stop the Tuff thread layer", ex);
+            }
+        }
+    }
+
+    private static void stopEngine() {
         final ComputeStatus previous = status;
         final @Nullable AsyncComputeScheduler scheduler = previous.engine().orElse(null);
         status = ComputeStatus.notInitialised();

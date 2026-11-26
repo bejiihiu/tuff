@@ -17,6 +17,7 @@ import kz.bejiihiu.tuff.threads.internal.impl.pools.ExecutionPoolRegistryImpl;
 import kz.bejiihiu.tuff.threads.internal.impl.pools.PoolProbeRegistryImpl;
 import kz.bejiihiu.tuff.threads.internal.impl.registry.ThreadRegistryImpl;
 import kz.bejiihiu.tuff.threads.internal.spi.MonotonicClock;
+import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
 import kz.bejiihiu.tuff.threads.internal.spi.TopologyView;
 import org.jspecify.annotations.Nullable;
@@ -187,6 +188,12 @@ final class ThreadManagerRuntimeImpl implements ThreadManagerRuntime {
             }
             return true;
         }
+    }
+
+    @Override
+    public void attachProbe(final PoolProbe probe) {
+        Objects.requireNonNull(probe, "probe");
+        this.probes.attach(probe);
     }
 
     /**
