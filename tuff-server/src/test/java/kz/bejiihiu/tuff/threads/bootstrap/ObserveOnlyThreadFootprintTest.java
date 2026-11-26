@@ -140,13 +140,14 @@ class ObserveOnlyThreadFootprintTest {
         assertEquals(ThreadsStatus.State.NOT_INITIALISED, this.layer.currentStatus().state());
         assertEquals(Map.of(), newOurThreads(before));
 
-        // the lifecycle is one shot per process on purpose: the server calls start once and stop once,
-        // and a stale runtime must never come back to life because a command or a test asked again
+        // the instance is reusable, but nothing stale comes back: start after stop builds a fresh
+        // runtime from the file, and the old one is already gone (no pool, no adapter, no thread)
         this.layer.startWith(config);
-        assertEquals(ThreadsStatus.State.NOT_INITIALISED, this.layer.currentStatus().state(),
-            "a stopped layer is not restarted behind the server's back");
-        assertFalse(this.layer.regionPoolRegistered());
-        assertEquals(Map.of(), newOurThreads(before));
+        assertEquals(ThreadsStatus.State.RUNNING, this.layer.currentStatus().state(),
+            "a stopped layer must start again instead of silently ignoring the request");
+        assertTrue(this.layer.regionPoolRegistered(), "the fresh runtime registers the canonical pools");
+        assertEquals(7, this.layer.currentStatus().snapshot().pools().size());
+        assertEquals(Map.of(), newOurThreads(before), "restarting must not leave a thread behind either");
     }
 
     @Test

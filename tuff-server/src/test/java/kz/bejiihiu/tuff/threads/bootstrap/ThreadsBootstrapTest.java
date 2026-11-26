@@ -90,6 +90,34 @@ class ThreadsBootstrapTest {
     }
 
     @Test
+    void aLayerCanBeStartedAgainAfterItWasStopped() throws IOException {
+        final Path file = this.write("""
+            thread-management:
+              enabled: true
+            """);
+        final ThreadsBootstrap bootstrap = new ThreadsBootstrap();
+        final ThreadsConfig config = new ThreadsConfig(file);
+
+        bootstrap.startWith(config);
+        assertEquals(ThreadsStatus.State.RUNNING, bootstrap.currentStatus().state());
+        assertNotNull(bootstrap.adapterFor(ComputeSettings.defaults()), "the first start serves the engine");
+
+        bootstrap.shutdown();
+        assertEquals(ThreadsStatus.State.NOT_INITIALISED, bootstrap.currentStatus().state());
+        assertFalse(bootstrap.regionPoolRegistered(), "a stopped layer must not keep its pools");
+        assertNull(bootstrap.adapterFor(ComputeSettings.defaults()), "a stopped layer has no adapter");
+
+        bootstrap.startWith(config);
+
+        assertEquals(ThreadsStatus.State.RUNNING, bootstrap.currentStatus().state(),
+            "a start after stop must build a new runtime instead of quietly doing nothing");
+        assertTrue(bootstrap.regionPoolRegistered(), "the second start registers the pools again");
+        assertNotNull(bootstrap.adapterFor(ComputeSettings.defaults()), "the second start serves the engine again");
+        bootstrap.shutdown();
+        assertEquals(ThreadsStatus.State.NOT_INITIALISED, bootstrap.currentStatus().state());
+    }
+
+    @Test
     void aMissingConfigurationStillStartsWithTheDefaults() {
         final ThreadsBootstrap bootstrap = new ThreadsBootstrap();
 

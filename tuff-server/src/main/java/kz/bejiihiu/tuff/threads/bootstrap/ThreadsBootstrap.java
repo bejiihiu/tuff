@@ -47,7 +47,8 @@ import org.jspecify.annotations.Nullable;
  *
  * <p>The lifecycle is an instance so it can be driven more than once in a process, which is what the
  * startup and shutdown tests do; {@link #start()}, {@link #stop()} and {@link #status()} act on the one
- * instance bound to the server.
+ * instance bound to the server. {@link #shutdown()} leaves the instance reusable: a later start builds
+ * a fresh runtime, so a stopped layer never turns a restart into a silent no-op.
  */
 public final class ThreadsBootstrap {
 
@@ -110,11 +111,20 @@ public final class ThreadsBootstrap {
     /**
      * Starts the layer from a specific configuration.
      *
+     * <p>Starting a layer that is already up - running, disabled or failed - is a no-op, so the
+     * startup hook can be called more than once without building a second runtime. After
+     * {@link #shutdown()} the instance is reusable: the next call builds a fresh runtime from the
+     * file as it is on disk then.
+     *
      * @param config configuration to read
      */
     void startWith(final ThreadsConfig config) {
         synchronized (this.lock) {
             if (this.started) {
+                // legitimate when the hook runs twice, but an operator debugging a restart should be
+                // able to tell "already started" apart from "never called"
+                LOGGER.debug("Tuff thread management is already up ({}); ignoring the start request",
+                    this.status.state());
                 return;
             }
             this.started = true;
@@ -158,6 +168,10 @@ public final class ThreadsBootstrap {
 
     /**
      * Stops the layer and forgets the runtime.
+     *
+     * <p>Leaves the instance ready for another start: the flag that makes a repeated start a no-op is
+     * cleared here, together with the runtime and the status. Without that reset a started-then-stopped
+     * bootstrap would quietly ignore every later start.
      */
     void shutdown() {
         synchronized (this.lock) {
@@ -165,6 +179,7 @@ public final class ThreadsBootstrap {
             final ThreadsStatus previous = this.status;
             this.runtime = null;
             this.computeAdapter = null;
+            this.started = false;
             this.status = ThreadsStatus.notInitialised();
             if (current == null) {
                 // one line even when there is nothing to stop, otherwise an operator cannot tell the hook
