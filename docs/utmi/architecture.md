@@ -111,7 +111,7 @@ What the running layer actually registers and measures in this build:
 
 | Pool id | Kind | Registered coverage | Live numbers | Threads created by UTMI | Capacity from the ledger |
 | --- | --- | --- | --- | --- | --- |
-| `region-execution` | `REGION_EXECUTION` | L1; L2 when `region-execution.managed: true` | Yes, through the probe | No | No |
+| `region-execution` | `REGION_EXECUTION` | L1; L2 when `region-execution.managed: true` | Yes, through the probe | No; at L2 their bodies are wrapped for accounting | No |
 | `compute` | `COMPUTE` | L1 | No: `alive 0`, queue unknown | No | No |
 | `compute-virtual` | `VIRTUAL` | L1 | No | No | No |
 | `chunk-worker` | `CHUNK` | L1; L2 when `execution-pools.chunk-system.managed: true` | No | No | No |
@@ -122,6 +122,12 @@ What the running layer actually registers and measures in this build:
 `region-execution` is the only pool with a probe. Unprobed pools are still registered, so they appear
 in `/tuff threads` with their spec and `alive 0`; that is a measured zero (the registry holds no
 threads for them), not an unknown value.
+
+`region-execution` at L2 is the one place where "threads created through the provider" is read as
+"bodies wrapped by the provider": Folia constructs and owns the `TickThreadRunner` because the tick
+class is checked on every tick, and only the runnable it runs is passed through
+`ThreadFactoryProvider.wrap`. Accounting and lifecycle visibility are what L2 buys here; the thread
+itself never leaves Folia.
 
 The subsystem picture behind those seven entries, and how far each is planned to go:
 

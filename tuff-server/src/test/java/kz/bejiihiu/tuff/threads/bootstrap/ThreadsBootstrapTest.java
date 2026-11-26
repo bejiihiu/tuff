@@ -16,6 +16,7 @@ import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.PoolSnapshot;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.ThreadSnapshot;
+import kz.bejiihiu.tuff.threads.bridge.RegionThreads;
 import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -23,7 +24,9 @@ import org.junit.jupiter.api.io.TempDir;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ThreadsBootstrapTest {
@@ -130,6 +133,49 @@ class ThreadsBootstrapTest {
 
         assertEquals(ThreadsStatus.State.RUNNING, bootstrap.currentStatus().state());
         assertTrue(bootstrap.regionPoolRegistered());
+        bootstrap.shutdown();
+    }
+
+    @Test
+    void aManagedRegionPoolIsRegisteredAtL2BeforeTheSchedulerExists() throws IOException {
+        final ThreadsBootstrap bootstrap = new ThreadsBootstrap();
+        bootstrap.startWith(new ThreadsConfig(this.write("""
+            thread-management:
+              enabled: true
+              region-execution:
+                managed: true
+            """)));
+
+        final PoolSnapshot region = bootstrap.currentStatus().snapshot()
+            .pool(PoolId.REGION_EXECUTION).orElseThrow();
+        assertEquals(CoverageLevel.L2, region.coverage(), "managed means L2, not L3");
+        assertEquals(1, region.spec().minThreads(), "an L2 pool needs a positive floor");
+
+        final Runnable body = () -> { };
+        assertNotSame(body, RegionThreads.wrapBody(body),
+            "a managed region pool must wrap the bodies Folia's factory hands over");
+
+        bootstrap.shutdown();
+        assertSame(body, RegionThreads.wrapBody(body),
+            "after stop nothing may be wrapped, including bodies created during shutdown");
+    }
+
+    @Test
+    void anObserveOnlyRegionPoolKeepsFoliaThreadsUntouched() throws IOException {
+        final ThreadsBootstrap bootstrap = new ThreadsBootstrap();
+        bootstrap.startWith(new ThreadsConfig(this.write("""
+            thread-management:
+              enabled: true
+            """)));
+
+        final PoolSnapshot region = bootstrap.currentStatus().snapshot()
+            .pool(PoolId.REGION_EXECUTION).orElseThrow();
+        assertEquals(CoverageLevel.L1, region.coverage());
+        assertEquals(0, region.spec().minThreads());
+
+        final Runnable body = () -> { };
+        assertSame(body, RegionThreads.wrapBody(body), "the default configuration must change nothing");
+
         bootstrap.shutdown();
     }
 

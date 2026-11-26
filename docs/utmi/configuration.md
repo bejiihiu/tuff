@@ -60,7 +60,7 @@ thread-management:
 | `resources.max-concurrent-tasks` | integer, `-1` or ≥ 1 | `-1` | restart | Global cap on concurrently leased tasks across pools. critical pools (`region-execution`, `network`) bypass it by policy; `-1` disables the cap and leaves only per-pool permits |
 | `lifecycle.centralized-thread-factory` | boolean | `true` | restart | Policy statement: new server-owned threads should come from `ThreadFactoryProvider`. It does not move existing threads and is enforced by code review and the static guard, not by the flag alone |
 | `lifecycle.monitor-threads` | boolean | `true` | restart | Sample thread states, CPU time and creation/termination rates. Combined with `metrics.enabled` with AND: either switch off leaves the layer running with a structural snapshot (registered pools and registry-known thread counts, no measured values) |
-| `region-execution.managed` | boolean | `false` | restart | Raises the registered coverage of the region pool from L1 to L2. In this build Folia still creates the threads itself, so the flag changes what the layer claims, not who builds the threads; see [architecture](architecture.md#current-matrix) |
+| `region-execution.managed` | boolean | `false` | restart | Raises the registered coverage of the region pool from L1 to L2 and lets Folia's thread factory hand each tick body to the thread layer for accounting. Folia still creates, names, groups and schedules its own `TickThreadRunner`; only the body is wrapped, so class, group, daemon flag and uncaught handler are unchanged; see [architecture](architecture.md#current-matrix) |
 | `region-execution.preserve-folia-scheduling` | boolean | `true` | n/a | Must stay `true`. Folia owns tick order, catch-up and region ownership. `false` is rejected at startup instead of being silently ignored |
 | `region-execution.scheduler` | `edf` \| `work-stealing` \| `kairos` | `edf` | restart | Region scheduler variant the configuration describes. `kairos` additionally requires `kairos-unstable: true` |
 | `region-execution.threads` | integer, `-1` or ≥ 1 | `-1` | restart | Tick thread count used by the pool spec and the budget deduction. It is **not** the number Folia runs: Folia reads `threaded-regions.threads` from `paper-global.yml` (or its own auto formula). `-1` leaves the deduction at zero |
@@ -86,7 +86,7 @@ fields rather than levers that move threads today.
 | `region-execution.threads` | The registered pool spec and the budget deduction change. Folia's tick thread count does not: it comes from `paper-global.yml: threaded-regions.threads`, and under EDF it cannot change without a restart anyway |
 | `region-execution.scheduler` | The configured and reported scheduler variant changes. It does not switch Folia's live scheduler; that happens only through the platform key and a restart, and `kairos` has no implementation yet |
 | `region-execution.grid-exponent` | The model value changes. The regioniser's shift is fixed at the first initialisation |
-| `execution-pools.chunk-system.managed` or `network.managed` | The pool is registered with coverage L2 instead of L1, and `/tuff threads` prints the deeper level. No thread is created through the factory, because no owner hands its factory over yet. The manager does not flag this as a conflict for these kinds — treat the printed level as a registration claim, not proof of management |
+| `execution-pools.chunk-system.managed` or `network.managed` | The pool is registered with coverage L2 instead of L1, and `/tuff threads` prints the deeper level. No thread is created through the factory, because no owner hands its factory over yet. The manager does not flag this as a conflict for these kinds — treat the printed level as a registration claim, not proof of management. `region-execution.managed` is different: that pool's bodies are really wrapped |
 | `async-compute.managed` | The compute pool is still registered at L1 and the snapshot reports `CONFIG_CONFLICT`, because the adapter that would deliver the promised management is not wired |
 | `metrics.per-pool: false` | Pool entries disappear from the snapshot and `/tuff threads`. Degradation reasons are still collected at the top level; measurement continues |
 | `lifecycle.centralized-thread-factory: false` | Nothing. The flag is a policy statement; the guard and review remain the enforcement |
@@ -132,8 +132,11 @@ thread-management:
 
 The ledger now subtracts four tick threads instead of zero. It still does not size any pool.
 
-**Experimental managed region (L2).** Only after the factory hook exists in the build you run;
-today this changes the printed coverage and nothing else:
+**Managed region (L2).** `managed: true` registers the pool at L2 and wraps each tick body through
+`ThreadFactoryProvider.wrap`, so Folia's region threads are accounted while they run. Folia still
+creates the threads, names them and schedules them; the class, group, daemon flag and uncaught handler
+are untouched. With a custom build that lacks the factory hook the flag only changes the printed
+coverage:
 
 ```yaml
 thread-management:

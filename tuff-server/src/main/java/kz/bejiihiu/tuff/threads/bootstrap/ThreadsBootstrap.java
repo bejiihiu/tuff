@@ -9,6 +9,7 @@ import kz.bejiihiu.tuff.compute.config.ConfigProblem;
 import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import kz.bejiihiu.tuff.threads.UnifiedThreadManager;
+import kz.bejiihiu.tuff.threads.bridge.RegionThreads;
 import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
 import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
@@ -25,7 +26,9 @@ import org.jspecify.annotations.Nullable;
  * <ol>
  *     <li>{@link #start()} runs first, at the top of {@code ComputeBootstrap.start()}. The runtime is
  *     built from {@code thread-management} and started; starting it registers the canonical pools at
- *     their configured coverage. The region pool is then attached to a probe, because the manager cannot
+ *     their configured coverage. The region bridge is installed right after, before Folia constructs
+ *     its region scheduler, so a managed region pool can wrap tick bodies while everything else in that
+ *     scheduler stays Folia's. The region pool is then attached to a probe, because the manager cannot
  *     see threads it did not create, and the background refresher takes over every heavy read.</li>
  *     <li>{@link #stop()} runs last, at the bottom of {@code ComputeBootstrap.stop()}. The compute engine
  *     stops first, then the refresher is signalled and only then does the accounting layer go away.
@@ -123,6 +126,8 @@ public final class ThreadsBootstrap {
                 return;
             }
             this.started = true;
+            // a fresh start never inherits a bridge from a previous lifecycle in the same process
+            RegionThreads.clear();
             ThreadManagerRuntime created = null;
             try {
                 final ThreadsConfig.ThreadsLoadResult result = config.load();
@@ -144,6 +149,9 @@ public final class ThreadsBootstrap {
                 }
                 created = new DefaultThreadManagerFactory().create(settings);
                 created.start();
+                // before Folia builds its region scheduler, so the factory sees the L2 spec and the
+                // bridge can hand the tick bodies to the provider; a no-op when managed is off
+                RegionThreads.install(created.manager());
                 // the probe is attached after start, because start is what registers the pools; attaching
                 // earlier would be rejected by the probe registry with "pool is not registered"
                 created.attachProbe(new RegionPoolProbe());
@@ -156,6 +164,7 @@ public final class ThreadsBootstrap {
                 logStarted(created.manager());
             } catch (final Throwable ex) {
                 this.runtime = null;
+                RegionThreads.clear();
                 final ThreadsSampler partial = this.sampler;
                 this.sampler = null;
                 if (partial != null) {
@@ -187,6 +196,8 @@ public final class ThreadsBootstrap {
             this.computeAdapter = null;
             this.started = false;
             this.status = ThreadsStatus.notInitialised();
+            // before the runtime stops: no new region body may be wrapped while the manager is going down
+            RegionThreads.clear();
             // flag + interrupt, no join: this runs in the window where the watchdog is still armed and
             // a blocking wait would look like a hung server. The thread is a daemon and exits on its own
             if (currentSampler != null) {
@@ -313,7 +324,10 @@ public final class ThreadsBootstrap {
         LOGGER.info("Tuff thread management enabled: {} pool(s) registered, {}",
             manager.pools().ids().size(),
             settings.anyManagementEnabled() ? "some pools are managed" : "all pools are observed only");
-        if (settings.anyManagementEnabled()) {
+        if (settings.regionExecution().managed()) {
+            LOGGER.info("Tuff thread management: region execution is at L2; Folia still creates and schedules its "
+                + "tick threads, the manager only accounts their bodies");
+        } else if (settings.anyManagementEnabled()) {
             LOGGER.info("Tuff thread management: managed capacity is configured; the manager only creates threads for "
                 + "pools whose owner hands them over, so nothing changes for Folia's region scheduler");
         } else {

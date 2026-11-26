@@ -13,6 +13,7 @@ import org.junit.platform.suite.api.SuiteDisplayName;
 @SuiteDisplayName("Tuff thread layer tests")
 @SelectPackages({
     "kz.bejiihiu.tuff.threads.bootstrap",
+    "kz.bejiihiu.tuff.threads.bridge",
     "kz.bejiihiu.tuff.threads.observe",
     "kz.bejiihiu.tuff.threads.probe",
     "kz.bejiihiu.tuff.threads.region"
