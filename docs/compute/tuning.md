@@ -23,6 +23,8 @@ computes after its own threads exist (`ComputeThreadBudget`). A fixed `threads` 
 - `min-threads` is the idle floor. The default of `2` is why an idle server shows two workers; that is
   normal, not a leak.
 - More workers than the budget do not add throughput; they add context switches for the tick threads.
+- `scheduling.idle-wait-millis` is not a latency cap: a submission signals an idle worker. Leave it at the
+  default unless you are measuring idle recheck behaviour; lowering it only adds wake-ups.
 
 ### Virtual lane
 
@@ -34,8 +36,16 @@ a CPU-bound task on the lane competes with the platform workers for the same cor
 - Keep CPU-bound work on `NORMAL`/`HIGH` and set `normal-spill: false` if `NORMAL` is CPU-heavy.
 - Use `LOW` for work that may wait and may block (prefetch, cache warm-up, webhooks). Do not use `LOW` for a
   CPU render or a structure search.
-- The lane shares consumer quotas with the platform workers: a virtual task holds a consumer slot, so a
-  consumer can exhaust its limit on the lane.
+- The lane shares consumer quotas with the platform workers: a virtual task holds a consumer slot. A
+  relative limit is resolved against platform workers **plus** `max-concurrent`, so one consumer can keep
+  up to `max-concurrent` blocking tasks on the lane while platform work continues on the workers.
+  `absolute(N)` is exactly `N` across both lanes, and `max-concurrent` is a hard cap on virtual bodies.
+
+Measured expectations on the test machine: for blocking work at the same concurrency the lane matches the
+platform pool (about 3.6k against 4.0k ops/s at eight 1 ms blocks); for CPU work it is about 2.3x slower;
+`NORMAL` spill was rare (~0.05% of tasks) and did not raise throughput. The lane's value is isolation — a
+blocked virtual task does not hold a platform worker — not extra throughput. See
+[Benchmarks § Execution lanes](benchmarks.md#execution-lanes).
 
 ## Presets
 
@@ -59,8 +69,6 @@ async-compute:
   queue:
     capacity: 1024
     overflow-policy: reject
-  scheduling:
-    idle-wait-millis: 10
   lanes:
     virtual:
       enabled: true
@@ -90,7 +98,6 @@ async-compute:
     capacity: 4096
     overflow-policy: reject
   scheduling:
-    idle-wait-millis: 10
     aging-interval-millis: 1000
     max-aging-boost: 3
   lanes:
@@ -123,7 +130,6 @@ async-compute:
     capacity: 16384
   scheduling:
     strategy: weighted-fair
-    idle-wait-millis: 10
   lanes:
     virtual:
       enabled: true
@@ -160,7 +166,6 @@ async-compute:
   queue:
     capacity: 4096
   scheduling:
-    idle-wait-millis: 5
     aging-interval-millis: 500
     max-aging-boost: 3
   lanes:
@@ -239,7 +244,6 @@ async-compute:
     capacity: 8192
   scheduling:
     strategy: weighted-fair
-    idle-wait-millis: 10
   lanes:
     virtual:
       enabled: true
@@ -264,7 +268,7 @@ may wait; if it is CPU-bound, `LOW` sends it to virtual threads and makes tick j
 | Blocking IO: HTTP, database, disk, plugin APIs that wait | `LOW` | virtual | `lanes.virtual.max-concurrent` to the downstream pool; `spill-wait-millis` low if `NORMAL` IO also needs the lane |
 | CPU compute: rendering, pathfinding, structure search, serialisation | `NORMAL` (or `HIGH` when it gates a region) | platform | `workers.max-threads`/`threads` against the budget; `normal-spill: false` |
 | Bursty work: login waves, world events | `NORMAL` | platform, with spill as a tail valve | `queue.capacity`, per-consumer `max-queued-tasks`, `max-queue-wait-seconds`, modest spill depth |
-| Latency-critical: a player is waiting now | `CRITICAL`/`HIGH` | platform, never spill | `min-threads` high enough for the expected concurrency, low `idle-wait-millis`; do not rely on the lane |
+| Latency-critical: a player is waiting now | `CRITICAL`/`HIGH` | platform, never spill | `min-threads` high enough for the expected concurrency; do not rely on the lane |
 | Disposable cache warm-up, speculative prefetch | `LOW` | virtual | `max-concurrent` and `max-queue-wait-seconds`; rejects or expiry are acceptable |
 
 `CRITICAL` is not a capacity reservation. A flood of `CRITICAL` work degrades scheduling into FIFO; use it
@@ -275,6 +279,12 @@ only when a person is actually waiting.
 Spill is a tail valve for `NORMAL` work, opened only while the platform lane is saturated. It uses two
 OR-ed triggers: the queue depth (`spill-queue-depth`) and the age of the oldest queued `NORMAL` task
 (`spill-wait-millis`).
+
+The measured effect was small: 1-3 spilled tasks per second (~0.05%) at a saturated eight-worker pool and no
+throughput change. That run predates the quota change that counts lane permits in the consumer capacity, so
+treat the rate as a lower bound rather than a property of the lane. The shape does not change: spill is a
+pressure valve for blocking work, not a second CPU pool and not a capacity plan. For blocking throughput,
+size `max-concurrent` to the downstream limit; for CPU work, add platform workers or remove work.
 
 | Workload | `normal-spill` | `spill-wait-millis` | `spill-queue-depth` | Why |
 | --- | --- | --- | --- | --- |
@@ -299,8 +309,8 @@ to remove `NORMAL` spill entirely. `HIGH` and `CRITICAL` never spill regardless 
 | Many `expired` | Work waits longer than `max-queue-wait-seconds` | Raise the wait limit or reduce production; check whether the lane or a consumer quota is the bottleneck |
 | `virtual` counters stay at zero on a busy server | No `LOW` work and no spill condition | Expected for CPU-only loads; check `low-priority` and the spill keys if IO work exists |
 | Exactly two workers in idle | `min-threads: 2` | Normal; not a leak |
-| One consumer at `active / limit` while queue grows | Its own `max-concurrent` caps it, and virtual tasks also hold those slots | Raise that consumer's limit or split the work across consumer ids |
-| First task after an idle period is slow | `scheduling.idle-wait-millis` park interval | Lower it (e.g. 5–10 ms) if latency matters more than wakeups |
+| One consumer at `active / limit` while queue grows | Its own `consumers.<id>.max-concurrent` caps it, and virtual tasks also hold those slots | Raise that consumer's limit or split the work across consumer ids |
+| An empty `LOW` task costs ~0.1–0.2 ms even on an idle lane | Virtual thread launch and pump hand-off | Expected; keep latency-critical work on the platform lane and CPU work off the virtual lane |
 
 ## Anti-patterns
 
@@ -315,8 +325,8 @@ to remove `NORMAL` spill entirely. `HIGH` and `CRITICAL` never spill regardless 
   use `REJECT` and backpressure instead.
 - **Removing the bounded queue by setting an enormous capacity.** Capacity protects the heap; a queue of
   millions of tasks is an outage waiting to happen.
-- **Ignoring shared quotas.** Virtual tasks hold consumer slots, so a busy lane can starve that consumer's
-  platform work.
+- **Ignoring shared quotas.** Virtual tasks hold consumer slots, so a lane that fills a consumer's share
+  leaves fewer slots for that consumer's platform work.
 - **Expecting virtual threads in a thread dump.** Use `/tuff` and the lane metrics.
 
 ## Verifying a configuration

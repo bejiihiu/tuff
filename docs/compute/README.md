@@ -109,3 +109,5 @@ See [Operations § Command](operations.md#command) for output details and JFR li
 - [Operations](operations.md) — command, logs, metrics, JFR recordings, benchmarks, tuning, known limitations.
 - [Benchmarks](benchmarks.md) — JMH numbers for the submission path, dispatch, strategies, cancellation,
   lifecycle and idle latency, with the harness caveats.
+- [Chunk system](chunk-system.md) — why the chunk system's ordered streams stay on their own executors and
+  what would break if its tasks were moved onto this queue.

@@ -134,8 +134,9 @@ lane settings: virtual lane enabled, LOW on the virtual lane, NORMAL spills when
 - `virtual queued` is what the lane may claim right now: `LOW` entries when the lane serves `LOW`, plus
   `NORMAL` entries while the spill trigger is open. `NORMAL` work the platform lane can still take is not
   counted.
-- `virtual spilled` is cumulative since scheduler start, not a gauge. A growing number means `NORMAL` work is
-  leaving the platform lane.
+- `virtual spilled` is cumulative since scheduler start, not a gauge. A growing number means `NORMAL` work
+  was executed by the virtual lane because the platform lane was saturated; the task does not leave the
+  queue and a platform worker may still claim it first.
 - With the lane disabled the right side reads `virtual disabled (LOW tasks use the platform workers)` and
   the settings line says so.
 
@@ -146,7 +147,7 @@ What to watch:
 | `virtual running == limit` and `queued` stable or growing | The lane is the bottleneck | Raise `max-concurrent` only if the tasks really block (IO, waiting) and the downstream can take more concurrency; otherwise the queue is doing its job |
 | `spilled` rising under CPU-bound `NORMAL` work | CPU work is being picked up by virtual threads, which have no extra CPU parallelism | Add platform capacity (`workers.max-threads`/`threads`) or set `normal-spill: false`; do not treat the lane as extra cores |
 | Virtual tasks grow while `cpu` and tick times rise | Misrouted CPU work | Move that work to `NORMAL`/`HIGH` on the platform lane, or stop routing it to `LOW` |
-| `queued > 0` but `running < limit` | The pump cannot claim: usually a consumer quota is exhausted | Check `consumers`: `activeTasks` at `concurrencyLimit` stops both lanes for that consumer |
+| `queued > 0` but `running < limit` | The pump cannot claim: usually the consumer's resolved limit is reached | Check `consumers`: `activeTasks` at `concurrencyLimit` stops both lanes for that consumer |
 | `virtual` counters all zero on a busy server | No `LOW` work and no spill condition | Expected for CPU-only workloads; check `low-priority`, `normal-spill`, `spill-wait-millis`, `spill-queue-depth` only if IO work exists |
 
 The overall queue wait includes tasks waiting for either lane; there is no separate per-lane latency
@@ -233,8 +234,10 @@ regression tracking, not as server SLAs:
 - `WEIGHTED_FAIR` costs ~0.2–0.35 µs per task over FIFO at four consumers; aging is not measurable.
 - A refused submission costs ~6 µs (the handle and entry are allocated before the refusal), and a queued
   cancellation ~2.7 µs. Rejection-heavy or cancel-heavy designs pay this per call.
-- Idle latency is dominated by `scheduling.idle-wait-millis`: with the 50 ms default the p90 for one task on
-  an idle pool is ~50 ms. Lower it if a subsystem waits for results from an occasionally idle pool.
+- Idle latency is no longer capped by `scheduling.idle-wait-millis`: a submission signals an idle worker.
+  On one worker, an empty task on an idle pool measures p50 ~22 µs, p90 ~36 µs and p99 ~190 µs at the 50 ms
+  default. The p99 tail is operating-system wake-up latency, not a scheduler decision, and the same tail
+  appears with much shorter idle waits. A `LOW` task pays another ~0.1–0.2 ms for the virtual-thread start.
 
 The suite ran on one machine, one fork, one run per scenario; multi-threaded figures moved by 3–10x when
 another build was active. Re-run on a quiet machine before using absolute values.
@@ -252,7 +255,7 @@ version.
 | One consumer monopolises turns | `weighted-fair` + weights | Per-consumer `max-concurrent` | Weights only order dispatch while both queues have work |
 | Rejections under bursts | `consumers.*.max-queued-tasks`, `queue.capacity` | Client-side shedding, `drop-oldest` for disposable work | Capacity is memory, not throughput; restart required to change it |
 | Stale work runs too late | `max-queue-wait-seconds` | `drop-oldest` for the consumer | Expiry granularity is the janitor tick, 10–100 ms |
-| First task after an idle period is slow | `scheduling.idle-wait-millis` | Consumer-side batching | This is the worker park interval; lowering it shortens the wait but polls more often |
+| Empty `LOW` task latency | `max-concurrent`/lane routing | Move latency-critical work to `CRITICAL`/`HIGH` on the platform lane | A virtual-thread start costs ~0.1–0.2 ms even on an idle lane; `idle-wait-millis` no longer caps platform latency |
 | Latency spikes at constant load | `adaptive.enabled` | `target-utilization`, `decrease-factor` | Adaptive needs `threads: -1` and only moves once per window |
 | Pool shrinks too aggressively | `adaptive.decrease-factor` | `min-concurrency` | The floor is `max(min-concurrency, min-threads)` |
 | Need per-task detail | `metrics.jfr: true` | A JFR recording around the incident | JFR adds allocation only while events are enabled |
@@ -265,11 +268,17 @@ seconds or a consumer policy capping itself.
 These are deliberate, with the technical reason:
 
 - **The virtual lane gives no CPU parallelism.** Virtual threads make blocking cheaper, not computation
-  faster; CPU-bound work on the lane competes with the platform workers for the same cores. Virtual threads
-  also do not appear in a normal thread dump, so use the lane metrics rather than `jcmd Thread.print`.
+  faster; CPU-bound work on the lane competes with the platform workers for the same cores and measured
+  about 2.3x slower than the platform pool. At equal concurrency, blocking throughput is about the same as
+  the platform pool: the lane buys isolation, not throughput. Virtual threads also do not appear in a normal
+  thread dump, so use the lane metrics rather than `jcmd Thread.print`.
 - **Virtual tasks are not platform workers.** They do not count in `totalWorkers()` / `activeWorkers()`, do
   not hold a gate permit and do not feed the adaptive controller. They do hold the same consumer quota slot
   as platform work, and they wait in the same bounded queue, so capacity, expiry and overflow apply to them.
+- **Lane concurrency can exceed the worker count.** `max-concurrent` is a hard cap on virtual bodies, and a
+  relative consumer limit is resolved against platform workers plus those permits. The real bounds are
+  `max-concurrent`, the resolved consumer limit (a share of that capacity, or an absolute count) and the
+  downstream system the tasks block on.
 - **`HIGH` and `CRITICAL` never spill.** Only `LOW` (when the lane serves it) and saturated `NORMAL` can use
   the virtual lane.
 - **Lane settings are startup-only.** The lane is created with the scheduler; every `lanes.*` key needs a
@@ -291,7 +300,9 @@ These are deliberate, with the technical reason:
   consumers registered on the fly; `consumers.<id>.overflow-policy` and an explicit `registerConsumer`
   policy take precedence for their ids.
 - **No built-in consumers.** No server subsystem submits to the pool in this build. The three consumer
-  sections in the template are example policies; a plugin must submit under its own id.
+  sections in the template are example policies; a plugin must submit under its own id. The chunk system in
+  particular stays on its own ordered-stream executors — see [Chunk system](chunk-system.md) for why its
+  scheduling contract does not translate to this queue.
 - **No metrics exporter.** `/tuff` prints text and `SchedulerMetrics` returns an immutable snapshot;
   there is no Prometheus/OpenMetrics endpoint. Pushing the numbers anywhere is the job of the consumer of
   that API.

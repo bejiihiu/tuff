@@ -134,7 +134,7 @@ bound the scheduler refuses or evicts, it never blocks. See
 | `priority-aging` | boolean | — | `true` | `true`/`false` | Waiting tasks gain effective priority levels | yes |
 | `aging-interval-millis` | number | ms | `1000` | `> 0` | Wait per aging step | yes |
 | `max-aging-boost` | integer | levels | `3` | `>= 1` | Maximum levels a task may gain; capped at `CRITICAL` | yes |
-| `idle-wait-millis` | number | ms | `50` | `> 0` | How long an idle worker parks before checking again | yes |
+| `idle-wait-millis` | number | ms | `50` | `> 0` | How long an idle worker waits before it rechecks the queue. A submission signals an idle worker directly, so this is not a latency cap | yes |
 
 | Strategy | Behaviour |
 | --- | --- |
@@ -171,17 +171,23 @@ inherited from `default`.
 | Key | Type | Unit | Default in `default` | Allowed | Effect |
 | --- | --- | --- | --- | --- | --- |
 | `enabled` | boolean | — | `true` | `true`/`false` | A disabled consumer rejects every submission with `CONSUMER_DISABLED` but keeps its metrics |
-| `max-concurrent` | integer or fraction | tasks / pool share | `-1` | `-1`, `>= 1`, or `(0.0, 1.0]` | Concurrency limit. Whole number = absolute; decimal point = share of the current pool limit. `-1` = the whole pool |
+| `max-concurrent` | integer or fraction | tasks / capacity share | `-1` | `-1`, `>= 1`, or `(0.0, 1.0]` | Concurrency limit. Whole number = absolute; decimal point = share of the current execution capacity. `-1` = the whole execution capacity |
 | `fair-share-weight` | number | ratio | `1.0` | finite `> 0` | Dispatch weight under `weighted-fair`; `2.0` gets about twice the turns of `1.0` |
 | `max-queued-tasks` | integer | tasks | `-1` | `-1` or `>= 0` | Per-consumer queue bound. `-1` = only the global capacity applies |
 | `overflow-policy` | enum | — | `reject` | `reject`, `drop-oldest` | What happens when this consumer cannot queue more. Applies to both bounds |
 | `max-queue-wait-seconds` | number | seconds | `0` | `>= 0` | Queued wait limit; `0` disables expiry |
 
 `max-concurrent` parsing is literal about the decimal point: write `4` for four tasks and `0.25` for a
-quarter of the pool. `4.0` is read as a fraction, fails validation, and falls back.
+quarter of the execution capacity. `4.0` is read as a fraction, fails validation, and falls back.
 
-A share is resolved against the **current pool-wide limit**, so it follows adaptive resizing, and it is
-always at least one task. It is a cap, not a reservation.
+A share is resolved against the **current execution capacity**: platform workers plus
+`lanes.virtual.max-concurrent` when the virtual lane is enabled. It therefore follows adaptive resizing and
+includes the lane permits, and it is always at least one task. It is a cap, not a reservation.
+
+An absolute value is exactly that many slots across both lanes and is not capped by the capacity. If the
+capacity is smaller, the lanes cannot fill every slot; a larger capacity does not widen the absolute limit.
+With the lane on, 8 workers and `max-concurrent: 64`, the capacity is 72, so `0.5` resolves to 36 and
+`absolute(3)` stays 3.
 
 These policy keys are the only configuration a live reload can change, and only for consumers that are
 already registered on the running engine. An override for an id that has not registered yet is read from
@@ -239,7 +245,7 @@ engine was created with.
 | `enabled` | boolean | — | `true` | `true`/`false` | Create the virtual lane. `false` starts no pump and no virtual thread; `LOW` falls back to the platform workers, the pre-lane behaviour |
 | `low-priority` | boolean | — | `true` | `true`/`false` | Route `LOW` to the virtual lane. `false` keeps `LOW` on the platform workers while the lane still exists for `NORMAL` spill |
 | `normal-spill` | boolean | — | `true` | `true`/`false` | Allow saturated `NORMAL` work to spill onto the virtual lane. `HIGH` and `CRITICAL` never spill |
-| `max-concurrent` | integer | tasks | `64` | `>= 1` | Hard limit of virtual tasks executing at the same time. Not a CPU reservation |
+| `max-concurrent` | integer | tasks | `64` | `>= 1` | Hard limit of virtual tasks executing at the same time, independent of the worker count. Not a CPU reservation |
 | `spill-wait-millis` | number | ms | `50` | `>= 0` | How long the oldest queued `NORMAL` task must have waited before `NORMAL` work is eligible to spill. `0` makes any queued `NORMAL` task eligible as soon as the platform lane is saturated |
 | `spill-queue-depth` | integer | tasks | `64` | `>= 0` | `NORMAL` queue depth at which spill becomes eligible regardless of the wait. `0` disables the depth trigger, leaving `spill-wait-millis` as the only condition |
 
@@ -252,7 +258,9 @@ be claimed by whichever lane gets to it first.
 
 The lane never changes the platform pool size, the processor budget or adaptive concurrency, and virtual
 threads add no CPU parallelism. Consumer quotas are shared: a running virtual task holds a consumer slot and
-counts towards `max-concurrent` of that consumer, so the lane cannot be used to bypass a policy.
+counts towards that consumer's resolved limit. Because a relative limit is resolved against platform workers
+plus these lane permits, one consumer can fill up to `max-concurrent` virtual slots while platform work
+continues; `absolute(N)` and `max-concurrent` still bound it. The lane cannot be used to bypass a policy.
 
 | Scenario | `LOW` | `NORMAL` |
 | --- | --- | --- |

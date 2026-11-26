@@ -4,11 +4,16 @@ Real JMH runs of the compute engine on one developer machine. The module lives i
 `tuff-benchmarks`, depends on `:tuff-compute` only, is not part of `build` or CI, is not published and
 is not bundled into the server jar.
 
-> **Two runs, two baselines.** The tables up to *Baseline against `ThreadPoolExecutor`* are the first
+> **Two runs, three code states.** The tables up to *Baseline against `ThreadPoolExecutor`* are the first
 > run, made before the idle worker was signalled on submission. The *Execution lanes* section and the
 > *Idle latency* table are a second run made after that fix landed. Do not compare an absolute number
 > from one section with a number from the other: the machine load was different and the submission
 > path itself changed. Comparisons are valid inside one section.
+>
+> Two later changes were not re-measured and are called out where they matter: the submission signal
+> became wake-one instead of wake-all, and a consumer's relative quota stopped being capped by the platform
+> worker count (it now resolves against workers plus virtual-lane permits). Lane tables whose limit above
+> the pool size had no effect, and submit-cost rows against a parked pool, describe the earlier behaviour.
 
 ## Machine and toolchain
 
@@ -223,24 +228,26 @@ second run).
 | 50 ms (default) | 1.3 us | 22.2 us | 35.8 us | 190 us | 25.8 ms |
 
 Before the fix the same benchmark read p50 112 us, **p90 50.6 ms and p99 54 ms** at the default 50 ms
-idle wait. The submission now unparks an idle worker, so the park interval no longer caps the round
-trip: p90 fell from 50.6 ms to 35.8 us and all three settings land in the same noise band. The p99 in
-the hundreds of microseconds and the occasional multi-millisecond maximum are OS wake-up latency on
-a laptop, not a scheduler decision; the earlier sub-50 us settings show the same tail.
+idle wait. A submission now signals an idle worker, so the park interval no longer caps the round trip:
+p90 fell from 50.6 ms to 35.8 us and all three settings land in the same noise band. The signal is
+wake-one — a credit plus a notification to a single waiter under the idle monitor — not a wake-all. The p99
+in the hundreds of microseconds and the occasional multi-millisecond maximum are OS wake-up latency on a
+laptop, not a scheduler decision; the earlier sub-50 us settings show the same tail.
 
-The fix is not free. Every accepted submission calls `wakeUp()`, which signals the concurrency gate
-and unparks **every** worker. With parked workers that is O(workers) system wake-ups per submission:
+The measurements above were taken with the first fix, which unparked **every** worker. Submit cost against
+a parked pool, in that build:
 
-| Target lane, 8 parked workers | ns per accepted submit |
+| Target lane, 8 parked workers | us per accepted submit |
 | --- | --- |
-| virtual lane (`LaneSubmitCostBenchmark`, limit 8) | 14.4 us |
-| virtual lane (limit 32) | 14.4 us |
-| platform pool | 11.0-12.2 us |
+| virtual lane (`LaneSubmitCostBenchmark`, limit 8) | 14.4 |
+| virtual lane (limit 32) | 14.4 |
+| platform pool | 11.0-12.2 |
 
-For comparison, the pre-fix submission path with a **busy** worker and no parked threads measured
-219 ns (`SubmitPathBenchmark`). The gap is the wake-ups: roughly 1.4 us per parked worker, plus the
-pump notify on the virtual lane. That is the price of the latency win and the reason a large pool
-with a shallow queue does not scale (see *Platform pool size* below).
+For comparison, the submission path with a **busy** worker and no parked threads measured 219 ns
+(`SubmitPathBenchmark`). The gap was the wake-ups: roughly 1.4 us per parked worker, plus the pump notify on
+the virtual lane. Wake-one removes the per-worker part, but the parked-pool cost has not been re-measured;
+treat the table as an upper bound for the current code. Waking a worker is still the price of the latency
+win and a reason a large pool with a shallow queue does not scale (see *Platform pool size* below).
 
 
 ## Baseline against `ThreadPoolExecutor`
@@ -273,11 +280,13 @@ Two fixture details matter for reproducing these numbers:
 - The worker limit is pinned with `maxThreads == threads`. With `maxThreads: -1` the pool ceiling is
   the processor budget, so a fixed `threads: 32` is silently clamped to 16 on this machine and the
   benchmark would measure the clamp instead of the setting.
-- The IO body is `Thread.sleep(1 ms)`, not `LockSupport.parkNanos`. The pool unparks every worker on
-  a submission, and a leftover unpark permit makes the next `parkNanos` return immediately: a park
-  body does not block at all on the platform lane while it does block on a virtual thread. A timed
-  park also has a floor of about 1.5 ms on this OS. The sleep measures 1.87 ms on a platform thread
-  and 2.13 ms on a virtual thread, which is the block both lanes actually pay.
+- The IO body is `Thread.sleep(1 ms)`, not `LockSupport.parkNanos`. In the measured build the pool
+  unparked every worker on a submission, and a leftover unpark permit made the next `parkNanos` return
+  immediately: a park body did not block at all on the platform lane while it did block on a virtual
+  thread. The current wake-one path uses a monitor notification and a credit, not unpark permits, so that
+  artefact should be gone; the body was not re-tested. A timed park also has a floor of about 1.5 ms on
+  this OS. The sleep measures 1.87 ms on a platform thread and 2.13 ms on a virtual thread, which is the
+  block both lanes actually pay.
 
 ### LOW blocking work: throughput
 
@@ -298,12 +307,14 @@ The same load on the platform pool, LOW not routed to a lane:
 | 16 | 7 667 |
 | 32 | 14 460 |
 
-The lane is flat at its 8 worker pool and matches the platform pool of 8 within 9%. Raising
-`maxConcurrent` above 8 changes nothing, and the reason is the quota model, not the lane: a
-consumer's concurrency limit is resolved against the pool wide limit, so one consumer can never run
-more than `workers` tasks across both lanes. `maxConcurrent` is an upper bound on the lane, not a way
-to exceed the pool. The platform pool scales linearly with workers for blocking work because each
-worker is a real thread that can block independently.
+The lane matches the platform pool of 8 within 9%: for blocking work at the same concurrency the lane is
+neutral, not faster. The rows at limits 32 and 128 were also flat and peaked at 8 bodies because the run
+predates the quota change: a consumer's limit was then capped by the platform pool, so one consumer could
+never run more than `workers` tasks across both lanes. That cap is gone — a relative limit now resolves
+against platform workers plus lane permits, so one consumer can fill up to `maxConcurrent` virtual slots —
+but the higher limits were not re-run and those rows are not evidence about the current ceiling. The
+platform pool scales linearly with workers for blocking work because each worker is a real thread that can
+block independently.
 
 ### LOW blocking work: latency
 
@@ -350,11 +361,13 @@ four producers (`SpillBenchmark`).
 | on | 3 900 | 1-3 per second (~0.05%) | 107 ms | 125 ms | 139-155 ms |
 | off | 3 632 | 0 | 104-112 ms | 118-137 ms | 126-172 ms |
 
-Spill fires, but only for a few tasks per second: at saturation all 8 pool slots are held by running
-tasks, so the same pool wide quota that caps the lane refuses the pump's claim. The pump then carries
-the entry and retries on its 25 ms tick, which is why a spilled task can wait tens of milliseconds
-longer than one that stayed in the queue. Throughput is unchanged within noise. Spill as specified
-cannot relieve a saturated single-consumer pool.
+Spill fired for only a few tasks per second in this run. At saturation every platform slot was held, and the
+then-current pool-wide quota refused the pump's claim; the pump carried the entry and retried on its 25 ms
+tick, which is why a spilled task could wait tens of milliseconds longer than one that stayed in the queue.
+Since the quota now counts lane permits, that refusal is not structural for a default consumer: the pump can
+claim against the same saturated pool. The measured 1-3 tasks per second (~0.05%) and the flat throughput
+therefore describe the earlier quota model; the current spill rate was not measured. What survives is the
+shape: spill is a tail valve for blocking `NORMAL` work, not a throughput lever and not a second CPU pool.
 
 ### Lane ceiling
 
@@ -367,10 +380,13 @@ One wave of exactly `maxConcurrent` tasks, 8 worker pool, 20 ms block
 | 32 | 32 | 8 | 12 |
 | 128 | 128 | 8 | 12 |
 
-The observed concurrency is `min(maxConcurrent, workers)`, and the JVM platform thread count does not
-move: virtual tasks do not add OS threads, so there is no thread explosion even at limit 128. A run
-with a 32 worker pool in the same session peaked at 32 for limits 32 and 128, which is the same rule.
-Above the pool size, a bigger `maxConcurrent` only makes the lane's queue longer.
+The peak of 8 at every limit is the old quota behaviour, not the lane: the consumer's limit was capped by the
+pool, so the extra permits were never reachable. Under the current model the lane ceiling is `maxConcurrent`,
+bounded by the consumer's resolved limit — a relative share of platform workers plus lane permits, or
+`absolute(N)` — so with 8 workers and limit 64 the lane can run up to 64 virtual bodies while the platform
+pool runs 8. The JVM platform thread count does not move: virtual tasks add no OS threads, so a high limit
+does not create thread explosion. The run with a 32 worker pool peaked at 32 for limits 32 and 128 for the
+same old-cap reason, and was not re-run either.
 
 ### Cancellation and eviction on the lane
 
@@ -399,10 +415,12 @@ already full.
 | `ThreadPoolExecutor`, 8 threads | 3 759 |
 | `Executors.newThreadPerTaskExecutor` | 356 025 |
 
-This is the honest shape of the feature. A bare virtual thread executor turns the same blocking work
-into about 90x the throughput because every blocked task simply gets another virtual thread. The lane
-does not, because the per-consumer quota is the pool size: it is a bounded lane for LOW work, not an
-unbounded thread-per-task escape hatch.
+This is the honest shape of the feature. A bare virtual thread executor turns the same blocking work into
+about 90x the throughput because every blocked task simply gets another virtual thread. The lane does not,
+because it is bounded twice: `maxConcurrent` permits and the consumer quota. In this run the quota was the
+pool size, so the limit-64 row actually ran 8 bodies; it measures an eight-concurrent lane, not a limit of
+64. Even with the quota fix the lane remains a bounded lane for `LOW` and spilled work, not an unbounded
+thread-per-task escape hatch.
 
 ### Platform pool size and the wake-up cost
 
@@ -416,12 +434,12 @@ Fixed platform pool, no lane, four producers, batch 256 (`PlatformLaneBenchmark`
 | 32 | 5 641 | 14 460 |
 
 Blocking work scales with workers as expected. CPU work peaks at 8 and collapses above it: 12x lower
-at 32 workers. The same shape appeared in a second run with the same fixtures. The suspected cause is
-the wake-all on submission: with a shallow queue the workers are parked most of the time, and each
-submission unparks all of them, so the per-submission cost grows with the pool while the useful work
-does not. Oversubscription of 16 logical cores by 32 workers plus 4 producers is a second candidate.
-This run does not isolate the two; a quiet machine and a deep-queue variant are needed before calling
-it a defect.
+at 32 workers. The same shape appeared in a second run with the same fixtures. The suspected cause was the
+wake-all on submission in that build: with a shallow queue the workers were parked most of the time, and each
+submission unparked all of them, so the per-submission cost grew with the pool while the useful work did
+not. Oversubscription of 16 logical cores by 32 workers plus 4 producers was a second candidate. This run
+does not isolate the two, and the wake path is now wake-one; a quiet machine and a deep-queue variant are
+still needed before calling it a defect.
 
 ### When the lane helps, and when it hurts
 
@@ -429,25 +447,28 @@ it a defect.
   a pool slot, so NORMAL work keeps its workers. That is the isolation the lane was built for, and it
   is real even when throughput is the same. Long blocking calls (network, database, file) are the
   intended load.
-- **Neutral.** Throughput for blocking LOW work at the same pool size: 3 620 against 3 957 ops/s at
-  8 workers, inside noise. If the goal is more blocking throughput, raise the pool, not
-  `maxConcurrent`.
-- **Hurts.** CPU-bound LOW work (2.3x slower), very short blocks (a timed park on a virtual thread has
+- **Neutral.** Throughput for blocking `LOW` work at the same concurrency: 3 620 against 3 957 ops/s at
+  eight bodies, inside noise. The lane is not a capacity multiplier. With the current quota model a higher
+  `maxConcurrent` does raise the lane's own concurrency, but size it to the downstream blocking limit, not
+  to the CPU count, and do not expect CPU work to speed up.
+- **Hurts.** CPU-bound `LOW` work (2.3x slower), very short blocks (a timed park on a virtual thread has
   a floor of roughly 1 ms on this JDK/OS, so a "50 us" IO task is not 50 us), and an idle pool
   (0.1-0.2 ms lane round trip against ~20 us on the platform).
-- **Cannot do what it looks like it can do.** `maxConcurrent` above the worker count is inert for one
-  consumer, and spill cannot relieve a saturated pool because the quota is already fully held. Both
-  are quota-model decisions, not lane bugs, but an operator reading `max-concurrent: 64` will expect
-  otherwise.
+- **Cannot do what it looks like it can do.** `maxConcurrent` is a hard cap on virtual bodies, and a
+  relative consumer limit is resolved against workers plus those permits, so a value above the lane cap or
+  above the consumer's resolved limit is inert. Spill is a tail valve for blocking `NORMAL` work, not extra
+  platform capacity. Both are quota-model decisions, not lane bugs, but an operator reading
+  `max-concurrent: 64` will expect otherwise.
 
 ## Observations and suspected defects
 
-The first five came out of the first run, before the wake-up fix; items 6-10 are from the second run.
-No engine code was changed for this work.
+The first five came out of the first run, before the wake-up fix; items 6-10 are from the second run. The
+engine has changed since items 6-8 and 10 were written: each item says what was true in the measured build
+and what is true now.
 
 1. **No submit-to-wakeup (fixed after the first run).** An idle worker used to be woken only by the
-   expiry of `idle-wait-millis`, which capped an idle pool at p90 50.6 ms. The submission now unparks
-   the pool and the same benchmark reads p90 36 us. The cost of the fix is item 6.
+   expiry of `idle-wait-millis`, which capped an idle pool at p90 50.6 ms. Submission now signals an idle
+   worker, and the same benchmark reads p90 36 us. The cost of that first fix was item 6.
 2. **Selection is `O(consumers)` per poll.** 16 consumers cost ~0.4 us more per dispatched task than
    one consumer at a 10 000 task backlog. Fine with the three example consumers, worth watching if
    many plugins register their own.
@@ -458,25 +479,29 @@ No engine code was changed for this work.
 5. **Hot-path sensitivity to co-tenants.** The same binary measured 1.16 M ops/s and 118 k ops/s at
    eight workers on different runs, while total CPU utilisation stayed below 25%. The hot path is
    memory-latency bound; on a shared host it degrades well before the CPU is saturated.
-6. **The wake-up is O(parked workers) per submission.** `wakeUp()` signals the gate and unparks every
-   worker, so a submission against an idle 8 worker pool costs 11-12 us instead of the 219 ns a busy
-   pool costs (`LaneSubmitCostBenchmark`). A wake-one strategy would keep the latency win and remove
-   the per-worker price.
-7. **A single consumer cannot exceed the pool size, on either lane.** The quota controller resolves
-   the consumer limit against the pool wide limit, so `maxConcurrent: 64` with 8 workers still runs 8
-   LOW tasks at a time and the extra 56 slots are inert. It is why the lane's blocking throughput is
-   flat across 8/32/128 and why the ceiling is `min(maxConcurrent, workers)`.
-8. **Spill cannot relieve a saturated single-consumer pool.** At saturation the quota is fully held,
-   so the pump's claim loses and the entry sits in the carry slot until the next 25 ms tick. Measured
-   spill was 2-7 tasks per second (~0.1%) with no throughput change and a longer tail.
+6. **The wake-up cost was O(parked workers) per submission in this run.** `wakeUp()` unparked every
+   worker, so a submission against an idle 8 worker pool cost 11-12 us instead of the 219 ns a busy pool
+   costs (`LaneSubmitCostBenchmark`). It has since been replaced by a wake-one credit plus a monitor
+   notification, so the per-worker price is gone; the parked-pool submission cost has not been re-measured.
+7. **A single consumer was capped by the pool size in this run.** The quota controller resolved the
+   consumer limit against the pool-wide limit, so `maxConcurrent: 64` with 8 workers ran 8 `LOW` tasks and
+   the extra 56 slots were inert; that is why the lane was flat across 8/32/128. The cap has been removed:
+   a relative limit resolves against platform workers plus lane permits, so one consumer can reach
+   `maxConcurrent`, while `absolute(N)` remains exactly `N`. The flat rows are not the current ceiling.
+8. **Spill could not relieve a saturated single-consumer pool in the measured configuration.** The
+   then-current pool-wide quota was fully held, so the pump's claim lost and the entry sat in the carry slot
+   until the next 25 ms tick. Measured spill was 1-3 tasks per second (~0.05%) with no throughput change and
+   a longer tail. Quotas now include lane permits, so the pump is no longer refused by the pool-wide cap for
+   a default consumer; the current rate was not measured. Spill remains a tail valve, not an accelerator.
 9. **LOW CPU work on the lane is 2.3x slower than on the platform pool** (29 564 against 69 327
    ops/s at 8 workers). Expected in kind, useful to have a number: the lane is not a general worker
    replacement.
-10. **A timed park is not a usable block inside the scheduler's own workers.** `wakeUp()` leaves an
-    unpark permit on every worker, and the next `LockSupport.parkNanos` in a task body returns
-    immediately: a park-based "IO" task does not block on the platform lane at all. Timed parks on a
-    virtual thread also have a ~1 ms floor on this OS. Benchmarks must use `Thread.sleep`, and the
-    same applies to any real task body that expects a park to wait.
+10. **A timed park was not a usable block inside the scheduler's own workers in this run.**
+    `wakeUp()` left an unpark permit on every worker, and the next `LockSupport.parkNanos` in a task body
+    returned immediately: a park-based "IO" task did not block on the platform lane at all. The current
+    wake-one path uses a monitor notification and a credit, not an unpark permit, so that artefact should
+    be gone; it was not re-tested. Timed parks on a virtual thread still have a ~1 ms floor on this OS, so
+    the benchmark keeps `Thread.sleep`.
 
 ## Limitations
 
@@ -494,10 +519,12 @@ No engine code was changed for this work.
   and 2.13 ms on a virtual thread, so "ops/s" is really "blocks of ~2 ms per second". The two lanes
   pay the same block, which is what makes the comparison fair, but no absolute rate here transfers to
   a real network call.
-- `maxConcurrent` above the worker count, and spill under a single consumer, were measured but not
-  isolated from the quota model. A multi-consumer run would separate the two.
+- `maxConcurrent` above the worker count, and spill under a single consumer, were measured under the old
+  pool-wide quota. The current model was not re-run; a multi-consumer run would separate lane capacity from
+  consumer quotas.
 - The CPU collapse above 8 workers is the least certain number in this report: two runs agree on the
-  shape, but oversubscription and the wake-all are not separated, and the machine was not quiet.
+  shape, but oversubscription and the then-current wake-all are not separated, and the machine was not
+  quiet. The wake path is now wake-one, which may remove part of that cost.
 - The dispatch benchmarks spin the producer on purpose and time a drain of a fixed backlog; they are
   service-time measurements, not latency distributions under a fixed arrival rate.
 - The under-load queue wait (p50 5.5 ms, p99 12.3 ms at a ~8 000 task burst) drifts with machine load

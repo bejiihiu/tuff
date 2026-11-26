@@ -30,7 +30,7 @@ under those ids until a plugin or a future subsystem does.
 | `AsyncComputeScheduler` | Public contract and thin facade over the engine | [`AsyncComputeScheduler.java`](../../tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/AsyncComputeScheduler.java) |
 | `ComputeEngineImpl` | Lifecycle, submission validation, handle ownership, wiring | [`ComputeEngineImpl.java`](../../tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/internal/engine/impl/ComputeEngineImpl.java) |
 | `BoundedComputeQueue` | Ordering, aging, fair share, capacity, eviction, expiry | [`BoundedComputeQueue.java`](../../tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/internal/queue/impl/BoundedComputeQueue.java) |
-| `AtomicQuotaController` | Per-consumer concurrency slots plus the pool-wide limit | [`AtomicQuotaController.java`](../../tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/internal/queue/impl/AtomicQuotaController.java) |
+| `AtomicQuotaController` | Per-consumer concurrency slots resolved against the shared execution capacity | [`AtomicQuotaController.java`](../../tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/internal/queue/impl/AtomicQuotaController.java) |
 | `DispatcherImpl` | Picks one entry per worker iteration, handles quota races | [`DispatcherImpl.java`](../../tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/internal/engine/impl/DispatcherImpl.java) |
 | `DynamicWorkerPool` | Reusable platform threads, keep-alive, resize, idempotent shutdown | [`DynamicWorkerPool.java`](../../tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/internal/worker/impl/DynamicWorkerPool.java) |
 | `QueueJanitor` | Expiry sweep, gauge sampling, autoscale reconciliation | [`QueueJanitor.java`](../../tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/internal/engine/impl/QueueJanitor.java) |
@@ -89,6 +89,30 @@ the initial worker count and is the number the adaptive controller moves. Loweri
 permit that is already held: running tasks finish, new claims wait. `idleWorkers()` counts live platform
 workers minus permit holders, so a worker blocked by the gate reports as idle. Virtual lane tasks do not
 hold a gate permit and are not counted in `totalWorkers()` or `activeWorkers()`.
+
+### Consumer quotas and execution capacity
+
+The gate is a platform-lane throttle; the quota controller is the cross-lane accounting. Each consumer has
+a number of concurrent slots shared by both lanes. A relative limit (`0.35`, or `-1` for automatic) is a
+share of the **execution capacity**, not of the worker count:
+
+```
+executionCapacity = platformWorkers + (virtual lane enabled ? lanes.virtual.max-concurrent : 0)
+relativeLimit     = clamp(round(share * executionCapacity), 1, executionCapacity)
+absoluteLimit     = N
+```
+
+`platformWorkers` is the pool's current concurrency limit — the same number the gate uses — so a relative
+share follows autoscaling and adaptive resizing. The lane permits are part of the capacity because blocking
+`LOW` work does not occupy a platform worker: a share of the platform pool alone would starve it. An
+absolute limit is not a share and is not capped by the capacity. If the capacity is smaller than `N`, the
+lanes simply cannot fill every slot; a larger capacity does not widen the limit either.
+
+`lanes.virtual.max-concurrent` is a hard limit on virtual task bodies, independent of the worker count:
+with 8 workers and `max-concurrent: 64`, the lane can run up to 64 virtual tasks at once while the platform
+pool runs up to 8. What actually runs is the smaller of the consumer's resolved limit and the permits
+available on the target lane. Virtual concurrency can therefore exceed the worker count, but never the
+consumer quota or `max-concurrent`.
 
 ## Exactly-once invariants
 
@@ -232,9 +256,12 @@ buckets per consumer head but keeps sequence, submission timestamps and virtual 
 waits for a lane ages exactly like any other. FIFO order within a priority is preserved per consumer.
 
 Quotas are shared. A virtual-lane claim reserves the same consumer slot a platform worker would, and a
-running virtual task counts towards the consumer's `activeTasks` and `concurrencyLimit`. A consumer can
-therefore use its whole limit on the virtual lane, which is the point: otherwise the lane would be a way
-around the policy.
+running virtual task counts towards the consumer's `activeTasks` and resolved `concurrencyLimit`. Because a
+relative limit is resolved against platform workers plus lane permits, a consumer with the default
+automatic limit can keep `max-concurrent` blocking tasks on the lane while platform work continues on the
+workers. `absolute(N)` still means exactly `N` slots across both lanes, and `max-concurrent` caps how many
+of them the lane can fill. Holding the same slot is the point: otherwise the lane would be a way around the
+policy.
 
 Cancellation, queue expiry and eviction are queue-level and identical on both lanes. A running virtual task
 is flagged, never interrupted, and its result is discarded; consumer removal is the exception described
@@ -245,7 +272,10 @@ daemons.
 The virtual lane never changes the platform pool size, the processor budget or the adaptive concurrency
 limit. It has no CPU parallelism: a CPU-bound task placed on the lane competes with the platform workers for
 the same cores and can make tick times worse. The lane is for blocking or IO-bound work and for breaking a
-dependency where a platform worker would otherwise wait on something only that lane can finish.
+dependency where a platform worker would otherwise wait on something only that lane can finish. Measured, it
+matches the platform pool at equal concurrency on blocking work and is slower on CPU work; the benefit is
+isolation — a blocked virtual task does not hold a platform worker — not extra throughput. Numbers are in
+[Benchmarks](benchmarks.md#execution-lanes).
 
 ## Bounded queue and the three failure paths
 
@@ -314,8 +344,8 @@ budget = max(1, floor(cores * 0.8) - regionThreads - chunkWorkers - ioThreads - 
 The engine never subtracts region, chunk or IO threads itself; doing both would leave the pool with far
 fewer workers than the administrator asked for. The server resolves the budget and applies it with
 `AsyncComputeScheduler#applyProcessorBudget(int)` once the region scheduler is up; the engine resizes the
-pool, its concurrency gate and the quota limit on that call. Before the first call — and in a direct
-construction — `Runtime.availableProcessors()` is used as the budget.
+pool, its concurrency gate and the quota capacity (platform workers plus lane permits) on that call. Before
+the first call — and in a direct construction — `Runtime.availableProcessors()` is used as the budget.
 
 **Static autoscaler** (adaptive disabled, `threads: -1`): a submission that finds a backlog raises the
 desired worker count by one when no worker is idle, and the janitor reconciles every tick towards
@@ -335,7 +365,8 @@ It shrinks on latency pressure (`W >= 2C` or `W99 >= 4C`) or after three consecu
 queue, utilisation below half the target). Failed tasks are not sampled; their timing says nothing about
 capacity. The floor is `max(min-concurrency, min-threads)`, the ceiling is `min(max-concurrency, worker
 ceiling)` or the worker ceiling when `max-concurrency` is `-1`; the processor budget is a hard cap on top of
-that. An explicit worker count pins the limit and the controller reports `EXPLICIT_WORKER_COUNT`.
+that. An explicit worker count pins the limit and the controller reports `EXPLICIT_WORKER_COUNT`. The
+controller sizes the platform pool only; the quota capacity follows that size and adds the lane permits.
 
 Virtual-lane tasks are excluded from all of this: they do not occupy a gate permit, do not count as backlog
 for growth, and do not feed the adaptive samples. Their execution time is dominated by blocking and would
@@ -403,3 +434,4 @@ numbers are in [Benchmarks](benchmarks.md).
 - [Tuning](tuning.md)
 - [Operations](operations.md)
 - [Benchmarks](benchmarks.md)
+- [Chunk system](chunk-system.md)

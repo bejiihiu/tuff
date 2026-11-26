@@ -109,7 +109,7 @@ A consumer is a stable id with limits attached. Two ways to get one:
 // 1. Declare it with an explicit policy. Idempotent by id, safe across plugin reloads.
 compute.registerConsumer(ComputeConsumer.of(
     "map-colour-cache",
-    ConsumerPolicy.relative(0.25)          // at most a quarter of the pool, capped, not reserved
+    ConsumerPolicy.relative(0.25)          // at most a quarter of the execution capacity, capped, not reserved
 ));
 
 // 2. Just submit under the id. With allow-dynamic-registration it is registered from config/default.
@@ -137,12 +137,14 @@ Policy helpers:
 
 | Call | Meaning |
 | --- | --- |
-| `ConsumerPolicy.defaults()` | Whole pool, weight 1.0, no queue bound, `REJECT`, no expiry |
-| `ConsumerPolicy.relative(0.25)` | At most 25% of the current pool-wide concurrency limit, minimum 1 |
-| `ConsumerPolicy.absolute(3)` | At most 3 concurrent tasks, capped by the pool limit |
+| `ConsumerPolicy.defaults()` | Whole execution capacity, weight 1.0, no queue bound, `REJECT`, no expiry |
+| `ConsumerPolicy.relative(0.25)` | At most 25% of the current execution capacity (platform workers plus virtual-lane permits), minimum 1 |
+| `ConsumerPolicy.absolute(3)` | Exactly 3 concurrent tasks; not capped by the capacity, and the lanes may be unable to fill all 3 slots |
 
-Relative limits are a share of the *current* limit, so they follow adaptive resizing. They are a cap, never
-a reservation: a consumer with `0.5` is not guaranteed half the workers.
+Relative limits are a share of the *current* capacity, so they follow adaptive resizing and the lane
+permits. They are a cap, never a reservation: a consumer with `0.5` is not guaranteed half the workers. An
+absolute limit is a fixed count across both lanes; if the capacity is smaller, the extra slots stay empty,
+and a bigger capacity does not widen it.
 
 `registerConsumer` replaces an existing policy with the same id, which makes plugin enable/disable cycles
 safe. `unregisterConsumer(id)` cancels queued work of that consumer with `CONSUMER_DISABLED`; tasks that
