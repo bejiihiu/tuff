@@ -42,26 +42,31 @@ in `NEW`; it owns no thread until `start()`.
 
 ## Threading model
 
-The pool uses **platform threads**, never virtual threads.
+The **platform lane** is a pool of platform threads. The optional **virtual lane** runs tasks on virtual
+threads. Virtual threads add no CPU parallelism: the lane exists to make blocking cheaper, not to compute
+faster, and CPU-bound work on it competes with the platform workers for the same cores.
 
-- Virtual threads add no parallelism to CPU-bound work; they only make blocking cheaper.
-- A virtual worker disappears from a normal thread dump, and the scheduler needs workers that an operator
-  can see and count.
-- Each worker has a stable index used by the dispatcher's carry slot and by the optional stealing scan; a
-  virtual thread is not a stable slot.
-- The pool rejects a virtual thread from its `ThreadFactory` with `IllegalArgumentException`, so the
+Why the platform lane does not use virtual threads:
+
+- each platform worker has a stable index used by the dispatcher's carry slot and the optional stealing
+  scan; a virtual thread is not a stable slot;
+- platform workers must be visible and countable in a thread dump, and they are the CPU budget the
+  configuration is sized against;
+- the pool rejects a virtual thread from its `ThreadFactory` with `IllegalArgumentException`, so the
   property is enforced and not just documented.
 
-Worker threads are named `<prefix>-<n>`; the remaining threads are named individually. All of them appear in
-dumps, watchdog reports and JFR:
+Thread names follow `<prefix>-…`; all scheduler threads are daemons:
 
 | Thread | Name | Count |
 | --- | --- | --- |
-| Workers | `Tuff Compute Worker-1`, `-2`, … | 1 to `max-threads` |
+| Platform workers | `Tuff Compute Worker-1`, `-2`, … | 1 to `max-threads` |
 | Janitor | `Tuff Compute Worker-janitor` | 1 daemon |
 | Adaptive timer | `Tuff Compute Worker-adaptive` | 1 daemon, only when adaptive is enabled |
 | Shutdown | `Tuff Compute Worker-shutdown` | 1 daemon for the duration of shutdown |
 | Metrics sampler | `Tuff Compute Metrics-1` | 1 daemon, only when metrics are enabled |
+| Virtual pump | `Tuff Compute Worker-virtual-pump` | 1 daemon, only when the virtual lane is enabled |
+| Virtual tasks | `Tuff Compute Worker-virtual-1`, … | up to `lanes.virtual.max-concurrent`; virtual threads do not appear in a normal thread dump |
+| Completion dispatcher (not a lane) | `Tuff Compute Worker-completion-1`, … | short-lived virtual threads for future stages, one per completion |
 
 All of them are daemons. A task stuck in user code cannot keep the JVM alive after the server decided to
 stop, and the server already has an explicit shutdown sequence.
@@ -74,15 +79,16 @@ with Folia is strict:
 - `ComputeHandoff` schedules the consumer on the region scheduler, the entity scheduler or the global
   region, so world mutation happens where Folia allows it.
 
-The pool never touches the region scheduler and the region scheduler never touches the pool. There is no
-lock shared between them.
+Neither lane touches the region scheduler and the region scheduler never touches a lane. There is no lock
+shared between them.
 
 ### Pool-wide concurrency gate
 
-The gate permits up to `concurrencyLimit` workers to be inside a task at once. The limit starts at the
-initial worker count and is the number the adaptive controller moves. Lowering it does not revoke a permit
-that is already held: running tasks finish, new claims wait. `idleWorkers()` counts live workers minus
-permit holders, so a worker blocked by the gate reports as idle.
+The gate permits up to `concurrencyLimit` platform workers to be inside a task at once. The limit starts at
+the initial worker count and is the number the adaptive controller moves. Lowering it does not revoke a
+permit that is already held: running tasks finish, new claims wait. `idleWorkers()` counts live platform
+workers minus permit holders, so a worker blocked by the gate reports as idle. Virtual lane tasks do not
+hold a gate permit and are not counted in `totalWorkers()` or `activeWorkers()`.
 
 ## Exactly-once invariants
 
@@ -92,9 +98,9 @@ and shutdown racing each other:
 1. **Only the task handle ends a task.** `TaskHandle` owns one `AtomicReference<State>` and is the only
    code that completes the caller's future. The queue, dispatcher, janitor, eviction listener and shutdown
    path only *request* a transition; the winner of the terminal compare-and-set performs it.
-2. **Only the worker that received an entry releases its quota slot.** The dispatcher acquires a slot
+2. **Only the executor that received an entry releases its quota slot.** The dispatcher acquires a slot
    before returning an entry, so `taskFinished`, `taskCompleted` and `taskCancelled` are the only release
-   points, and all of them run on the worker thread that holds the entry.
+   points, and all of them run on the thread that holds the entry — a platform worker or the virtual pump.
 3. **A queued entry never held a slot, so it never releases one.** Cancellation, expiry, eviction, consumer
    removal and shutdown of queued work are pure handle transitions plus a metrics event.
 4. **Exactly one terminal metrics event per accepted task.** The caller that won the handle's terminal CAS
@@ -156,7 +162,8 @@ effective = min(CRITICAL, base + min(floor(waited / aging-interval), max-aging-b
 Aging is recomputed from the bucket head's timestamp on every poll, so a waiting task climbs levels without
 being moved between buckets, and the bucket head is always its best candidate. Aging can lift `LOW` to
 `CRITICAL` in at most `max-aging-boost` steps, which is what stops a `CRITICAL` flood from starving the
-rest.
+rest. Aging changes dispatch order only: it never moves a task to another lane, so a `LOW` task stays on the
+virtual lane even when its effective level reaches `CRITICAL`.
 
 ### Weighted fair share
 
@@ -179,6 +186,66 @@ decides who gets the next turn when both have work.
 `work-stealing: true` lets an idle worker bypass normal consumer selection and take the head of a stream
 starting from a rotating index, so idle workers do not all hit the same consumer. It is off by default and
 the stream scan is bounded by the number of registered consumers.
+
+## Execution lanes
+
+A task runs on exactly one of two lanes. Both share one bounded queue, one consumer quota and the same task
+handle state machine; only the thread that executes the body differs.
+
+```mermaid
+flowchart LR
+    S[accepted task] --> Q[bounded queue]
+    Q -->|LOW, virtual lane serves LOW| V[virtual lane]
+    Q -->|NORMAL, platform saturated and spill open| V
+    Q -->|HIGH / CRITICAL, or NORMAL without spill| P[platform lane]
+    V -->|permit free| VT[one virtual thread per task]
+    V -->|max-concurrent reached| W[stays queued, expiry and overflow apply]
+    P --> PW[platform worker]
+```
+
+| Priority | Lane |
+| --- | --- |
+| `LOW` | Virtual lane when it is enabled and `low-priority: true`; otherwise the platform lane, which is the pre-lane behaviour |
+| `NORMAL` | Platform lane. May spill to the virtual lane only while the platform lane is saturated and a spill threshold is met |
+| `HIGH`, `CRITICAL` | Platform lane. Never spill |
+
+Spill is eligible when all of these hold: `lanes.virtual.enabled` and `normal-spill` are true, the platform
+lane is saturated (`activeWorkers >= concurrencyLimit`), at least one `NORMAL` task is queued, and either
+the `NORMAL` queue depth reached `spill-queue-depth` (when it is greater than `0`) or the oldest `NORMAL`
+task waited at least `spill-wait-millis`. `spill-wait-millis: 0` makes any queued `NORMAL` task eligible as
+soon as the platform lane is full.
+
+The platform lane's selection mask excludes `LOW` while the virtual lane owns it, so platform autoscaling
+and the adaptive controller are never driven by work the pool cannot run. If the lane is disabled or
+`low-priority` is false, the mask includes `LOW` again and the platform workers take it.
+
+The virtual lane is one daemon pump thread plus one virtual thread per running task, bounded by a semaphore
+of `max-concurrent` permits. The pump claims only priorities in its current mask; when every permit is held,
+tasks stay in the shared queue and the ordinary capacity, expiry and overflow rules apply. `LOW` never falls
+back: while the lane serves it, the platform mask excludes it. `NORMAL` spill is different — it adds the
+virtual lane as an additional eligible executor; the platform mask still includes `NORMAL`, so whichever lane
+claims the task first runs it. Besides submission signals, the pump re-evaluates spill every 25 ms, because
+the platform lane can become saturated after a task was queued.
+
+The configured strategy, aging and fair share still apply inside a lane: the queue skips excluded priority
+buckets per consumer head but keeps sequence, submission timestamps and virtual service time, so a task that
+waits for a lane ages exactly like any other. FIFO order within a priority is preserved per consumer.
+
+Quotas are shared. A virtual-lane claim reserves the same consumer slot a platform worker would, and a
+running virtual task counts towards the consumer's `activeTasks` and `concurrencyLimit`. A consumer can
+therefore use its whole limit on the virtual lane, which is the point: otherwise the lane would be a way
+around the policy.
+
+Cancellation, queue expiry and eviction are queue-level and identical on both lanes. A running virtual task
+is flagged, never interrupted, and its result is discarded; consumer removal is the exception described
+under [Cancellation](#cancellation). On shutdown the pump stops claiming, queued work is cancelled, running
+virtual tasks get the grace period and are abandoned after it like platform tasks; virtual threads are
+daemons.
+
+The virtual lane never changes the platform pool size, the processor budget or the adaptive concurrency
+limit. It has no CPU parallelism: a CPU-bound task placed on the lane competes with the platform workers for
+the same cores and can make tick times worse. The lane is for blocking or IO-bound work and for breaking a
+dependency where a platform worker would otherwise wait on something only that lane can finish.
 
 ## Bounded queue and the three failure paths
 
@@ -270,6 +337,10 @@ capacity. The floor is `max(min-concurrency, min-threads)`, the ceiling is `min(
 ceiling)` or the worker ceiling when `max-concurrency` is `-1`; the processor budget is a hard cap on top of
 that. An explicit worker count pins the limit and the controller reports `EXPLICIT_WORKER_COUNT`.
 
+Virtual-lane tasks are excluded from all of this: they do not occupy a gate permit, do not count as backlog
+for growth, and do not feed the adaptive samples. Their execution time is dominated by blocking and would
+distort the platform pool's capacity model.
+
 ## Server lifecycle
 
 The server owns the engine through `ComputeBootstrap`, which has three hooks:
@@ -285,10 +356,10 @@ the regions exist, the pool is resized against what the rest of the server actua
 `workers.threads` count is never resized; the bootstrap logs that the budget was not applied. `/reload` does
 not rebuild the engine.
 
-With `async-compute.enabled: false` the engine is not created at all: no worker, janitor, adaptive or
-sampler thread exists, nothing is installed, and `TuffCompute.scheduler()` is empty. The configuration is
-still read and validated, and `/tuff` answers with the disabled explanation. A failure during startup is
-logged under `Tuff/Compute` and leaves the server running without an engine (`FAILED`).
+With `async-compute.enabled: false` the engine is not created at all: no worker, janitor, adaptive, virtual
+pump or sampler thread exists, nothing is installed, and `TuffCompute.scheduler()` is empty. The
+configuration is still read and validated, and `/tuff` answers with the disabled explanation. A failure
+during startup is logged under `Tuff/Compute` and leaves the server running without an engine (`FAILED`).
 
 ## Shutdown
 
@@ -296,34 +367,39 @@ logged under `Tuff/Compute` and leaves the server running without an engine (`FA
 
 1. moves to `SHUTTING_DOWN`, closes the queue to new offers;
 2. cancels **all** queued work with `SHUTDOWN` immediately;
-3. asks the pool to stop claiming, and gives running tasks the grace period to finish;
+3. asks both lanes to stop claiming, and gives running tasks the grace period to finish;
 4. stops the janitor and the adaptive timer, closes the metrics collector, resets quotas;
 5. moves to `TERMINATED` and releases `awaitTermination`.
 
 Running tasks are never interrupted. If the grace period expires, the scheduler moves to `TERMINATED`
-anyway: the tasks that are still running keep running and their futures complete normally (or with the
-failure the body throws) after termination. `awaitTermination` therefore returns within roughly the grace
-period even when a task hangs. `shutdownNow()` on the facade is the same sequence with a zero grace period,
-and is not part of the public scheduler interface.
+anyway: the tasks that are still running — platform or virtual — keep running and their futures complete
+normally (or with the failure the body throws) after termination. `awaitTermination` therefore returns
+within roughly the grace period even when a task hangs. `shutdownNow()` on the facade is the same sequence
+with a zero grace period, and is not part of the public scheduler interface.
 
 ## Metrics and JFR
 
 Metrics are collected from lifecycle events on the hot path: `LongAdder` counters, a log-linear latency
 histogram for queue wait and execution, and a throughput meter sampled once per `sample-interval-seconds`.
 Global queue depth and worker gauges come from the janitor's samples, so those values can be up to one
-sample interval stale; everything derived from lifecycle events is current.
+sample interval stale; everything derived from lifecycle events is current. Worker gauges describe the
+platform lane only. The virtual lane has its own snapshot at `SchedulerMetrics#lanes().virtual()`, with
+`running`, `limit`, `queued`, `spilled` and its own counters.
 
 The CPU figure is the **process** CPU load from `OperatingSystemMXBean`, not a pool utilisation. It
 includes tick threads, GC and JIT, and it is `NaN` when the runtime cannot provide it.
 
 JFR is independent of metrics collection: with `metrics.jfr: true` the scheduler emits events even when
 `metrics.enabled` is false. The recorder never fails a task; an event that cannot be emitted is dropped.
-See [Operations](operations.md#jfr) for the event list and recording recipes. Measured costs and scaling
+`VirtualTask` marks a task that started on the virtual lane; the other task events carry an optional
+`taskLabel` but no lane, so join them by `taskId` if you need both. See
+[Operations](operations.md#jfr) for the event list and recording recipes. Measured costs and scaling
 numbers are in [Benchmarks](benchmarks.md).
 
 ## Related pages
 
 - [Plugin API](plugin-api.md)
 - [Configuration](configuration.md)
+- [Tuning](tuning.md)
 - [Operations](operations.md)
 - [Benchmarks](benchmarks.md)

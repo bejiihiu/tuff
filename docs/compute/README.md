@@ -1,8 +1,9 @@
 # Compute scheduler
 
-Tuff ships one shared pool of worker threads for CPU-bound server work. Server code and plugins submit a
-task, get a `CompletableFuture` back, and the scheduler decides when it runs, on which worker, and how the
-pool is shared between everyone who submitted.
+Tuff ships one shared scheduler for CPU-bound and blocking server work: a platform worker pool plus an
+optional virtual-thread lane. Server code and plugins submit a task, get a `CompletableFuture` back, and the
+scheduler decides when it runs, on which lane and worker, and how the resources are shared between everyone
+who submitted.
 
 The workers own no region, no chunk and no entity. A task computes from a snapshot, and the result is
 delivered back to the thread that owns the world state.
@@ -16,7 +17,7 @@ and queues are usually unbounded.
 
 The compute scheduler replaces that with:
 
-- one pool, one queue, one backpressure story;
+- one scheduler, one queue, one backpressure story, with a platform pool and a virtual lane for blocking work;
 - priorities with aging, so background work still runs under load;
 - per-consumer quotas and fair-share weights, so one subsystem cannot take every worker;
 - a bounded queue that refuses work instead of growing the heap;
@@ -78,7 +79,7 @@ works from the console and from players.
 
 | Form | Shows |
 | --- | --- |
-| `/tuff`, `/tuff compute`, `/tuff status` | Engine summary: state, workers, queue, task counters, throughput, wait/execution averages, CPU, startup settings |
+| `/tuff`, `/tuff compute`, `/tuff status` | Engine summary: state, platform and virtual lane lines, queue, task counters, throughput, wait/execution averages, CPU, startup settings |
 | `/tuff compute consumers` | Per-consumer policy, active/queued tasks, counters and latency |
 | `/tuff compute reload`, `/tuff reload` | Re-reads `config/tuff.yml`, applies consumer policies, lists deferred keys and validation problems |
 | `/tuff compute jfr start\|stop\|dump` | Controls a JFR recording with the `tuff.compute` events |
@@ -94,6 +95,7 @@ See [Operations § Command](operations.md#command) for output details and JFR li
 | Consumer | A stable id that work is submitted under; carries limits, fair-share weight and a queue bound |
 | Priority | `CRITICAL`, `HIGH`, `NORMAL`, `LOW`; a dispatch hint, not a reservation |
 | Policy | `ConsumerPolicy`: concurrency limit, queue bound, weight, overflow policy, max queue wait |
+| Lane | Platform worker pool or virtual-thread lane; the priority decides which one runs a task |
 | Handoff | Delivering a finished result onto the region, entity or global context that may touch the world |
 
 ## Pages
@@ -103,6 +105,7 @@ See [Operations § Command](operations.md#command) for output details and JFR li
 - [Plugin API](plugin-api.md) — submit, cancel, register consumers, hand results back correctly, common
   mistakes.
 - [Configuration](configuration.md) — every key in `config/tuff.yml`, defaults, validation errors, presets.
+- [Tuning](tuning.md) — server-type presets, lane and spill choices, symptom → knob, anti-patterns.
 - [Operations](operations.md) — command, logs, metrics, JFR recordings, benchmarks, tuning, known limitations.
 - [Benchmarks](benchmarks.md) — JMH numbers for the submission path, dispatch, strategies, cancellation,
   lifecycle and idle latency, with the harness caveats.

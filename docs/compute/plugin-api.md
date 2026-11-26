@@ -66,7 +66,9 @@ ComputeHandoff.toEntity(this, mob, handle, mob.getPathfinder()::moveTo);
 ```
 
 `ComputeRequest.of(task)` and `ComputeRequest.of(priority, task)` build requests for the default consumer
-with `GENERAL`.
+with `GENERAL`. A request can also carry an optional diagnostic `label` (the five-argument constructor, or
+`ComputeRequest.of(label, task)`): it is trimmed to 64 characters, appears in JFR task events and in handle
+diagnostics, and never affects scheduling, ordering or quotas. `handle.label()` returns it when present.
 
 ### What a task may do
 
@@ -88,14 +90,16 @@ A task must return a non-null value. Returning `null` is treated as a task bug a
 
 | Priority | Use it for | Cost of getting it wrong |
 | --- | --- | --- |
-| `CRITICAL` | Work a player is actively waiting for right now | A flood of `CRITICAL` degrades scheduling into FIFO and defeats aging |
+| `LOW` | Blocking or IO-bound work that may wait, speculative prefetch, cache warm-up | Routed to the virtual lane when it is enabled; never use `LOW` for CPU-bound work. Too much `LOW` also wastes the lane |
 | `HIGH` | Work that gates region progress: a block decision, a spawn decision | Too much `HIGH` makes `NORMAL` behave like `LOW` |
 | `NORMAL` | Ordinary compute work; the default | — |
-| `LOW` | Prefetch, cache warm-up, speculative work that may be dropped | Too much `LOW` wastes worker time if the queue is contended |
+| `CRITICAL` | Work a player is actively waiting for right now | A flood of `CRITICAL` degrades scheduling into FIFO and defeats aging |
 
-Priority orders *dispatch*. It does not preempt a running task, does not reserve a worker, and does not
-override consumer quotas or fair-share weights. A `LOW` task that waits long enough is aged upwards; a
-`CRITICAL` task still cannot exceed its consumer's concurrency limit.
+Priority orders *dispatch within a lane*. It does not preempt a running task, does not reserve a worker, and
+does not override consumer quotas or fair-share weights. `LOW` is routed to the virtual lane when
+`lanes.virtual.low-priority` is true and stays on the platform lane otherwise; aging changes the order of
+work inside a lane, it never moves a `LOW` task onto the platform lane. `HIGH` and `CRITICAL` never spill.
+`NORMAL` may spill only while the platform lane is saturated and a spill threshold is met.
 
 ## Consumers
 
@@ -109,7 +113,7 @@ compute.registerConsumer(ComputeConsumer.of(
 ));
 
 // 2. Just submit under the id. With allow-dynamic-registration it is registered from config/default.
-compute.submit("map-colour-cache", ComputeTaskType.CUSTOM, ComputePriority.LOW, () -> rebuild(snapshot));
+compute.submit("map-colour-cache", ComputeTaskType.CUSTOM, ComputePriority.NORMAL, () -> rebuild(snapshot));
 ```
 
 `ComputeConsumer.of(id, policy)` allows every task type up to `CRITICAL`. The four-argument `of` restricts
@@ -119,7 +123,7 @@ types and priority:
 compute.registerConsumer(ComputeConsumer.of(
     "map-colour-cache",
     Set.of(ComputeTaskType.CUSTOM),
-    ComputePriority.LOW,
+    ComputePriority.NORMAL,
     ConsumerPolicy.relative(0.25)
 ));
 ```
@@ -280,7 +284,7 @@ Some APIs only accept an `Executor`. `ComputeExecutor` is the bridge:
 
 ```java
 final Executor executor = new ComputeExecutor(
-    compute, "map-colour-cache", ComputePriority.LOW, ComputeExecutor.RejectionPolicy.CALLER_RUNS);
+    compute, "map-colour-cache", ComputePriority.NORMAL, ComputeExecutor.RejectionPolicy.CALLER_RUNS);
 cache.rebuildAsync(executor);
 ```
 
@@ -397,7 +401,7 @@ private void submitOrRun(Runnable work) {
         return;
     }
     try {
-        this.compute.submit("my-plugin", ComputeTaskType.CUSTOM, ComputePriority.LOW, () -> {
+        this.compute.submit("my-plugin", ComputeTaskType.CUSTOM, ComputePriority.NORMAL, () -> {
             work.run();
             return Boolean.TRUE;
         });

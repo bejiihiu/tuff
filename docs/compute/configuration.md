@@ -37,14 +37,14 @@ publishes an immutable snapshot and logs every problem. The command prints the s
 A live pool adopts very little. The bootstrap compares the previous and the updated effective policy of
 every consumer that is **already registered on the engine** and calls
 `AsyncComputeScheduler#updateConsumerPolicy` for the ones that differ. Everything else — `enabled`,
-`workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*`, `shutdown-grace-seconds` — is reported
-as `takes effect after a restart`. Consumer overrides for ids that are not registered yet are not applied
-either: dynamic registration reads the policy from the engine's startup snapshot, so a new consumer gets
-its new limits only after a restart. Such an override is not added to the deferred list either.
+`workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*`, `shutdown-grace-seconds` — is
+reported as `takes effect after a restart`. Consumer overrides for ids that are not registered yet are not
+applied either: dynamic registration reads the policy from the engine's startup snapshot, so a new consumer
+gets its new limits only after a restart. Such an override is not added to the deferred list either.
 
 The loader's `ConfigDiff` marks a narrower restart set (`enabled`, `queue.capacity`, `scheduling.*`,
-`allow-dynamic-registration`, `adaptive.enabled`), but the bootstrap is stricter. For a running server the
-deferred list printed by the command is the authoritative answer.
+`lanes.*`, `allow-dynamic-registration`, `adaptive.enabled`), but the bootstrap is stricter. For a running
+server the deferred list printed by the command is the authoritative answer.
 
 Reload log lines:
 
@@ -61,7 +61,7 @@ Compute config: async-compute.workers.threads: expected a whole number, got 'man
 
 | Key | Type | Default | Allowed | Effect | Restart |
 | --- | --- | --- | --- | --- | --- |
-| `enabled` | boolean | `true` | `true`/`false` | Master switch. `false` reads and validates the file but creates no engine: no worker, janitor, adaptive or sampler thread, nothing installed, `TuffCompute.scheduler()` empty, submissions unavailable. `/tuff` explains that the engine is disabled | yes |
+| `enabled` | boolean | `true` | `true`/`false` | Master switch. `false` reads and validates the file but creates no engine: no worker, janitor, adaptive, virtual pump or sampler thread, nothing installed, `TuffCompute.scheduler()` empty, submissions unavailable. `/tuff` explains that the engine is disabled | yes |
 
 With `enabled: false` there is no scheduler object at all: `TuffCompute.scheduler()` is empty, no engine
 thread exists, and `/tuff` answers with the disabled explanation. The file is still read and validated, so
@@ -228,6 +228,38 @@ The controller treats failed tasks as non-samples, never grows when process CPU 
 shrinks on latency pressure or after three idle windows. Full decision logic is in
 [Architecture § Autoscaling](architecture.md#autoscaling).
 
+## `async-compute.lanes.virtual`
+
+The platform lane is the worker pool configured under `workers`. This section configures the optional
+virtual lane. Every key here is engine wiring and needs a restart; `/tuff` prints the values the running
+engine was created with.
+
+| Key | Type | Unit | Default | Allowed | Effect |
+| --- | --- | --- | --- | --- | --- |
+| `enabled` | boolean | — | `true` | `true`/`false` | Create the virtual lane. `false` starts no pump and no virtual thread; `LOW` falls back to the platform workers, the pre-lane behaviour |
+| `low-priority` | boolean | — | `true` | `true`/`false` | Route `LOW` to the virtual lane. `false` keeps `LOW` on the platform workers while the lane still exists for `NORMAL` spill |
+| `normal-spill` | boolean | — | `true` | `true`/`false` | Allow saturated `NORMAL` work to spill onto the virtual lane. `HIGH` and `CRITICAL` never spill |
+| `max-concurrent` | integer | tasks | `64` | `>= 1` | Hard limit of virtual tasks executing at the same time. Not a CPU reservation |
+| `spill-wait-millis` | number | ms | `50` | `>= 0` | How long the oldest queued `NORMAL` task must have waited before `NORMAL` work is eligible to spill. `0` makes any queued `NORMAL` task eligible as soon as the platform lane is saturated |
+| `spill-queue-depth` | integer | tasks | `64` | `>= 0` | `NORMAL` queue depth at which spill becomes eligible regardless of the wait. `0` disables the depth trigger, leaving `spill-wait-millis` as the only condition |
+
+Spill requires the platform lane to be saturated (`activeWorkers >= concurrencyLimit`) and at least one
+`NORMAL` task queued. The depth and wait triggers are OR-ed. `max-concurrent` bounds running virtual tasks,
+not queued ones: when every permit is held, tasks wait in the same bounded queue, so capacity, expiry and
+overflow policy still apply. `LOW` never moves to the platform workers while the lane serves it. `NORMAL`
+spill is additional eligibility, not a move: the platform mask still includes `NORMAL`, so a spilled task can
+be claimed by whichever lane gets to it first.
+
+The lane never changes the platform pool size, the processor budget or adaptive concurrency, and virtual
+threads add no CPU parallelism. Consumer quotas are shared: a running virtual task holds a consumer slot and
+counts towards `max-concurrent` of that consumer, so the lane cannot be used to bypass a policy.
+
+| Scenario | `LOW` | `NORMAL` |
+| --- | --- | --- |
+| `enabled: false` | platform | platform, no spill |
+| `low-priority: false`, `normal-spill: true` | platform | spill when saturated and a threshold is met |
+| `low-priority: true`, `normal-spill: false` | virtual lane | platform, never spills |
+
 ## `async-compute.shutdown-grace-seconds`
 
 | Key | Type | Unit | Default | Allowed | Effect |
@@ -252,6 +284,9 @@ Every problem becomes one WARN line prefixed with `Compute config:` and is also 
 | `async-compute.consumers.default.max-concurrent: a share must be in (0.0, 1.0], got 4.0; using 1.0` | Wrote `4.0` | Write `4` for an absolute count |
 | `async-compute.workers: rejected (threads must not exceed maxThreads, got 8 > 4), using defaults` | Inconsistent section | Fix the values; the whole section fell back |
 | `async-compute.scheduling.aging-interval-millis: must be positive, got 0.0; using 1000` | Zero duration | Use a positive number |
+| `async-compute.lanes.virtual.max-concurrent: must be at least 1, got 0; using 64` | Invalid lane limit | Use a positive count |
+| `async-compute.lanes.virtual.spill-wait-millis: must not be negative, got -5.0; using 50` | Negative duration | Use `0` or a positive number |
+| `async-compute.lanes.virtual.spill-queue-depth: must not be negative, got -1; using 64` | Negative depth | Use `0` to disable the depth trigger |
 | `config/tuff.yml: is not valid YAML (...), keeping the previous settings` | Parse failure | Fix the YAML; the old snapshot stays live |
 
 A rejected section is replaced as a whole, so one bad key can reset its siblings. Read the warning, fix the

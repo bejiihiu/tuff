@@ -52,11 +52,12 @@ the subcommands.
 | `/tuff compute reload`, `/tuff reload` | Re-read `config/tuff.yml` |
 | `/tuff compute jfr start\|stop\|dump` | Flight Recorder control |
 
-The summary prints the scheduler state, live/busy/idle workers, concurrency limit and peak, queue depth and
-capacity, submitted/completed/failed/rejected/cancelled/expired counters, throughput, queue-wait and
-execution averages with their longest values, the process CPU estimate, and the startup worker/queue/
-scheduling settings. It reads the public `SchedulerMetrics` snapshot, which has no percentiles, so the
-command shows averages and longest values only.
+The summary prints the scheduler state, live/busy/idle platform workers, concurrency limit and peak, the
+lane line, queue depth and capacity, submitted/completed/failed/rejected/cancelled/expired counters,
+throughput, queue-wait and execution averages with their longest values, the process CPU estimate, and the
+requested worker sizing with the live worker count, the queue and scheduling settings, and the lane
+settings the engine was created with. It reads the public `SchedulerMetrics` snapshot, which has no
+percentiles, so the command shows averages and longest values only.
 
 `consumers` prints, for every registered consumer, its policy (enabled, concurrency limit, weight, queue
 bound, overflow policy, max wait), active/limit and queued/bound, the same counters, and wait/execution
@@ -96,6 +97,9 @@ immutable snapshot. If the engine is not running, neither is available.
 | `averageQueueWait` / `longestQueueWait` | Wait before execution | `longest` catching the window in which a task was starved |
 | `averageExecutionTime` / `longestExecutionTime` | Body duration | `longest` shows a task that holds a slot for too long |
 | `consumers()` | Per-consumer counters, limits and active/queued counts | Find the subsystem that fills the queue |
+| `lanes().virtual().running` / `.limit` | Virtual tasks executing now / `max-concurrent` | `running == limit` means the lane is full; queued work waits |
+| `lanes().virtual().queued` | `LOW` entries plus spill-eligible `NORMAL` entries | The lane's own backlog, not the whole queue |
+| `lanes().virtual().spilled` | Cumulative `NORMAL` tasks dispatched to the virtual lane | A rate, not a gauge; compare with `submitted()` over an interval |
 
 Per-consumer snapshots expose `activeTasks`, `queuedTasks`, `concurrencyLimit`, `maxQueuedTasks`, the same
 counter set and the same wait/execution statistics. A consumer whose `activeTasks` sits at its
@@ -112,6 +116,41 @@ counter set and the same wait/execution statistics. A consumer whose `activeTask
 | Wasting workers | `totalWorkers` high, `activeWorkers` near zero, queue empty for long periods | `min-threads` too high, keep-alive too long, or a fixed `threads` value larger than needed |
 | One task hogging | `activeWorkers == limit`, queue present, `longestExecutionTime` orders of magnitude above the average | Split the task; there is no preemption and no watchdog |
 | Queue bound hit per consumer | One consumer at `maxQueuedTasks`, others fine | The consumer's own limit is the bottleneck; raise it or fix its production rate |
+
+### Reading the lanes line
+
+`/tuff` prints one lane line followed by the lane settings the engine was created with:
+
+```
+lanes: platform 4/5 (3 busy, 1 idle) | virtual 12/64 (9 queued, 3 spilled)
+lane settings: virtual lane enabled, LOW on the virtual lane, NORMAL spills when saturated, max-concurrent 64, spill after 50 ms or 64 queued NORMAL tasks
+```
+
+- `platform live/limit` is `totalWorkers()` over `concurrencyLimit()`, with busy and idle workers in
+  parentheses. `idle` here means platform workers without a gate permit; a worker blocked by the gate counts
+  as idle.
+- `virtual running/limit` is tasks executing now over `max-concurrent`. `running == limit` means the lane is
+  full and eligible work is waiting in the queue.
+- `virtual queued` is what the lane may claim right now: `LOW` entries when the lane serves `LOW`, plus
+  `NORMAL` entries while the spill trigger is open. `NORMAL` work the platform lane can still take is not
+  counted.
+- `virtual spilled` is cumulative since scheduler start, not a gauge. A growing number means `NORMAL` work is
+  leaving the platform lane.
+- With the lane disabled the right side reads `virtual disabled (LOW tasks use the platform workers)` and
+  the settings line says so.
+
+What to watch:
+
+| Signal | Meaning | Action |
+| --- | --- | --- |
+| `virtual running == limit` and `queued` stable or growing | The lane is the bottleneck | Raise `max-concurrent` only if the tasks really block (IO, waiting) and the downstream can take more concurrency; otherwise the queue is doing its job |
+| `spilled` rising under CPU-bound `NORMAL` work | CPU work is being picked up by virtual threads, which have no extra CPU parallelism | Add platform capacity (`workers.max-threads`/`threads`) or set `normal-spill: false`; do not treat the lane as extra cores |
+| Virtual tasks grow while `cpu` and tick times rise | Misrouted CPU work | Move that work to `NORMAL`/`HIGH` on the platform lane, or stop routing it to `LOW` |
+| `queued > 0` but `running < limit` | The pump cannot claim: usually a consumer quota is exhausted | Check `consumers`: `activeTasks` at `concurrencyLimit` stops both lanes for that consumer |
+| `virtual` counters all zero on a busy server | No `LOW` work and no spill condition | Expected for CPU-only workloads; check `low-priority`, `normal-spill`, `spill-wait-millis`, `spill-queue-depth` only if IO work exists |
+
+The overall queue wait includes tasks waiting for either lane; there is no separate per-lane latency
+histogram in `SchedulerMetrics`.
 
 A snapshot can be up to one `sample-interval-seconds` old for the queue and worker gauges; counters derived
 from lifecycle events are current.
@@ -152,17 +191,22 @@ On Windows use a normal path such as `C:\temp\compute.jfr`.
 
 | Event | Fields | When it fires |
 | --- | --- | --- |
-| `tuff.compute.TaskSubmitted` | `taskId`, `consumerId`, `taskType`, `priority`, `queueDepth` | Accepted submission |
-| `tuff.compute.TaskStarted` | `taskId`, `consumerId`, `taskType`, `priority`, `queueWaitNanos`, `activeTasks` | A worker starts the body; `activeTasks` is that consumer's active count |
-| `tuff.compute.TaskCompleted` | `taskId`, `consumerId`, `taskType`, `priority`, `executionNanos` | Successful finish |
+| `tuff.compute.TaskSubmitted` | `taskId`, `consumerId`, `taskType`, `priority`, `queueDepth`, `taskLabel` | Accepted submission |
+| `tuff.compute.TaskStarted` | `taskId`, `consumerId`, `taskType`, `priority`, `queueWaitNanos`, `activeTasks`, `taskLabel` | A task starts the body; `activeTasks` is that consumer's active count |
+| `tuff.compute.TaskCompleted` | `taskId`, `consumerId`, `taskType`, `priority`, `executionNanos`, `taskLabel` | Successful finish |
 | `tuff.compute.TaskFailed` | same plus `failureType`, `failureMessage` | Finish with a throwable |
-| `tuff.compute.TaskCancelled` | `taskId`, `consumerId`, `reason` | Cancellation other than queue expiry |
-| `tuff.compute.TaskQueueExpired` | `taskId`, `consumerId` | Queue wait limit reached |
+| `tuff.compute.TaskCancelled` | `taskId`, `consumerId`, `reason`, `taskLabel` | Cancellation other than queue expiry |
+| `tuff.compute.TaskQueueExpired` | `taskId`, `consumerId`, `taskLabel` | Queue wait limit reached |
 | `tuff.compute.TaskRejected` | `consumerId`, `reason` | Refused submission |
+| `tuff.compute.VirtualTask` | `taskId`, `consumerId`, `priority`, `queueWaitNanos`, `spilled`, `running`, `limit`, `taskLabel` | A task starts on the virtual lane; `spilled` is true for `NORMAL` work dispatched to the lane |
 | `tuff.compute.QueueDepthSample` | `queuedTasks`, `capacity`, `fillRatio` | Every gauge sample |
-| `tuff.compute.WorkerPoolState` | `totalWorkers`, `activeWorkers`, `idleWorkers`, `concurrencyLimit` | Every gauge sample |
+| `tuff.compute.WorkerPoolState` | `totalWorkers`, `activeWorkers`, `idleWorkers`, `concurrencyLimit` | Every gauge sample, platform lane only |
 | `tuff.compute.WorkerPoolResized` | `totalWorkers`, `concurrencyLimit` | When the sampled worker count changes |
 | `tuff.compute.AdaptiveDecision` | `currentLimit`, `desiredLimit`, `minLimit`, `maxLimit`, `samples`, `averageQueueWaitNanos`, `averageExecutionNanos`, `p99QueueWaitNanos`, `utilization`, `reason` | Each adaptive evaluation that passed the cooldown checks |
+
+Task events do not carry a lane field. A task is on the virtual lane when a `VirtualTask` with the same
+`taskId` exists; join the two streams on `taskId`. `taskLabel` comes from the optional
+`ComputeRequest#label`, trimmed to 64 characters, and is empty when the submission had none.
 
 `AdaptiveDecision.reason` is the fastest way to answer "why is the pool not growing": `HOLD_CPU_BUDGET`,
 `HOLD_STABLE`, `AT_MAXIMUM`, `EXPLICIT_WORKER_COUNT`, `INSUFFICIENT_SAMPLES`, `SHRINK_WAIT`, `SHRINK_IDLE`
@@ -197,6 +241,9 @@ another build was active. Re-run on a quiet machine before using absolute values
 
 ## Tuning playbook
 
+Server-type presets, lane choices and the full symptom table are in [Tuning](tuning.md); this is the quick
+version.
+
 | Symptom | First knob | Then | Caveat |
 | --- | --- | --- | --- |
 | Queue grows, workers busy | `workers.max-threads` or `workers.threads` | `adaptive.enabled: true` with a matching `max-concurrency` | More workers than the processor budget only adds context switches |
@@ -217,8 +264,16 @@ seconds or a consumer policy capping itself.
 
 These are deliberate, with the technical reason:
 
-- **No virtual threads.** They add no parallelism for CPU-bound work, hide workers from thread dumps, and do
-  not provide the stable worker index the dispatcher uses. The pool rejects them.
+- **The virtual lane gives no CPU parallelism.** Virtual threads make blocking cheaper, not computation
+  faster; CPU-bound work on the lane competes with the platform workers for the same cores. Virtual threads
+  also do not appear in a normal thread dump, so use the lane metrics rather than `jcmd Thread.print`.
+- **Virtual tasks are not platform workers.** They do not count in `totalWorkers()` / `activeWorkers()`, do
+  not hold a gate permit and do not feed the adaptive controller. They do hold the same consumer quota slot
+  as platform work, and they wait in the same bounded queue, so capacity, expiry and overflow apply to them.
+- **`HIGH` and `CRITICAL` never spill.** Only `LOW` (when the lane serves it) and saturated `NORMAL` can use
+  the virtual lane.
+- **Lane settings are startup-only.** The lane is created with the scheduler; every `lanes.*` key needs a
+  restart and the command shows the values the running engine was created with.
 - **No automatic retries.** A failed task is reported to the caller and counted. Retrying is a policy
   decision that belongs to the subsystem, which knows whether the work is idempotent.
 - **No preemption or per-task timeout.** A running task holds its slot until it returns. Interrupting
@@ -229,8 +284,9 @@ These are deliberate, with the technical reason:
 - **Queue capacity needs a restart.** The queue allocates its bound at construction; growing it live would
   require a different structure with the same ordering guarantees.
 - **Live reload is narrow.** Only the policies of consumers that are already registered change on a running
-  engine. `workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*` and `shutdown-grace-seconds`
-  need a restart, and an override for a consumer that has not registered yet is only read at startup.
+  engine. `workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*` and
+  `shutdown-grace-seconds` need a restart, and an override for a consumer that has not registered yet is
+  only read at startup.
 - **`queue.overflow-policy` is a default, not an override.** It applies to the `default` consumer and to
   consumers registered on the fly; `consumers.<id>.overflow-policy` and an explicit `registerConsumer`
   policy take precedence for their ids.

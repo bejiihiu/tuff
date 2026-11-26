@@ -71,10 +71,11 @@ Gradle properties (see `.github/workflows/release.yml`).
 ## Tuff compute
 
 Tuff has a shared compute scheduler for CPU-bound work: priorities with aging, per-consumer quotas and
-fair-share weights, a bounded queue, metrics and JFR. Plugins reach it through `TuffCompute` and hand results
-back to the owning region with `ComputeHandoff`; the configuration lives in `config/tuff.yml`. Built-in
-consumers are not part of this build yet; `/tuff` shows the engine state and controls its JFR recording. See
-[`docs/compute/`](docs/compute/README.md).
+fair-share weights, a bounded queue, an optional virtual-thread lane for blocking work, metrics and JFR.
+Plugins reach it through `TuffCompute` and hand results back to the owning region with `ComputeHandoff`; the
+configuration lives in `config/tuff.yml`. Built-in consumers are not part of this build yet; `/tuff` shows
+the engine state and controls its JFR recording. Start with [`docs/compute/`](docs/compute/README.md) and the
+server presets in [`tuning.md`](docs/compute/tuning.md).
 
 ## Region threading (the Folia part)
 
