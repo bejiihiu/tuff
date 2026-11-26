@@ -464,7 +464,10 @@ public record ComputeSettings(
      *
      * @param enabled            whether the adaptive controller may change the concurrency limit
      * @param minConcurrency     lowest limit the controller may pick, at least {@code 1}
-     * @param maxConcurrency     highest limit, or {@code -1} for the current pool size
+     * @param maxConcurrency     highest limit, or {@code -1} for the worker ceiling: with automatic
+     *                           worker sizing that is {@link Workers#resolveMaxThreads(int)}, which
+     *                           honours {@code workers.max-threads}; with an explicit
+     *                           {@code workers.threads} it is that fixed count
      * @param sampleWindow       window over which samples are aggregated before a decision is taken
      * @param minSamples         minimum number of finished tasks per window before the limit may move
      * @param increaseStep       additive increase applied when the pool is not saturated, in

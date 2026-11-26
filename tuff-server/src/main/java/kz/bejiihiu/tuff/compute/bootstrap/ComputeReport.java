@@ -232,8 +232,10 @@ public final class ComputeReport {
      * concurrency may keep below the pool size. Virtual numbers come from
      * {@link SchedulerMetrics.VirtualLane}: {@code running} and {@code limit} are gauges,
      * {@code queued} is the lane backlog (LOW entries plus spill eligible NORMAL entries) and
-     * {@code spilled} is the cumulative number of NORMAL tasks that left the platform lane since the
-     * scheduler started, not a current gauge.
+     * {@code spilled} is the cumulative number of NORMAL tasks the lane executed because the
+     * platform pool stayed saturated and a spill threshold fired. It is not a current gauge, and a
+     * NORMAL task never leaves the platform lane in advance: it stays in the shared queue and any
+     * platform worker that gets to it first runs it normally.
      *
      * @param liveWorkers      worker threads that exist
      * @param busyWorkers      workers executing a task
