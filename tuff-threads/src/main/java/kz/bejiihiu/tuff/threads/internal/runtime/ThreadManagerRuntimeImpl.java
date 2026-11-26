@@ -89,7 +89,6 @@ final class ThreadManagerRuntimeImpl implements ThreadManagerRuntime {
             this.registry,
             this.probes::attached,
             new MxBeanThreadCounters(),
-            topology,
             clock,
             sink,
             metricsConfig(settings),

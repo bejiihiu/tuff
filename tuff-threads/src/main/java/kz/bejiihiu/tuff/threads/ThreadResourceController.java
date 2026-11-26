@@ -25,13 +25,31 @@ public interface ThreadResourceController {
     /**
      * Returns the number of cores available to managed pools right now.
      *
-     * <p>This is the resolved value after the configured reserve and the container aware processor
-     * count, not the raw machine size. It is the denominator every pool budget is resolved against,
-     * and it may change between calls when the platform reports a different topology.
+     * <p>This is the ledger's {@code usable}: the thread ceiling ({@code floor(processors * 0.8)}) minus
+     * the lanes that were already deducted (region, chunk, io) and the effective reserve, floored at
+     * one. It is <b>the</b> usable number of the module - the snapshot's usable core count is this same
+     * value, never the raw {@code processors - reserve} headroom. The raw subtraction before the floor,
+     * which may be zero or negative, is printed by {@link #budgetLedger()}.
+     *
+     * <p>It may change between calls when the registry or the platform topology changed; it is never
+     * recomputed by a caller.
      *
      * @return usable cores, at least one
      */
     int usableCores();
+
+    /**
+     * Returns the whole budget ledger as one printable line.
+     *
+     * <p>The line spells out every term of {@link #usableCores()} - cores, ceiling, region, chunk, io,
+     * reserve, the raw remainder and the floor when one was applied - so "why does my pool have one
+     * core" no longer needs a debugger. It is the same text as the internal plan's ledger, produced from
+     * the plan the controller is actually using.
+     *
+     * @return a single line such as
+     *     {@code cores 16: ceiling 12 = region 2 + chunk 0 + io 0 + reserve 1 + usable 9}
+     */
+    String budgetLedger();
 
     /**
      * Returns the total budget the controller may divide.

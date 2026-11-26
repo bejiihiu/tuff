@@ -182,9 +182,12 @@ Two limits of the current build are worth stating plainly:
    compute still sizes itself from `ComputeThreadBudget`, which subtracts the **live** region, chunk
    and IO counts and a fixed network reserve. The two formulas share the 80% rule and nothing else.
 
-The controller exposes `usableCores()` as the plan's `usable`. `ResourceSnapshot.usableCores()`, which
-`/tuff threads` prints on its `processors:` line, is `availableProcessors − reservedCores`. The two
-numbers answer different questions and are not interchangeable; see [observability](observability.md).
+There is exactly one `usable` number. `ThreadResourceController.usableCores()` returns the plan's
+`usable`, the snapshot publishes that same value, and `/tuff threads` prints it on its `processors:`
+line. `reservedCores` next to it is the configured reserve, before the plan floors it at one. The raw
+subtraction, which may be zero or negative, is visible in the printable ledger
+(`ThreadResourceController.budgetLedger()`, also carried by the snapshot as `budgetLedger`) rather than
+in a second "usable" field.
 
 ## Thread safety
 

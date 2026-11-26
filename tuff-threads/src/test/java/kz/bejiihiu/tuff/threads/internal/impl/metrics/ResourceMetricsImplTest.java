@@ -3,6 +3,7 @@ package kz.bejiihiu.tuff.threads.internal.impl.metrics;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -124,21 +125,34 @@ class ResourceMetricsImplTest {
     }
 
     @Test
-    void disabledMetricsPublishZerosAndNoPools() {
-        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
+    void disabledMetricsStillListRegisteredPoolsWithoutMeasuringThem() {
+        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1), spec(REGION, 0));
         this.registry.put(COMPUTE, thread(7L, "compute-1", COMPUTE, Thread.State.RUNNABLE));
         final MetricsConfig off = new MetricsConfig(false, true, true, Duration.ofSeconds(1), Duration.ofSeconds(30));
         final ResourceMetricsImpl metrics = this.metrics(pools, off);
 
         assertFalse(metrics.enabled());
         final ResourceSnapshot snapshot = metrics.snapshot();
-        assertEquals(0, snapshot.totalThreads());
-        assertTrue(snapshot.pools().isEmpty());
-        assertTrue(snapshot.threads().isEmpty());
-        assertTrue(metrics.pool(COMPUTE).isEmpty());
-        assertTrue(metrics.threads(COMPUTE).isEmpty());
+        assertEquals(2, snapshot.pools().size(), "registered pools must not disappear when metrics are off");
+        assertEquals(1, snapshot.totalThreads(), "registry accounting still knows the threads");
+        assertTrue(snapshot.threads().isEmpty(), "no per thread list is published while collection is off");
+        assertEquals(Set.of(DegradedReason.METRICS_UNAVAILABLE), snapshot.degradedReasons());
+
+        final PoolSnapshot compute = metrics.pool(COMPUTE).orElseThrow();
+        assertEquals(1, compute.aliveThreads());
+        assertEquals(1, compute.activeThreads(), "states come from the registry, not from a probe");
+        assertEquals(1, compute.coreThreads(), "the spec floor is known without sampling");
+        assertEquals(-1L, compute.queuedTasks(), "a disabled sampler must not invent a queue depth");
+        assertEquals(-1L, compute.submittedTasks());
+        assertEquals(-1.0d, compute.cpuLoad(), 0.0d);
+        assertEquals(SaturationReport.Level.UNKNOWN, compute.saturation().level());
         assertEquals(SaturationReport.Level.UNKNOWN, metrics.saturation(COMPUTE).level());
-        assertEquals(2, snapshot.usableCores());
+
+        final PoolSnapshot region = metrics.pool(REGION).orElseThrow();
+        assertEquals(0, region.aliveThreads(), "the registry holds no probe-only threads");
+        assertEquals(2, snapshot.usableCores(), "the budget ledger still answers with collection off");
+        assertEquals(0, snapshot.reservedCores());
+        assertTrue(snapshot.budgetLedger().isPresent());
     }
 
     @Test
@@ -367,6 +381,41 @@ class ResourceMetricsImplTest {
     }
 
     @Test
+    void snapshotUsableAndLedgerComeFromTheController() {
+        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
+        final ResourceControllerImpl controller = new ResourceControllerImpl(
+            new MetricsFixtures.FakeTopology(16),
+            pools,
+            this.registry,
+            new ThreadManagementSettings.Resources(true, 1, -1),
+            BudgetDeductions.none(),
+            this.clock,
+            this.sink
+        );
+        final ResourceSampler sampler = new ResourceSampler(
+            pools,
+            this.registry,
+            PoolProbeSource.empty(),
+            this.counters,
+            this.clock,
+            this.sink,
+            MetricsConfig.defaults(),
+            1,
+            controller
+        );
+
+        final ResourceSnapshot snapshot = sampler.sampleNow();
+
+        assertEquals(controller.usableCores(), snapshot.usableCores(),
+            "the snapshot must publish the ledger's usable, not a second formula");
+        assertEquals(11, snapshot.usableCores());
+        assertTrue(snapshot.usableCores() < 16 - 1, "the 80% ceiling is part of usable");
+        assertEquals(Optional.of(controller.budgetLedger()), snapshot.budgetLedger());
+        assertTrue(controller.budgetLedger().contains("cores 16"), controller.budgetLedger());
+        assertTrue(controller.budgetLedger().contains("usable 11"), controller.budgetLedger());
+    }
+
+    @Test
     void leaseWaitReachesTheSaturationReport() {
         final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
         final PoolProbe probe = new MetricsFixtures.FakeProbe(
@@ -382,7 +431,6 @@ class ResourceMetricsImplTest {
             this.registry,
             () -> List.of(probe),
             this.counters,
-            new MetricsFixtures.FakeTopology(2),
             this.clock,
             this.sink,
             MetricsConfig.defaults(),
@@ -433,16 +481,17 @@ class ResourceMetricsImplTest {
         final PoolProbeSource probes,
         final MetricsConfig config
     ) {
+        // the fixture ledger says two usable cores, matching the two processor topology the tests used
         return new ResourceSampler(
             pools,
             this.registry,
             probes,
             this.counters,
-            new MetricsFixtures.FakeTopology(2),
             this.clock,
             this.sink,
             config,
-            0
+            0,
+            new MetricsFixtures.FakeLeaseController(2)
         );
     }
 

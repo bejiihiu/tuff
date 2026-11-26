@@ -25,7 +25,7 @@ A running server with default settings prints something like this:
 
 ```
 Tuff thread layer: running, all pools observed only
-  processors: 15 usable, 1 reserved; 4 registered thread(s) (peak 4)
+  processors: 11 usable, 1 reserved; 4 registered thread(s) (peak 4)
   pools: 7 registered
     chunk-io          L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
     chunk-worker      L1  alive 0  active 0  idle 0  [FEATURE_DISABLED, OBSERVE_ONLY]
@@ -43,10 +43,11 @@ How to read it:
 
 - **`running, all pools observed only`** comes from the configuration (`anyManagementEnabled()`
   derived from the `managed` flags), not from the measured coverage.
-- **`processors: N usable, R reserved`** is the snapshot's `usableCores` = `availableProcessors −
-  reserve`. It is not the budget ledger's `usable`, which additionally subtracts the 80% ceiling and
-  the deducted lanes, and which the command does not print. Do not compare the two numbers across
-  pages: they answer different questions.
+- **`processors: N usable, R reserved`** is the snapshot's `usableCores`, which is the budget ledger's
+  `usable`: `floor(processors × 0.8)` minus the deducted lanes and the effective reserve, floored at one.
+  `R` is the configured reserve before that floor. The raw subtraction and every term are in the
+  snapshot's `budgetLedger`, the same line `ThreadResourceController.budgetLedger()` returns, so there is
+  no second "usable" number to compare against.
 - **`N registered thread(s)`** is the sum of per-pool `alive`. It includes threads a probe reports,
   not only threads the registry created, so it can be non-zero while no thread has gone through the
   factory.
@@ -71,7 +72,7 @@ How to read it:
 | Field | Source | Notes |
 | --- | --- | --- |
 | `capturedAt` | monotonic clock | Wall-clock instant for display |
-| `usableCores` | `availableProcessors − reservedCores` | Minimum one; not the ledger's `usable` |
+| `usableCores` | The budget ledger's `usable` | Minimum one; also exposed by `ThreadResourceController` |
 | `reservedCores` | `resources.reserve-cores` | As configured, without the controller's floor at one |
 | `totalThreads`, `activeThreads`, `idleThreads`, `peakThreads` | Per-pool sums | `peak` is the highest total seen since start |
 | `creationRatePerSecond`, `terminationRatePerSecond` | `ThreadMXBean.getTotalStartedThreadCount` | JVM-wide deltas over the sampling window, not per pool |
@@ -79,6 +80,7 @@ How to read it:
 | `pools` | One `PoolSnapshot` per registered spec | Sorted by id; empty when `metrics.per-pool: false` |
 | `threads` | Per-thread snapshots | Sorted by thread id; empty when `metrics.per-thread: false` |
 | `degradedReasons` | Sampler plus manager | Union, independent of `per-pool` |
+| `budgetLedger` | `ThreadResourceController.budgetLedger()` | One printable line with every ledger term; empty only on a hand-built snapshot |
 
 `PoolSnapshot` carries the spec (id, kind, owner, purpose, min/max, coverage, budget), `alive`,
 `core`, `active`, `idle`, `queued`, `capacity`, task counters, `cpuLoad`, saturation and the pool's
@@ -96,6 +98,13 @@ Where a value is not measurable it is `-1`, never zero:
 | `processCpuLoad` | The OS bean returned a negative or non-finite value |
 | `unregisteredThreads` in the status | Metrics are disabled |
 
+With collection disabled (`metrics.enabled: false`, or `lifecycle.monitor-threads: false`) the snapshot
+is **structural**, not empty: it still lists every registered pool and the threads the registry accounts
+for, with their states, because that bookkeeping runs regardless of the switch. Everything that would
+have been measured is `-1` (queue, capacity, task counters, CPU), saturation is `UNKNOWN`, the per-thread
+list is empty, the rates are zero and `degradedReasons` carries `METRICS_UNAVAILABLE`. The metrics view
+also reports `enabled() == false`, which is the explicit "metrics disabled" status next to the numbers.
+
 `cpuLoad` for a pool is the share of the usable cores its threads consumed during the window:
 `ΔCPU(threads) / (elapsed × usableCores)`, clamped to `[0, 1]`. A newly seen thread has no baseline
 and contributes `-1`, so a fresh pool does not report a burst it did not have.
@@ -107,8 +116,7 @@ Saturation is derived, not measured by the pool:
 - `utilisation = active / alive`
 - `queuePressure = queued / capacity`, when both are known and positive; otherwise zero
 - `longestWaitNanos` comes from the lease controller: the age of the oldest parked lease request for
-  that pool. Zero means either nothing waits or no source is wired — the queue depth next to it tells
-  you which
+  that pool. Zero means nothing waits
 - level: `IDLE` when nothing is alive and nothing is queued, `SATURATED` at utilisation ≥ 0.95 or
   pressure ≥ 0.90, `BUSY` at utilisation ≥ 0.75 or pressure ≥ 0.50, otherwise `NORMAL`; `UNKNOWN` when
   neither active nor queued is available
@@ -230,7 +238,7 @@ integration that reads this data, obey the same rule.
 | `queued` unknown on every pool | No probe is attached | Expected; queue depth needs an owner getter |
 | No `tuff.threads.*` events in a recording | The recording does not have those events enabled, or it is the compute recording (category `tuff.compute` only) | Start a recording with the events enabled |
 | TPS looks wrong in a profiler | The profiler uses server-wide tick hooks, which Folia does not feed | Use `/tps` or a region-aware profiler |
-| `pools: 0 registered` while the layer is running | `metrics.enabled: false` or `lifecycle.monitor-threads: false`; the snapshot is empty by policy | Re-enable metrics and restart |
+| `pools: 0 registered` while the layer is running | `metrics.per-pool: false` (publication off), not `metrics.enabled: false` — with collection off the pools are still listed with unmeasured values | Check the `metrics` keys and the `degraded:` line (`METRICS_UNAVAILABLE` means collection is off) |
 
 ## Related pages
 

@@ -16,11 +16,12 @@ import java.util.Objects;
  * {@code false}, region execution keeps Folia's scheduler and the experimental Kairos path stays off.
  * Turning a flag on is a separate, reviewed integration step, not a side effect of upgrading.
  *
- * <p>Reload behaviour is not uniform, and the model does not pretend otherwise:
- * {@code region-execution.scheduler}, {@code region-execution.grid-exponent},
- * {@code region-execution.threads} while the scheduler is EDF and the top level {@code enabled} are
- * restart only; metrics switches and management flags are read on reload. The manager reports an
- * ignored change instead of silently accepting it.
+ * <p>The whole section is restart only, and the model does not pretend otherwise. The bootstrap parses
+ * it once, the runtime registers its pool set and bakes its sampling policy in {@code start()}, and no
+ * reconfigure call reaches a live manager: a changed key is listed by {@code /tuff reload} as "takes
+ * effect after a restart", never applied on the fly. That includes the metrics switches and every
+ * {@code managed} flag - they describe the manager that was built, so a running instance cannot
+ * honour a change to them.
  *
  * @param enabled         whether the manager runs at all; a disabled manager registers nothing, creates
  *                        no thread and rejects every lease
@@ -157,8 +158,9 @@ public record ThreadManagementSettings(
      * integrations are observation and, later, a factory plus registration; the tick model itself stays
      * Folia's.
      *
-     * @param managed                 whether UTMI may create the pool's threads and account its
-     *                                lifecycle; the safe default is {@code false}
+     * @param managed                 whether the region pool is registered at L2 instead of L1; Folia
+     *                                still creates the tick threads itself, so this changes the claimed
+     *                                coverage, not who builds the threads
      * @param preserveFoliaScheduling must stay {@code true}; Folia owns tick order, catch up and region
      *                                ownership, and disabling this is rejected rather than silently
      *                                ignored
@@ -247,8 +249,9 @@ public record ThreadManagementSettings(
      * capacity it may take and when it has to yield. Virtual thread limits stay in the existing
      * {@code async-compute} section; this record does not duplicate them.
      *
-     * @param managed    whether UTMI owns the platform pool's capacity; the safe default is
-     *                   {@code false}
+     * @param managed    whether the compute pool is registered as managed capacity; the compute
+     *                   adapter is what would deliver it, so without one the configuration is reported
+     *                   as {@link DegradedReason#CONFIG_CONFLICT} instead of applied
      * @param maxThreads explicit ceiling, or {@code -1} to keep the engine's own configured maximum
      */
     public record AsyncCompute(boolean managed, int maxThreads) {
@@ -314,7 +317,8 @@ public record ThreadManagementSettings(
     /**
      * Treatment of one specialised pool.
      *
-     * @param managed                whether UTMI may influence this pool's capacity
+     * @param managed                whether the pool is registered at L2 instead of L1; the owner still
+     *                               creates the threads, so this is a registration claim, not a merge
      * @param preserveSpecialization must stay {@code true}; these pools exist because their ordering,
      *                               affinity or lifecycle cannot be shared, and disabling this is
      *                               rejected rather than silently ignored
@@ -347,8 +351,11 @@ public record ThreadManagementSettings(
     /**
      * Metrics collection switches.
      *
-     * @param enabled   whether the manager samples pool and thread state at all; with collection off the
-     *                  other two flags have no effect and snapshots carry zeros
+     * @param enabled   whether the manager measures pool and thread state at all; with collection off
+     *                  the snapshot still lists the registered pools and the threads the registry
+     *                  accounts for, but no probe, CPU, rate or per thread list is read, the top level
+     *                  carries {@link DegradedReason#METRICS_UNAVAILABLE} and {@link ResourceMetrics#enabled()}
+     *                  stays {@code false}
      * @param perPool   whether per pool counters and saturation are published
      * @param perThread whether per thread snapshots are published; disabling it removes the individual
      *                  thread list from snapshots but keeps pool totals

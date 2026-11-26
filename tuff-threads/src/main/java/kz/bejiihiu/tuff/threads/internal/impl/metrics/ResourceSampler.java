@@ -7,6 +7,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
@@ -26,7 +27,6 @@ import kz.bejiihiu.tuff.threads.internal.spi.MonotonicClock;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolObservation;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadRegistry;
-import kz.bejiihiu.tuff.threads.internal.spi.TopologyView;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -40,7 +40,11 @@ import org.jspecify.annotations.Nullable;
  * <p>One pass is: one {@link ThreadRegistry#snapshot()} (a single walk over registered threads), one
  * {@code observe()} per attached probe, one CPU read per thread and a handful of JVM counters. Pool state
  * is never read from a pool lock, regions are never scanned, and no stack dump happens here - the
- * unaccounted thread report is a separate, throttled scan.
+ * unaccounted thread report is a separate, throttled scan that belongs to the registry's report class.
+ *
+ * <p>The budget numbers are not measured here: {@code usableCores} and the printable ledger line come
+ * from {@link ThreadResourceController}, the single owner of the plan, for both the sampled and the
+ * structural snapshot.
  *
  * <p>Concurrency: single flight. A caller that finds the pass already running does not wait, it reads the
  * previous snapshot; that keeps a command handler from ever queueing behind a slow probe. Snapshots,
@@ -75,11 +79,10 @@ public final class ResourceSampler {
     private final ThreadRegistry registry;
     private final PoolProbeSource probes;
     private final ThreadCounters counters;
-    private final TopologyView topology;
     private final MonotonicClock clock;
     private final MetricsEventSink sink;
     private final int reservedCores;
-    private final @Nullable ThreadResourceController leases;
+    private final ThreadResourceController budget;
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Map<PoolId, SaturationReport.Level> lastSaturation = new HashMap<>();
@@ -101,20 +104,24 @@ public final class ResourceSampler {
     private boolean closed;
 
     /**
-     * Creates a sampler without a lease source.
+     * Creates a sampler over the controller that owns the ledger.
      *
-     * <p>Saturation then reports what the pool probes see, but cannot say how long a lease has been
-     * waiting. Prefer the constructor that takes the controller when one exists.
+     * <p>Pool probes can say how deep a queue is, but not how long the oldest task has been waiting.
+     * The controller can: its waiters know when they parked. Reading it here keeps one number out of two
+     * sources - the sampler owns the pool view, the controller owns the lease wait - and turns the old
+     * "zero nanoseconds while the queue is not empty" into an honest value. The same controller is the
+     * only source of {@code usableCores} and of the printable ledger, so a snapshot can never describe a
+     * budget the ledger does not use.
      *
      * @param pools         registered pool descriptions
      * @param registry      live registered threads and per pool creation and termination totals
      * @param probes        attached pool probes, needed because the frozen probe SPI has no read side
      * @param counters      JVM thread and CPU counters
-     * @param topology      processor view used for the usable core count
      * @param clock         time source for windows and timestamps
      * @param sink          event sink; JFR in production, a recorder in tests
      * @param config        sampling policy
      * @param reservedCores cores kept out of the managed budget, reported but never sized here
+     * @param budget        controller that owns the ledger and the lease waits
      * @throws NullPointerException     if a reference is {@code null}
      * @throws IllegalArgumentException if the reserve is negative
      */
@@ -123,53 +130,16 @@ public final class ResourceSampler {
         final ThreadRegistry registry,
         final PoolProbeSource probes,
         final ThreadCounters counters,
-        final TopologyView topology,
-        final MonotonicClock clock,
-        final MetricsEventSink sink,
-        final MetricsConfig config,
-        final int reservedCores
-    ) {
-        this(pools, registry, probes, counters, topology, clock, sink, config, reservedCores, null);
-    }
-
-    /**
-     * Creates a sampler that reads lease waits from the controller.
-     *
-     * <p>Pool probes can say how deep a queue is, but not how long the oldest task has been waiting.
-     * The controller can: its waiters know when they parked. Reading it here keeps one number out of two
-     * sources - the sampler owns the pool view, the controller owns the lease wait - and turns the old
-     * "zero nanoseconds while the queue is not empty" into an honest value.
-     *
-     * @param pools         registered pool descriptions
-     * @param registry      live registered threads and per pool creation and termination totals
-     * @param probes        attached pool probes, needed because the frozen probe SPI has no read side
-     * @param counters      JVM thread and CPU counters
-     * @param topology      processor view used for the usable core count
-     * @param clock         time source for windows and timestamps
-     * @param sink          event sink; JFR in production, a recorder in tests
-     * @param config        sampling policy
-     * @param reservedCores cores kept out of the managed budget, reported but never sized here
-     * @param leases        controller that knows lease wait times, or {@code null} when none is wired
-     * @throws NullPointerException     if a required reference is {@code null}
-     * @throws IllegalArgumentException if the reserve is negative
-     */
-    public ResourceSampler(
-        final ExecutionPoolRegistry pools,
-        final ThreadRegistry registry,
-        final PoolProbeSource probes,
-        final ThreadCounters counters,
-        final TopologyView topology,
         final MonotonicClock clock,
         final MetricsEventSink sink,
         final MetricsConfig config,
         final int reservedCores,
-        final @Nullable ThreadResourceController leases
+        final ThreadResourceController budget
     ) {
         this.pools = Objects.requireNonNull(pools, "pools");
         this.registry = Objects.requireNonNull(registry, "registry");
         this.probes = Objects.requireNonNull(probes, "probes");
         this.counters = Objects.requireNonNull(counters, "counters");
-        this.topology = Objects.requireNonNull(topology, "topology");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.sink = Objects.requireNonNull(sink, "sink");
         this.config = Objects.requireNonNull(config, "config");
@@ -177,7 +147,7 @@ public final class ResourceSampler {
             throw new IllegalArgumentException("reservedCores must not be negative, got " + reservedCores);
         }
         this.reservedCores = reservedCores;
-        this.leases = leases;
+        this.budget = Objects.requireNonNull(budget, "budget");
     }
 
     /**
@@ -213,6 +183,11 @@ public final class ResourceSampler {
     /**
      * Returns the current snapshot, taking a new one when the interval has elapsed.
      *
+     * <p>With collection disabled the answer is a structural snapshot: the registered pools and the
+     * threads the registry accounts for, without probes, CPU or rates. That is what makes a disabled
+     * manager still report "7 pools registered" instead of a fake "0", while
+     * {@link DegradedReason#METRICS_UNAVAILABLE} and {@link #enabled()} say that nothing was measured.
+     *
      * @return the latest snapshot, never {@code null}
      */
     public ResourceSnapshot current() {
@@ -220,7 +195,7 @@ public final class ResourceSampler {
             return this.lastOrEmpty();
         }
         if (!this.enabled()) {
-            return this.emptySnapshot();
+            return this.structuralSnapshot();
         }
         if (this.latest == null) {
             return this.sampleNow();
@@ -241,7 +216,7 @@ public final class ResourceSampler {
             return this.lastOrEmpty();
         }
         if (!this.enabled()) {
-            return this.emptySnapshot();
+            return this.structuralSnapshot();
         }
         final ResourceSnapshot existing = this.latest;
         if (existing != null && this.clock.nanoTime() - this.lastSampleNanos < this.config.intervalNanos()) {
@@ -255,13 +230,17 @@ public final class ResourceSampler {
      *
      * <p>Used by commands that must show the present moment, and by tests. When another pass is running
      * this method does not wait: it returns the previous snapshot, because a metrics read must never block
-     * an operator's thread.
+     * an operator's thread. With collection disabled it returns the structural snapshot instead of
+     * measuring anything.
      *
      * @return the snapshot taken by this call, or the previous one when a pass was already running
      */
     public ResourceSnapshot sampleNow() {
         if (this.closed) {
             return this.lastOrEmpty();
+        }
+        if (!this.enabled()) {
+            return this.structuralSnapshot();
         }
         if (!this.lock.tryLock()) {
             return this.lastOrEmpty();
@@ -354,29 +333,82 @@ public final class ResourceSampler {
 
     private ResourceSnapshot lastOrEmpty() {
         final ResourceSnapshot existing = this.latest;
-        return existing == null ? this.emptySnapshot() : existing;
+        return existing == null ? this.structuralSnapshot() : existing;
     }
 
-    private ResourceSnapshot emptySnapshot() {
+    /**
+     * Builds a snapshot from registry bookkeeping only.
+     *
+     * <p>Used when collection is disabled and by a stopped sampler that never took a pass. It answers
+     * what the registry knows without measuring anything: which pools are registered, how many threads
+     * each accounts for and what states those threads are in. Queues, capacity, task counters and CPU
+     * stay {@code -1}, saturation stays {@link SaturationReport#unknown(PoolId)}, the thread list is not
+     * published, and the peak equals the current total because no history is kept while collection is
+     * off. {@link DegradedReason#METRICS_UNAVAILABLE} at the top level is the explicit "metrics disabled"
+     * status.
+     *
+     * @return a structural snapshot, never {@code null}
+     */
+    private ResourceSnapshot structuralSnapshot() {
+        final List<ThreadSnapshot> registered = this.registry.snapshot();
+        final Map<PoolId, List<ThreadSnapshot>> byPool = new HashMap<>();
+        for (final ThreadSnapshot thread : registered) {
+            byPool.computeIfAbsent(thread.pool(), id -> new ArrayList<>()).add(thread);
+        }
+        final List<PoolSnapshot> poolSnapshots = new ArrayList<>();
+        int total = 0;
+        int activeTotal = 0;
+        int idleTotal = 0;
+        for (final PoolSpec spec : this.pools.specs()) {
+            final List<ThreadSnapshot> threads = byPool.remove(spec.id());
+            final int alive = threads == null ? 0 : threads.size();
+            final int active = threads == null ? 0 : countSnapshotStates(threads, false);
+            final int idle = threads == null ? 0 : countSnapshotStates(threads, true);
+            poolSnapshots.add(new PoolSnapshot(
+                spec,
+                alive,
+                spec.minThreads(),
+                active,
+                idle,
+                -1L,
+                -1L,
+                -1L,
+                -1L,
+                -1L,
+                -1.0d,
+                SaturationReport.unknown(spec.id()),
+                List.of()
+            ));
+            total += alive;
+            activeTotal += active;
+            idleTotal += idle;
+        }
+        for (final List<ThreadSnapshot> leftovers : byPool.values()) {
+            total += leftovers.size();
+            activeTotal += countSnapshotStates(leftovers, false);
+            idleTotal += countSnapshotStates(leftovers, true);
+        }
+        poolSnapshots.sort((left, right) -> left.id().compareTo(right.id()));
         return new ResourceSnapshot(
             this.clock.instant(),
             this.usableCores(),
             this.reservedCores,
-            0,
-            0,
-            0,
-            0,
+            total,
+            activeTotal,
+            idleTotal,
+            total,
             0.0d,
             0.0d,
             -1.0d,
+            poolSnapshots,
             List.of(),
-            List.of(),
-            Set.of()
+            Set.of(DegradedReason.METRICS_UNAVAILABLE),
+            Optional.of(this.budget.budgetLedger())
         );
     }
 
     private int usableCores() {
-        return Math.max(1, this.topology.availableProcessors() - this.reservedCores);
+        return this.budget.usableCores();
     }
 
     /**
@@ -535,7 +567,8 @@ public final class ResourceSampler {
             this.counters.processCpuLoad(),
             poolSnapshots,
             publishedThreads,
-            degraded
+            degraded,
+            Optional.of(this.budget.budgetLedger())
         );
     }
 
@@ -635,6 +668,19 @@ public final class ResourceSampler {
         return count;
     }
 
+    private static int countSnapshotStates(final List<ThreadSnapshot> threads, final boolean idle) {
+        int count = 0;
+        for (final ThreadSnapshot thread : threads) {
+            final boolean matches = idle
+                ? thread.state() == Thread.State.WAITING || thread.state() == Thread.State.TIMED_WAITING
+                : thread.state() == Thread.State.RUNNABLE;
+            if (matches) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     private static double cpuLoad(
         final boolean supported,
         final boolean windowed,
@@ -694,20 +740,16 @@ public final class ResourceSampler {
     /**
      * Returns how long the oldest lease request has been waiting for a pool.
      *
-     * <p>The probe cannot answer this - it knows queue depth, not queue age - so the controller is asked
-     * when one is wired. Zero is a real answer ("nothing is waiting"), not a placeholder; when no
-     * controller is present the value stays zero because there is no source, and the operator sees the
-     * queue depth next to it rather than a made up age.
+     * <p>The probe cannot answer this - it knows queue depth, not queue age - so the controller is asked.
+     * Zero is a real answer ("nothing is waiting"), not a placeholder; a broken controller is treated as
+     * "nothing waits" rather than failing the whole pass.
      *
      * @param pool pool id
-     * @return nanoseconds the oldest request has been parked, zero when nothing waits or no source exists
+     * @return nanoseconds the oldest request has been parked, zero when nothing waits
      */
     private long leaseWaitNanos(final PoolId pool) {
-        if (this.leases == null) {
-            return 0L;
-        }
         try {
-            return this.leases.saturation(pool).longestWaitNanos();
+            return this.budget.saturation(pool).longestWaitNanos();
         } catch (RuntimeException _) {
             return 0L;
         }
@@ -751,10 +793,9 @@ public final class ResourceSampler {
 
     private List<ThreadSnapshot> scan() {
         final List<ThreadSnapshot> found = new ArrayList<>();
-        for (final Thread thread : this.liveThreads()) {
-            if (this.registry.poolOf(thread).isPresent() || OUTSIDE_ALLOW_LIST.test(thread)) {
-                continue;
-            }
+        // the walk and the allow list live in the registry's report class; the sampler only shapes
+        // the same threads into its snapshot record
+        for (final Thread thread : UnregisteredThreads.unaccounted(this.registry, OUTSIDE_ALLOW_LIST)) {
             found.add(new ThreadSnapshot(
                 thread.threadId(),
                 nameOf(thread),
@@ -772,24 +813,6 @@ public final class ResourceSampler {
         }
         found.sort((left, right) -> Long.compare(left.threadId(), right.threadId()));
         return List.copyOf(found);
-    }
-
-    private List<Thread> liveThreads() {
-        ThreadGroup root = Thread.currentThread().getThreadGroup();
-        while (root.getParent() != null) {
-            root = root.getParent();
-        }
-        Thread[] buffer = new Thread[root.activeCount() + 16];
-        int count = root.enumerate(buffer, true);
-        while (count == buffer.length) {
-            buffer = new Thread[buffer.length * 2];
-            count = root.enumerate(buffer, true);
-        }
-        final List<Thread> threads = new ArrayList<>(count);
-        for (int index = 0; index < count; index++) {
-            threads.add(buffer[index]);
-        }
-        return threads;
     }
 
     /**
@@ -812,3 +835,4 @@ public final class ResourceSampler {
     ) {
     }
 }
+

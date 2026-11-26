@@ -15,9 +15,10 @@ import kz.bejiihiu.tuff.threads.ThreadSnapshot;
  *
  * <p>Every accessor answers from the latest snapshot, so one call site sees one moment and two accessors
  * never disagree. The sampler does the work; this class only chooses what to publish. Two different
- * "nothing to show" cases stay apart: collection switched off publishes zeros and empty lists (the
- * contract says a zero is not a measurement), while a stopped manager publishes the last snapshot that
- * was taken, because {@code UnifiedThreadManager} promises the last known values after {@code STOPPED}.
+ * "nothing to show" cases stay apart: collection switched off publishes a structural snapshot (registered
+ * pools with unmeasured values, no probes, no rates) and keeps {@link #enabled()} {@code false}, while a
+ * stopped manager publishes the last snapshot that was taken, because {@code UnifiedThreadManager}
+ * promises the last known values after {@code STOPPED}.
  *
  * <p>Cost: the fast accessors are volatile field reads. {@link #snapshot()} is the only method that may
  * take a pass, and only when the interval elapsed; it never waits for another pass in flight.

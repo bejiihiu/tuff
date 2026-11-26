@@ -11,9 +11,11 @@ import java.util.Optional;
  * operator asks during an incident - how many threads exist, which pool owns them, what is saturated,
  * what was created and destroyed recently - without requiring a profiler or a thread dump.
  *
- * <p>When collection is disabled {@link #enabled()} is {@code false}, snapshots still exist but carry
- * zeros and stale gauges, and per thread lists are empty. Callers must check the flag before treating a
- * zero as a measurement.
+ * <p>When collection is disabled {@link #enabled()} is {@code false} and the snapshot carries no
+ * measurement: it still lists the registered pools and the threads the registry accounts for, with
+ * {@code -1} for everything that would have been measured, an empty per thread list and
+ * {@link DegradedReason#METRICS_UNAVAILABLE} at the top level. Callers must check the flag before
+ * treating any number as a measurement.
  *
  * <p>Threading: all methods are thread safe and non blocking. Snapshot construction is bounded and does
  * not take pool locks, so it may be called from a command handler; it still should not be called from a
@@ -43,7 +45,7 @@ public interface ResourceMetrics {
      * Looks up the latest observation of one pool.
      *
      * @param pool pool id
-     * @return the pool snapshot, or an empty optional if the pool is unknown or collection is disabled
+     * @return the pool snapshot, or an empty optional if the pool is not registered
      * @throws NullPointerException if {@code pool} is {@code null}
      */
     Optional<PoolSnapshot> pool(PoolId pool);

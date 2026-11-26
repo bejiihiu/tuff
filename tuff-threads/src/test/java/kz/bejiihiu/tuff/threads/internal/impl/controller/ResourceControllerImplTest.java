@@ -453,6 +453,22 @@ class ResourceControllerImplTest {
     }
 
     @Test
+    void ledgerIsPrintableThroughThePublicContract() {
+        final ResourceControllerImpl controller = this.controller(16, -1, List.of(this.compute(4, 4)));
+
+        final String ledger = controller.budgetLedger();
+
+        assertEquals(controller.plan().ledger(), ledger, "one ledger, one text");
+        assertTrue(ledger.contains("cores 16"), ledger);
+        assertTrue(ledger.contains("ceiling 12"), ledger);
+        assertTrue(ledger.contains("region 0"), ledger);
+        assertTrue(ledger.contains("chunk 0"), ledger);
+        assertTrue(ledger.contains("io 0"), ledger);
+        assertTrue(ledger.contains("reserve 1"), ledger);
+        assertTrue(ledger.contains("usable 11"), ledger);
+    }
+
+    @Test
     void concurrentAcquireReleaseKeepsTheLedgerBalanced() throws InterruptedException {
         final ResourceControllerImpl controller = this.controller(32, -1, List.of(this.compute(1, 2)));
         final int workers = 6;

@@ -17,9 +17,15 @@ import java.util.Set;
  * are not part of {@link #threads()} and not part of the totals, because the manager cannot attribute
  * them to a pool. A non empty unregistered list is a finding, not a metric.
  *
+ * <p>There is one "usable" number in the module and {@link #usableCores()} is it: the budget ledger's
+ * {@code usable}, which is {@code floor(processors * 0.8)} minus the deducted lanes and the effective
+ * reserve, floored at one. It is the same value as
+ * {@link ThreadResourceController#usableCores()}. The raw subtraction before the floor, which may be
+ * zero or negative, is visible in {@link #budgetLedger()}.
+ *
  * @param capturedAt               moment the snapshot was taken
- * @param usableCores              cores available to managed pools after the reserve, at least one
- * @param reservedCores            cores kept out of the managed budget, at least zero
+ * @param usableCores              cores left to managed pools by the budget ledger, at least one
+ * @param reservedCores            cores kept out of the managed budget, as configured, at least zero
  * @param totalThreads             live registered threads
  * @param activeThreads            registered threads that are runnable
  * @param idleThreads              registered threads waiting for work
@@ -32,6 +38,8 @@ import java.util.Set;
  * @param threads                  per thread snapshots, may be empty when per thread collection is
  *                                 disabled
  * @param degradedReasons          union of the reasons reported by all pools
+ * @param budgetLedger             the controller's one line budget ledger, or empty when the sampler has
+ *                                 no ledger to read
  */
 public record ResourceSnapshot(
     Instant capturedAt,
@@ -46,7 +54,8 @@ public record ResourceSnapshot(
     double processCpuLoad,
     List<PoolSnapshot> pools,
     List<ThreadSnapshot> threads,
-    Set<DegradedReason> degradedReasons
+    Set<DegradedReason> degradedReasons,
+    Optional<String> budgetLedger
 ) {
 
     /**
@@ -60,6 +69,7 @@ public record ResourceSnapshot(
         Objects.requireNonNull(pools, "pools");
         Objects.requireNonNull(threads, "threads");
         Objects.requireNonNull(degradedReasons, "degradedReasons");
+        Objects.requireNonNull(budgetLedger, "budgetLedger");
         if (usableCores < 1) {
             throw new IllegalArgumentException("usableCores must be at least 1, got " + usableCores);
         }
@@ -83,6 +93,59 @@ public record ResourceSnapshot(
         pools = List.copyOf(pools);
         threads = List.copyOf(threads);
         degradedReasons = Set.copyOf(degradedReasons);
+    }
+
+    /**
+     * Creates a snapshot without a budget ledger.
+     *
+     * <p>Kept for call sites that describe a moment by hand - tests, fixtures, older integrations.
+     * Production snapshots come from the sampler, which attaches the controller's ledger.
+     *
+     * @param capturedAt               moment the snapshot was taken
+     * @param usableCores              cores left to managed pools by the budget ledger, at least one
+     * @param reservedCores            cores kept out of the managed budget, as configured, at least zero
+     * @param totalThreads             live registered threads
+     * @param activeThreads            registered threads that are runnable
+     * @param idleThreads              registered threads waiting for work
+     * @param peakThreads              highest number of live registered threads since start
+     * @param creationRatePerSecond    threads created per second over the last sampling window
+     * @param terminationRatePerSecond threads terminated per second over the last sampling window
+     * @param processCpuLoad           process wide CPU share, or {@code -1} when unavailable
+     * @param pools                    per pool snapshots, in id order
+     * @param threads                  per thread snapshots
+     * @param degradedReasons          union of the reasons reported by all pools
+     */
+    public ResourceSnapshot(
+        final Instant capturedAt,
+        final int usableCores,
+        final int reservedCores,
+        final int totalThreads,
+        final int activeThreads,
+        final int idleThreads,
+        final int peakThreads,
+        final double creationRatePerSecond,
+        final double terminationRatePerSecond,
+        final double processCpuLoad,
+        final List<PoolSnapshot> pools,
+        final List<ThreadSnapshot> threads,
+        final Set<DegradedReason> degradedReasons
+    ) {
+        this(
+            capturedAt,
+            usableCores,
+            reservedCores,
+            totalThreads,
+            activeThreads,
+            idleThreads,
+            peakThreads,
+            creationRatePerSecond,
+            terminationRatePerSecond,
+            processCpuLoad,
+            pools,
+            threads,
+            degradedReasons,
+            Optional.empty()
+        );
     }
 
     /**

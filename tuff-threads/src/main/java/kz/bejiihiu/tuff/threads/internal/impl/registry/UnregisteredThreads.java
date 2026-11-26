@@ -3,7 +3,6 @@ package kz.bejiihiu.tuff.threads.internal.impl.registry;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Predicate;
@@ -13,16 +12,19 @@ import kz.bejiihiu.tuff.threads.internal.spi.ThreadRegistry;
 /**
  * Finds threads that live in the JVM but are not accounted by any pool.
  *
- * <p>This is a diagnostic, not a metric. It takes one JVM wide stack dump, so it belongs to a command,
- * to startup verification or to a periodic audit that runs rarely; the sampler must never call it.
+ * <p>This is a diagnostic, not a metric. The walk itself is cheap (one enumeration of the root thread
+ * group), but {@link #scan(Predicate)} also captures a stack per finding, so it belongs to a command, to
+ * startup verification or to a periodic audit that runs rarely; the sampler must never call it. The
+ * sampler uses {@link #unaccounted(ThreadRegistry, Predicate)}, which is the same walk and the same
+ * allow list without the stacks.
  *
- * <p>Java does not expose the stack a thread was created with. What this report can offer is the stack
+ * <p>Java does not expose the stack a thread was created with. What the report can offer is the stack
  * the thread has at scan time, which usually still names the factory or pool that spawned it. It is
  * kept as evidence, not as a guarantee.
  *
  * <p>Threads known to be outside the manager on purpose (JDK housekeeping, loggers, JFR, profilers,
- * terminal handling) are filtered by {@link #defaultIgnore()}. The final allow list belongs to the
- * static guard package; this default is only what the report uses when nobody passes one.
+ * terminal handling) are filtered by {@link #defaultIgnore()}. That is the module's only allow list; the
+ * sampler shares it instead of keeping its own copy.
  */
 public final class UnregisteredThreads {
 
@@ -102,35 +104,76 @@ public final class UnregisteredThreads {
     /**
      * Scans the JVM for threads that are neither registered nor ignored.
      *
-     * <p>One stack dump is taken for all live threads; stacks of registered threads are discarded.
-     * Every reported thread also goes to the event sink as {@code unregisteredThread}.
+     * <p>Uses {@link #unaccounted(ThreadRegistry, Predicate)} for the walk, then keeps the stack every
+     * reported thread has at scan time. Every reported thread also goes to the event sink as
+     * {@code unregisteredThread}.
      *
      * @param ignored predicate that returns {@code true} for threads to leave out
      * @return unregistered threads in thread id order
      * @throws NullPointerException if {@code ignored} is {@code null}
      */
     public List<Entry> scan(final Predicate<Thread> ignored) {
-        Objects.requireNonNull(ignored, "ignored");
-
-        final Map<Thread, StackTraceElement[]> stacks = Thread.getAllStackTraces();
         final List<Entry> found = new ArrayList<>();
-        for (final Map.Entry<Thread, StackTraceElement[]> candidate : stacks.entrySet()) {
-            final Thread thread = candidate.getKey();
-            if (this.registry.poolOf(thread).isPresent() || ignored.test(thread)) {
-                continue;
-            }
+        for (final Thread thread : unaccounted(this.registry, ignored)) {
             final ThreadGroup group = thread.getThreadGroup();
             found.add(new Entry(
                 thread.threadId(),
                 thread.getName(),
                 thread.isDaemon(),
                 group == null ? "unknown" : group.getName(),
-                List.of(candidate.getValue())
+                List.of(thread.getStackTrace())
             ));
             this.emit(thread);
         }
-        found.sort(Comparator.comparingLong(Entry::threadId));
         return List.copyOf(found);
+    }
+
+    /**
+     * Returns live threads that no pool accounts for, without taking any stack.
+     *
+     * <p>This is the one implementation of the walk and the filter: {@link #scan(Predicate)} layers the
+     * stack evidence on top of it, and the metrics sampler uses it directly so both reports can never
+     * disagree about which thread is unaccounted.
+     *
+     * @param registry registry used to decide whether a thread is accounted
+     * @param ignored  predicate that returns {@code true} for threads to leave out
+     * @return the threads, in thread id order
+     * @throws NullPointerException if a reference is {@code null}
+     */
+    public static List<Thread> unaccounted(final ThreadRegistry registry, final Predicate<Thread> ignored) {
+        Objects.requireNonNull(registry, "registry");
+        Objects.requireNonNull(ignored, "ignored");
+        final List<Thread> found = new ArrayList<>();
+        for (final Thread thread : liveThreads()) {
+            if (registry.poolOf(thread).isEmpty() && !ignored.test(thread)) {
+                found.add(thread);
+            }
+        }
+        found.sort(Comparator.comparingLong(Thread::threadId));
+        return List.copyOf(found);
+    }
+
+    /**
+     * Enumerates every live thread of the JVM.
+     *
+     * @return the threads, unordered
+     */
+    private static List<Thread> liveThreads() {
+        ThreadGroup root = Thread.currentThread().getThreadGroup();
+        while (root.getParent() != null) {
+            root = root.getParent();
+        }
+        Thread[] buffer = new Thread[root.activeCount() + 16];
+        int count = root.enumerate(buffer, true);
+        while (count == buffer.length) {
+            buffer = new Thread[buffer.length * 2];
+            count = root.enumerate(buffer, true);
+        }
+        final List<Thread> threads = new ArrayList<>(count);
+        for (int index = 0; index < count; index++) {
+            threads.add(buffer[index]);
+        }
+        return threads;
     }
 
     private void emit(final Thread thread) {

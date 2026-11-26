@@ -155,7 +155,8 @@ public final class ThreadManagerImpl implements UnifiedThreadManager {
             measured.processCpuLoad(),
             poolSnapshots,
             measured.threads(),
-            allReasons
+            allReasons,
+            measured.budgetLedger()
         );
     }
 

@@ -333,11 +333,20 @@ final class MetricsFixtures {
     }
 
     /**
-     * Controller that only answers saturation, for wiring the lease wait into the sampler.
+     * Controller that only answers the ledger and saturation, for wiring the sampler.
      */
     static final class FakeLeaseController implements ThreadResourceController {
 
         private final Map<PoolId, SaturationReport> reports = new HashMap<>();
+        private final int usable;
+
+        FakeLeaseController() {
+            this(1);
+        }
+
+        FakeLeaseController(final int usable) {
+            this.usable = usable;
+        }
 
         void report(final SaturationReport report) {
             this.reports.put(report.pool(), report);
@@ -345,7 +354,13 @@ final class MetricsFixtures {
 
         @Override
         public int usableCores() {
-            return 1;
+            return this.usable;
+        }
+
+        @Override
+        public String budgetLedger() {
+            return "cores " + this.usable + ": ceiling " + this.usable
+                + " = region 0 + chunk 0 + io 0 + reserve 0 + usable " + this.usable;
         }
 
         @Override

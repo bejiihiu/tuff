@@ -124,6 +124,11 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     }
 
     @Override
+    public String budgetLedger() {
+        return this.ledger.plan().ledger();
+    }
+
+    @Override
     public ResourceBudget totalBudget() {
         return ResourceBudget.defaults();
     }
