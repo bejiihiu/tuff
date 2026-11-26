@@ -16,6 +16,12 @@ import java.util.Objects;
  * snapshots. They never sum to {@link #aliveThreads()} in every case, because blocked threads are
  * neither active nor idle.
  *
+ * <p>The task counters follow the same rule as every other "unknown" in this module: {@code -1} means
+ * "this layer has no source for it", never a measured zero. {@code submittedTasks} and friends are
+ * filled only when the pool owner exposes them through a probe; the metrics layer does not own the
+ * queues, so until then they are {@code -1} and an operator must not read them as "nothing was
+ * rejected".
+ *
  * @param spec            registered description of the pool
  * @param aliveThreads    threads that currently exist, at least zero
  * @param coreThreads     threads the pool keeps alive regardless of load, at least zero
@@ -23,9 +29,9 @@ import java.util.Objects;
  * @param idleThreads     threads currently waiting for work, or {@code -1} when unknown
  * @param queuedTasks     tasks waiting in the pool queue, or {@code -1} when unknown
  * @param queueCapacity   maximum queue depth, or {@code -1} when unknown or unbounded
- * @param submittedTasks  tasks accepted since registration
- * @param completedTasks  tasks completed since registration
- * @param rejectedTasks   tasks refused since registration
+ * @param submittedTasks  tasks accepted since registration, or {@code -1} when this layer has no counter
+ * @param completedTasks  tasks completed since registration, or {@code -1} when this layer has no counter
+ * @param rejectedTasks   tasks refused since registration, or {@code -1} when this layer has no counter
  * @param cpuLoad         share of the usable cores consumed by this pool over the last sampling
  *                        window, from zero to one, or {@code -1} when unavailable
  * @param saturation      saturation summary
@@ -75,8 +81,8 @@ public record PoolSnapshot(
         if (queueCapacity < -1L) {
             throw new IllegalArgumentException("queueCapacity must be -1 or non negative, got " + queueCapacity);
         }
-        if (submittedTasks < 0L || completedTasks < 0L || rejectedTasks < 0L) {
-            throw new IllegalArgumentException("task counters must not be negative");
+        if (submittedTasks < -1L || completedTasks < -1L || rejectedTasks < -1L) {
+            throw new IllegalArgumentException("task counters must be -1 (unknown) or non negative");
         }
         if (cpuLoad != -1.0d && (!(cpuLoad >= 0.0d) || cpuLoad > 1.0d)) {
             throw new IllegalArgumentException("cpuLoad must be -1 or in [0, 1], got " + cpuLoad);

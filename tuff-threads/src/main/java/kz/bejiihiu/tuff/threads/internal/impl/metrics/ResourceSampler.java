@@ -9,6 +9,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Predicate;
 import kz.bejiihiu.tuff.threads.DegradedReason;
 import kz.bejiihiu.tuff.threads.ExecutionPoolRegistry;
 import kz.bejiihiu.tuff.threads.PoolId;
@@ -17,8 +18,10 @@ import kz.bejiihiu.tuff.threads.PoolSpec;
 import kz.bejiihiu.tuff.threads.ResourceBudget;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.SaturationReport;
+import kz.bejiihiu.tuff.threads.ThreadResourceController;
 import kz.bejiihiu.tuff.threads.ThreadSnapshot;
 import kz.bejiihiu.tuff.threads.internal.impl.events.MetricsEventSink;
+import kz.bejiihiu.tuff.threads.internal.impl.registry.UnregisteredThreads;
 import kz.bejiihiu.tuff.threads.internal.spi.MonotonicClock;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolObservation;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
@@ -53,32 +56,20 @@ public final class ResourceSampler {
      */
     public static final PoolId UNREGISTERED_POOL = PoolId.of("unregistered");
 
-    private static final List<String> IGNORED_PREFIXES = List.of(
-        "Reference Handler",
-        "Finalizer",
-        "Signal Dispatcher",
-        "Notification Thread",
-        "Common-Cleaner",
-        "DestroyJavaVM",
-        "Attach Listener",
-        "process reaper",
-        "log4j2",
-        "JFR",
-        "spark",
-        "JLine",
-        "jdk.",
-        "JUnit",
-        "Test worker",
-        "Gradle",
-        "ForkJoinPool.commonPool"
-    );
-
-    private static final Set<String> IGNORED_GROUPS = Set.of("system", "InnocuousThreadGroup");
-
     private static final double SATURATED_UTILISATION = 0.95d;
     private static final double SATURATED_PRESSURE = 0.90d;
     private static final double BUSY_UTILISATION = 0.75d;
     private static final double BUSY_PRESSURE = 0.50d;
+
+    /**
+     * One allow list for the whole module.
+     *
+     * <p>The sampler used to carry its own copy with slightly different entries, so a thread could be
+     * "expected outside the manager" in one report and a finding in the other. Sharing the predicate
+     * keeps the two answers identical; the enumeration stays separate because a sampling pass must not
+     * take a stack dump.
+     */
+    private static final Predicate<Thread> OUTSIDE_ALLOW_LIST = UnregisteredThreads.defaultIgnore();
 
     private final ExecutionPoolRegistry pools;
     private final ThreadRegistry registry;
@@ -88,6 +79,7 @@ public final class ResourceSampler {
     private final MonotonicClock clock;
     private final MetricsEventSink sink;
     private final int reservedCores;
+    private final @Nullable ThreadResourceController leases;
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Map<PoolId, SaturationReport.Level> lastSaturation = new HashMap<>();
@@ -109,7 +101,10 @@ public final class ResourceSampler {
     private boolean closed;
 
     /**
-     * Creates a sampler.
+     * Creates a sampler without a lease source.
+     *
+     * <p>Saturation then reports what the pool probes see, but cannot say how long a lease has been
+     * waiting. Prefer the constructor that takes the controller when one exists.
      *
      * @param pools         registered pool descriptions
      * @param registry      live registered threads and per pool creation and termination totals
@@ -134,6 +129,42 @@ public final class ResourceSampler {
         final MetricsConfig config,
         final int reservedCores
     ) {
+        this(pools, registry, probes, counters, topology, clock, sink, config, reservedCores, null);
+    }
+
+    /**
+     * Creates a sampler that reads lease waits from the controller.
+     *
+     * <p>Pool probes can say how deep a queue is, but not how long the oldest task has been waiting.
+     * The controller can: its waiters know when they parked. Reading it here keeps one number out of two
+     * sources - the sampler owns the pool view, the controller owns the lease wait - and turns the old
+     * "zero nanoseconds while the queue is not empty" into an honest value.
+     *
+     * @param pools         registered pool descriptions
+     * @param registry      live registered threads and per pool creation and termination totals
+     * @param probes        attached pool probes, needed because the frozen probe SPI has no read side
+     * @param counters      JVM thread and CPU counters
+     * @param topology      processor view used for the usable core count
+     * @param clock         time source for windows and timestamps
+     * @param sink          event sink; JFR in production, a recorder in tests
+     * @param config        sampling policy
+     * @param reservedCores cores kept out of the managed budget, reported but never sized here
+     * @param leases        controller that knows lease wait times, or {@code null} when none is wired
+     * @throws NullPointerException     if a required reference is {@code null}
+     * @throws IllegalArgumentException if the reserve is negative
+     */
+    public ResourceSampler(
+        final ExecutionPoolRegistry pools,
+        final ThreadRegistry registry,
+        final PoolProbeSource probes,
+        final ThreadCounters counters,
+        final TopologyView topology,
+        final MonotonicClock clock,
+        final MetricsEventSink sink,
+        final MetricsConfig config,
+        final int reservedCores,
+        final @Nullable ThreadResourceController leases
+    ) {
         this.pools = Objects.requireNonNull(pools, "pools");
         this.registry = Objects.requireNonNull(registry, "registry");
         this.probes = Objects.requireNonNull(probes, "probes");
@@ -146,6 +177,7 @@ public final class ResourceSampler {
             throw new IllegalArgumentException("reservedCores must not be negative, got " + reservedCores);
         }
         this.reservedCores = reservedCores;
+        this.leases = leases;
     }
 
     /**
@@ -184,6 +216,9 @@ public final class ResourceSampler {
      * @return the latest snapshot, never {@code null}
      */
     public ResourceSnapshot current() {
+        if (this.closed) {
+            return this.lastOrEmpty();
+        }
         if (!this.enabled()) {
             return this.emptySnapshot();
         }
@@ -202,6 +237,9 @@ public final class ResourceSampler {
      * @return the latest snapshot, never {@code null}
      */
     public ResourceSnapshot sampleIfDue() {
+        if (this.closed) {
+            return this.lastOrEmpty();
+        }
         if (!this.enabled()) {
             return this.emptySnapshot();
         }
@@ -223,7 +261,7 @@ public final class ResourceSampler {
      */
     public ResourceSnapshot sampleNow() {
         if (this.closed) {
-            return this.emptySnapshot();
+            return this.lastOrEmpty();
         }
         if (!this.lock.tryLock()) {
             return this.lastOrEmpty();
@@ -246,6 +284,9 @@ public final class ResourceSampler {
      * @return an immutable list in thread id order, possibly empty
      */
     public List<ThreadSnapshot> unregisteredThreads() {
+        if (this.closed) {
+            return this.unregistered;
+        }
         if (!this.enabled()) {
             return List.of();
         }
@@ -265,6 +306,9 @@ public final class ResourceSampler {
      * @return an immutable list in thread id order, possibly empty
      */
     public List<ThreadSnapshot> scanUnregistered() {
+        if (this.closed) {
+            return this.unregistered;
+        }
         if (!this.enabled()) {
             return List.of();
         }
@@ -284,11 +328,13 @@ public final class ResourceSampler {
     }
 
     /**
-     * Drops every measured value and stops sampling.
+     * Stops sampling and keeps the last known values.
      *
      * <p>Idempotent. Called from the shutdown path before the pools are torn down: sampling in the window
      * between "the manager is stopping" and "everything is stopped" is what turns a slow read into a
-     * watchdog kill.
+     * watchdog kill. Reads after this point return the last snapshot that was actually taken, never a
+     * zeroed one - the manager contract says a stopped manager keeps answering with the last known
+     * values, and a fake zero is the one answer an incident responder cannot tell apart from health.
      */
     public void close() {
         this.closed = true;
@@ -296,8 +342,6 @@ public final class ResourceSampler {
             return;
         }
         try {
-            this.latest = null;
-            this.unregistered = List.of();
             this.cpuBaseline = Map.of();
             this.lastSaturation.clear();
             this.lastBudget.clear();
@@ -415,7 +459,9 @@ public final class ResourceSampler {
             final long capacity = observation == null ? -1L : observation.queueCapacity();
             final double cpuLoad = cpuLoad(cpuSupported, windowed, observed.isEmpty(), cpuReadings, cpuDelta,
                 elapsed, usable);
-            final SaturationReport saturation = saturation(id, alive, active, queued, capacity);
+            final SaturationReport saturation = saturation(
+                id, alive, active, queued, capacity, this.leaseWaitNanos(id)
+            );
             final List<DegradedReason> reasons = cpuSupported ? List.of() : List.of(DegradedReason.METRICS_UNAVAILABLE);
 
             final PoolSnapshot poolSnapshot = new PoolSnapshot(
@@ -426,16 +472,17 @@ public final class ResourceSampler {
                 idle,
                 queued,
                 capacity,
-                0L,
-                0L,
-                0L,
+                -1L,
+                -1L,
+                -1L,
                 cpuLoad,
                 saturation,
                 reasons
             );
+            // degradation is a state, not a publication detail: it has to survive per-pool being off
+            degraded.addAll(reasons);
             if (policy.perPool()) {
                 poolSnapshots.add(poolSnapshot);
-                degraded.addAll(reasons);
                 this.emit(poolSnapshot);
                 this.emitSaturation(saturation);
                 this.emitBudget(spec);
@@ -616,7 +663,8 @@ public final class ResourceSampler {
         final int alive,
         final int active,
         final long queued,
-        final long capacity
+        final long capacity,
+        final long longestWaitNanos
     ) {
         if (active < 0 && queued < 0) {
             return SaturationReport.unknown(pool);
@@ -633,7 +681,36 @@ public final class ResourceSampler {
         } else {
             level = SaturationReport.Level.NORMAL;
         }
-        return new SaturationReport(pool, utilisation, pressure, Math.max(0L, queued), 0L, level);
+        return new SaturationReport(
+            pool,
+            utilisation,
+            pressure,
+            Math.max(0L, queued),
+            Math.max(0L, longestWaitNanos),
+            level
+        );
+    }
+
+    /**
+     * Returns how long the oldest lease request has been waiting for a pool.
+     *
+     * <p>The probe cannot answer this - it knows queue depth, not queue age - so the controller is asked
+     * when one is wired. Zero is a real answer ("nothing is waiting"), not a placeholder; when no
+     * controller is present the value stays zero because there is no source, and the operator sees the
+     * queue depth next to it rather than a made up age.
+     *
+     * @param pool pool id
+     * @return nanoseconds the oldest request has been parked, zero when nothing waits or no source exists
+     */
+    private long leaseWaitNanos(final PoolId pool) {
+        if (this.leases == null) {
+            return 0L;
+        }
+        try {
+            return this.leases.saturation(pool).longestWaitNanos();
+        } catch (RuntimeException _) {
+            return 0L;
+        }
     }
 
     private static double clampShare(final double value) {
@@ -675,7 +752,7 @@ public final class ResourceSampler {
     private List<ThreadSnapshot> scan() {
         final List<ThreadSnapshot> found = new ArrayList<>();
         for (final Thread thread : this.liveThreads()) {
-            if (this.registry.poolOf(thread).isPresent() || ignored(thread)) {
+            if (this.registry.poolOf(thread).isPresent() || OUTSIDE_ALLOW_LIST.test(thread)) {
                 continue;
             }
             found.add(new ThreadSnapshot(
@@ -713,23 +790,6 @@ public final class ResourceSampler {
             threads.add(buffer[index]);
         }
         return threads;
-    }
-
-    private static boolean ignored(final Thread thread) {
-        final ThreadGroup group = thread.getThreadGroup();
-        if (group != null && group.getName() != null && IGNORED_GROUPS.contains(group.getName())) {
-            return true;
-        }
-        if (thread == Thread.currentThread()) {
-            return true;
-        }
-        final String name = thread.getName();
-        for (final String prefix : IGNORED_PREFIXES) {
-            if (name.startsWith(prefix) || name.contains(prefix)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /**

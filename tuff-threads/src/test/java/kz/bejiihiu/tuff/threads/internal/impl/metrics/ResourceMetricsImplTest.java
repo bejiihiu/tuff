@@ -15,7 +15,10 @@ import kz.bejiihiu.tuff.threads.PoolSpec;
 import kz.bejiihiu.tuff.threads.ResourceBudget;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.SaturationReport;
+import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import kz.bejiihiu.tuff.threads.ThreadSnapshot;
+import kz.bejiihiu.tuff.threads.internal.impl.budget.BudgetDeductions;
+import kz.bejiihiu.tuff.threads.internal.impl.controller.ResourceControllerImpl;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import org.junit.jupiter.api.Test;
 
@@ -300,7 +303,7 @@ class ResourceMetricsImplTest {
     }
 
     @Test
-    void closedSamplerStopsSampling() {
+    void closedSamplerKeepsTheLastKnownValues() {
         final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
         this.registry.put(COMPUTE, thread(7L, "compute-1", COMPUTE, Thread.State.RUNNABLE));
         final ResourceSampler sampler = this.sampler(pools, PoolProbeSource.empty());
@@ -308,8 +311,89 @@ class ResourceMetricsImplTest {
         sampler.close();
 
         assertFalse(sampler.enabled());
-        assertEquals(0, sampler.current().totalThreads());
-        assertEquals(0, new ResourceMetricsImpl(sampler).totalThreads());
+        assertEquals(1, sampler.current().totalThreads(), "a stopped manager keeps the last measured values");
+        assertEquals(1, new ResourceMetricsImpl(sampler).totalThreads());
+        assertEquals(1, new ResourceMetricsImpl(sampler).snapshot().totalThreads());
+    }
+
+    @Test
+    void degradedReasonsSurviveWithoutPerPoolPublication() {
+        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
+        this.counters.unsupported();
+        final MetricsConfig countsOnly = new MetricsConfig(true, false, false, Duration.ofSeconds(1),
+            Duration.ofSeconds(30));
+        final ResourceSnapshot snapshot = this.metrics(pools, countsOnly).snapshot();
+
+        assertTrue(snapshot.pools().isEmpty(), "per pool publication is off");
+        assertEquals(Set.of(DegradedReason.METRICS_UNAVAILABLE), snapshot.degradedReasons());
+        assertTrue(snapshot.degraded());
+    }
+
+    @Test
+    void taskCountersAreUnknownNotZero() {
+        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
+        final PoolSnapshot pool = this.metrics(pools, MetricsConfig.defaults()).snapshot().pool(COMPUTE).orElseThrow();
+
+        assertEquals(-1L, pool.submittedTasks(), "no probe counter means unknown, not a healthy zero");
+        assertEquals(-1L, pool.completedTasks());
+        assertEquals(-1L, pool.rejectedTasks());
+    }
+
+    @Test
+    void ledgerAndMetricsAgreeAfterASpecReplacement() {
+        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
+        final ResourceControllerImpl controller = new ResourceControllerImpl(
+            new MetricsFixtures.FakeTopology(16),
+            pools,
+            this.registry,
+            new ThreadManagementSettings.Resources(true, 1, -1),
+            BudgetDeductions.none(),
+            this.clock,
+            this.sink
+        );
+        final ResourceMetricsImpl metrics = this.metrics(pools, MetricsConfig.defaults());
+
+        final PoolSpec replaced = new PoolSpec(
+            COMPUTE, PoolKind.COMPUTE, "compute", "test pool", 1, -1, CoverageLevel.L3,
+            ResourceBudget.fixed(5, 1)
+        );
+        pools.register(replaced);
+        this.clock.advance(Duration.ofSeconds(1));
+
+        final PoolSpec inSnapshot = metrics.snapshot().pool(COMPUTE).orElseThrow().spec();
+        assertEquals(replaced, inSnapshot, "the metrics layer must publish the spec it was just replaced with");
+        assertEquals(5, controller.budget(COMPUTE).orElseThrow().cores(), "the ledger must follow the same spec");
+        assertEquals(5, controller.plan().pool(COMPUTE).orElseThrow().capacity());
+    }
+
+    @Test
+    void leaseWaitReachesTheSaturationReport() {
+        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
+        final PoolProbe probe = new MetricsFixtures.FakeProbe(
+            COMPUTE,
+            new MetricsFixtures.FakeObservation(1, 1, 1, 0, 2L, 10L, List.of())
+        );
+        final MetricsFixtures.FakeLeaseController controller = new MetricsFixtures.FakeLeaseController();
+        controller.report(new SaturationReport(
+            COMPUTE, 1.0d, 0.2d, 2L, 500_000_000L, SaturationReport.Level.BUSY
+        ));
+        final ResourceSampler sampler = new ResourceSampler(
+            pools,
+            this.registry,
+            () -> List.of(probe),
+            this.counters,
+            new MetricsFixtures.FakeTopology(2),
+            this.clock,
+            this.sink,
+            MetricsConfig.defaults(),
+            0,
+            controller
+        );
+
+        final PoolSnapshot pool = sampler.sampleNow().pool(COMPUTE).orElseThrow();
+
+        assertEquals(500_000_000L, pool.saturation().longestWaitNanos(),
+            "a non empty queue must not report zero wait when the controller knows better");
     }
 
     @Test

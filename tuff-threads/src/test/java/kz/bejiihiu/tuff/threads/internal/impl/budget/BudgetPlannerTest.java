@@ -92,7 +92,7 @@ class BudgetPlannerTest {
     }
 
     @Test
-    void fixedBudgetIsClampedToTheCeiling() {
+    void fixedRegionBudgetIsClampedToTheRegionThreads() {
         final PoolSpec region = new PoolSpec(
             PoolId.REGION_EXECUTION,
             PoolKind.REGION_EXECUTION,
@@ -104,13 +104,92 @@ class BudgetPlannerTest {
             ResourceBudget.fixed(64, 1)
         );
 
-        final PoolBudget budget = plan(4, BudgetDeductions.none(), List.of(region))
+        final PoolBudget budget = plan(4, new BudgetDeductions(3, 0, 0), List.of(region))
             .pool(PoolId.REGION_EXECUTION)
             .orElseThrow();
 
         assertEquals(3, budget.maxCores());
         assertEquals(3, budget.capacity());
         assertTrue(budget.satisfied());
+    }
+
+    @Test
+    void regionPermitsComeFromTheRegionThreadCountNotTheCeiling() {
+        final PoolSpec region = new PoolSpec(
+            PoolId.REGION_EXECUTION,
+            PoolKind.REGION_EXECUTION,
+            "folia",
+            "ticks",
+            1,
+            -1,
+            CoverageLevel.L3,
+            ResourceBudget.defaults()
+        );
+
+        final BudgetPlan plan = plan(16, new BudgetDeductions(2, 4, 1), List.of(region));
+        final PoolBudget budget = plan.pool(PoolId.REGION_EXECUTION).orElseThrow();
+
+        assertEquals(12, plan.ceilingCores());
+        assertEquals(2, budget.maxCores(), "an elastic region pool must not claim the whole ceiling");
+        assertEquals(2, budget.capacity());
+    }
+
+    @Test
+    void chunkAndIoPermitsComeFromTheirDeductions() {
+        final PoolSpec chunk = new PoolSpec(
+            PoolId.CHUNK_WORKER, PoolKind.CHUNK, "moonrise", "chunks", 1, -1, CoverageLevel.L3,
+            ResourceBudget.defaults()
+        );
+        final PoolSpec io = new PoolSpec(
+            PoolId.CHUNK_IO, PoolKind.IO, "moonrise", "chunk io", 1, -1, CoverageLevel.L3,
+            ResourceBudget.defaults()
+        );
+
+        final BudgetPlan plan = plan(16, new BudgetDeductions(2, 4, 1), List.of(chunk, io));
+
+        assertEquals(4, plan.pool(PoolId.CHUNK_WORKER).orElseThrow().capacity());
+        assertEquals(1, plan.pool(PoolId.CHUNK_IO).orElseThrow().capacity());
+    }
+
+    @Test
+    void elasticPoolsShareTheUsableRemainderInsteadOfEachTakingAllOfIt() {
+        final PoolSpec alpha = new PoolSpec(
+            PoolId.of("alpha"), PoolKind.COMPUTE, "test", "alpha", 1, -1, CoverageLevel.L3,
+            ResourceBudget.defaults()
+        );
+        final PoolSpec beta = new PoolSpec(
+            PoolId.of("beta"), PoolKind.SERVICE, "test", "beta", 1, -1, CoverageLevel.L3,
+            ResourceBudget.defaults()
+        );
+
+        final BudgetPlan plan = plan(16, foliaDefaults(16), List.of(alpha, beta));
+        final int alphaCores = plan.pool(PoolId.of("alpha")).orElseThrow().capacity();
+        final int betaCores = plan.pool(PoolId.of("beta")).orElseThrow().capacity();
+
+        assertEquals(4, plan.usableCores());
+        assertEquals(4, alphaCores + betaCores, "the caps together must not exceed the usable remainder");
+        assertTrue(alphaCores < 4 && betaCores < 4, "neither pool may take the whole remainder: " + alphaCores);
+    }
+
+    @Test
+    void overSubscribedSharedCapsAreDegradedWithNumbers() {
+        final PoolSpec alpha = new PoolSpec(
+            PoolId.of("alpha"), PoolKind.COMPUTE, "test", "alpha", 1, -1, CoverageLevel.L3,
+            ResourceBudget.defaults()
+        );
+        final PoolSpec beta = new PoolSpec(
+            PoolId.of("beta"), PoolKind.SERVICE, "test", "beta", 1, -1, CoverageLevel.L3,
+            ResourceBudget.defaults()
+        );
+
+        final BudgetPlan plan = plan(16, foliaDefaults(16), List.of(alpha, beta));
+
+        assertTrue(
+            plan.degradedReasons().stream()
+                .anyMatch(reason -> reason.contains("shared pool caps reach 8")
+                    && reason.contains("only 4 are usable")),
+            () -> "expected an overcommit reason with numbers, got " + plan.degradedReasons()
+        );
     }
 
     @Test

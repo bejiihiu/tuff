@@ -1,5 +1,6 @@
 package kz.bejiihiu.tuff.threads.internal.impl.registry;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -204,5 +205,96 @@ class ThreadRegistryImplTest {
         assertEquals(0L, this.registry.createdTotal(unknown));
         assertEquals(0L, this.registry.terminatedTotal(unknown));
         assertTrue(this.registry.poolOf(new Thread(() -> { })).isEmpty());
+    }
+
+    @Test
+    void neverStartedThreadsAreReapedAfterTheGrace() throws InterruptedException {
+        final ThreadRegistryImpl shortLived =
+            new ThreadRegistryImpl(this.sink, Duration.ofMillis(50), Duration.ZERO);
+        for (int index = 0; index < 5; index++) {
+            shortLived.register(new Thread(() -> { }, "never-started-" + index), POOL);
+        }
+        assertEquals(5, shortLived.trackedThreads());
+
+        Thread.sleep(100L);
+        shortLived.reap();
+
+        assertEquals(0, shortLived.trackedThreads(), "created and never started must not leak forever");
+        assertTrue(shortLived.snapshot().isEmpty());
+        assertEquals(0, shortLived.aliveThreads(POOL));
+        assertEquals(5L, shortLived.terminatedTotal(POOL), "a reaped thread is still counted as gone");
+    }
+
+    @Test
+    void reapRunsWithoutAnyReader() throws InterruptedException {
+        final ThreadRegistryImpl shortLived =
+            new ThreadRegistryImpl(this.sink, Duration.ofMillis(10), Duration.ZERO);
+        for (int index = 0; index < 4; index++) {
+            shortLived.register(new Thread(() -> { }, "abandoned-" + index), POOL);
+        }
+        Thread.sleep(50L);
+
+        // nothing reads snapshots here - only writes. that is the metrics-disabled case.
+        final Thread tickler = new Thread(() -> { }, "tickler");
+        shortLived.register(tickler, POOL);
+        shortLived.unregister(tickler);
+
+        assertEquals(0, shortLived.trackedThreads(), "the write hook must reap without a reader");
+    }
+
+    @Test
+    void registerAfterStopNeverResurrects() throws InterruptedException {
+        final int workers = 4;
+        final int perWorker = 200;
+        final CountDownLatch gate = new CountDownLatch(1);
+        final AtomicInteger registered = new AtomicInteger();
+        final AtomicInteger resurrected = new AtomicInteger();
+        final AtomicInteger wrongFailure = new AtomicInteger();
+        final List<Thread> creators = new ArrayList<>();
+        for (int index = 0; index < workers; index++) {
+            final Thread creator = Thread.ofPlatform().daemon().name("registrar-" + index).unstarted(() -> {
+                try {
+                    gate.await();
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                for (int iteration = 0; iteration < perWorker; iteration++) {
+                    final Thread candidate = new Thread(() -> { }, "late-" + iteration);
+                    if (this.registry.isStopped()) {
+                        try {
+                            this.registry.register(candidate, POOL);
+                            resurrected.incrementAndGet();
+                        } catch (IllegalStateException _) {
+                            // expected
+                        }
+                        continue;
+                    }
+                    try {
+                        this.registry.register(candidate, POOL);
+                        registered.incrementAndGet();
+                    } catch (IllegalStateException _) {
+                        // the stop won the race; that is legal, as long as nothing lands afterwards
+                    } catch (RuntimeException _) {
+                        wrongFailure.incrementAndGet();
+                    }
+                }
+            });
+            creators.add(creator);
+            creator.start();
+        }
+
+        gate.countDown();
+        Thread.sleep(5L);
+        this.registry.markStopped();
+        for (final Thread creator : creators) {
+            creator.join(5_000);
+        }
+
+        assertEquals(0, wrongFailure.get());
+        assertEquals(0, resurrected.get(), "a register that saw the stop flag must never land");
+        assertEquals(registered.get(), this.registry.trackedThreads(),
+            "the ledger must hold exactly the registrations that succeeded");
+        assertThrows(IllegalStateException.class, () -> this.registry.register(new Thread(() -> { }), POOL));
     }
 }

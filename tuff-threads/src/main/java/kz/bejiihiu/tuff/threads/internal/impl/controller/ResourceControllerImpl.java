@@ -27,25 +27,35 @@ import kz.bejiihiu.tuff.threads.internal.impl.budget.BudgetPlanner;
 import kz.bejiihiu.tuff.threads.internal.impl.budget.PoolBudget;
 import kz.bejiihiu.tuff.threads.internal.spi.MonotonicClock;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadEventSink;
+import kz.bejiihiu.tuff.threads.internal.spi.ThreadRegistry;
 import kz.bejiihiu.tuff.threads.internal.spi.TopologyView;
+import org.jspecify.annotations.Nullable;
 
 /**
- * Default resource controller: one permit ledger, one budget plan, one lock.
+ * Default resource controller: one permit ledger, one lock, live against the pool registry.
  *
- * <p>The budget is computed exactly once, in the constructor, from the pools that are registered at that
- * moment. That is not laziness: a live server cannot change its processor count, and a second ledger
- * computed later from a different topology would silently disagree with the leases already handed out.
- * A pool registered after the plan exists has no budget and no leases, which surfaces the mistake
- * instead of hiding it.
+ * <p>The ledger is not frozen at construction. A pool registered after the controller, or a spec
+ * replaced under the same id - which is the documented way coverage moves from L1 to L3 and a budget
+ * changes - is picked up the next time the controller is asked about that pool. The refresh re-reads
+ * every spec, rebuilds the budget plan and keeps the existing ledger entries and their held permits, so
+ * the plan, {@link #budget(PoolId)}, {@link #saturation(PoolId)} and the metrics layer never describe
+ * two different worlds. The refresh is O(pools) and only happens when a spec the controller already
+ * knows about differs from the registry; the steady state cost is one map read plus one spec comparison.
  *
- * <p>All shared state - in use counters, waiters, the global admission counter - lives under one lock.
- * The lock is only held while deciding and while parking a waiter; the event sink is called outside it.
- * A parked request holds no permit: the permit is taken at grant time, not at request time, so a lease
- * never waits while holding another lease. That is a structural guarantee for a flat request, and the
- * one thing it cannot see is a caller that nests leases - acquire, then block again while still holding
- * the first. Nesting is a caller error and documented as such rather than guessed at, because a lease
- * may legally be released by a different thread than the one that acquired it and ownership tracking
- * would produce false rejections instead of safety.
+ * <p>All shared state - in use counters, waiters, the per thread permit count, the global admission
+ * counter - lives under one lock. The lock is only held while deciding and while parking a waiter; the
+ * event sink is called outside it. A parked request holds no permit: the permit is taken at grant time,
+ * not at request time.
+ *
+ * <p>Nested leases: acquiring immediately while holding a permit is fine, waiting while holding one is
+ * not. A thread that already holds a permit and asks for a <em>blocking</em> lease is rejected with a
+ * clear message, because that is the caller-side hold-and-wait that can deadlock two workers as easily
+ * as one. The count is kept per requesting thread and is decremented by whoever releases the lease, so
+ * a lease released on another thread does not leave a phantom holder behind.
+ *
+ * <p>Region threads are recognised through the thread registry first; the name check is only a fallback
+ * for threads nobody registered yet. A retorted tick thread is still a tick thread, and a plugin thread
+ * that merely borrowed Folia's name is not.
  *
  * <p>Admission has two layers. Per pool permits protect a pool's own capacity, so a compute burst can
  * never take the region pool's slots. The optional global cap
@@ -55,62 +65,62 @@ import kz.bejiihiu.tuff.threads.internal.spi.TopologyView;
  */
 public final class ResourceControllerImpl implements ThreadResourceController {
 
-    private final MonotonicClock clock;
+    private final TopologyView topology;
     private final ExecutionPoolRegistry registry;
+    private final ThreadManagementSettings.Resources resources;
+    private final BudgetDeductions deductions;
     private final RegionThreadDetector regionThreads;
     private final ThreadEventSink events;
-    private final BudgetPlan plan;
+    private final MonotonicClock clock;
     private final int globalLimit;
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition permitFreed = this.lock.newCondition();
-    private final Map<PoolId, PoolState> pools;
     private final List<Waiter> waiters = new ArrayList<>();
+    private final Map<Thread, Integer> heldPermits = new HashMap<>();
     private final AtomicLong uids = new AtomicLong();
+    private volatile Ledger ledger;
     private long sequence;
     private int globalInUse;
     private volatile boolean closed;
 
     /**
-     * Builds the controller and its single budget plan.
+     * Builds the controller and its first budget ledger.
      *
-     * @param topology      processor topology to size against
-     * @param registry      pool registry, read once to build the ledger
-     * @param resources     resource settings, providing the reserve and the global cap
-     * @param deductions    threads already claimed outside the managed budget
-     * @param clock         monotonic clock for grant and wait timestamps
-     * @param regionThreads detector for region tick threads
-     * @param events        event sink for lease timeouts
+     * @param topology   processor topology to size against
+     * @param registry   pool registry, re-read whenever a spec changes
+     * @param threads    thread registry, used to recognise region tick threads
+     * @param resources  resource settings, providing the reserve and the global cap
+     * @param deductions threads already claimed outside the managed budget
+     * @param clock      monotonic clock for grant and wait timestamps
+     * @param events     event sink for lease timeouts
      * @throws NullPointerException if a reference is {@code null}
      */
     public ResourceControllerImpl(
         final TopologyView topology,
         final ExecutionPoolRegistry registry,
+        final ThreadRegistry threads,
         final ThreadManagementSettings.Resources resources,
         final BudgetDeductions deductions,
         final MonotonicClock clock,
-        final RegionThreadDetector regionThreads,
         final ThreadEventSink events
     ) {
+        this.topology = Objects.requireNonNull(topology, "topology");
         this.registry = Objects.requireNonNull(registry, "registry");
+        this.resources = Objects.requireNonNull(resources, "resources");
+        this.deductions = Objects.requireNonNull(deductions, "deductions");
         this.clock = Objects.requireNonNull(clock, "clock");
-        this.regionThreads = Objects.requireNonNull(regionThreads, "regionThreads");
         this.events = Objects.requireNonNull(events, "events");
-        this.globalLimit = Objects.requireNonNull(resources, "resources").maxConcurrentTasks();
-        final List<PoolSpec> specs = registry.specs();
-        this.plan = new BudgetPlanner(topology, resources, deductions).plan(specs);
-        final Map<PoolId, PoolState> states = new HashMap<>();
-        for (final PoolSpec spec : specs) {
-            final Optional<PoolBudget> planned = this.plan.pool(spec.id());
-            if (planned.isPresent()) {
-                states.put(spec.id(), new PoolState(planned.get(), spec));
-            }
-        }
-        this.pools = Map.copyOf(states);
+        this.globalLimit = resources.maxConcurrentTasks();
+        this.regionThreads = RegionThreadDetector.registered(
+            Objects.requireNonNull(threads, "threads"),
+            RegionThreadDetector.byThreadName()
+        );
+        this.ledger = this.buildLedger(Map.of());
     }
 
     @Override
     public int usableCores() {
-        return this.plan.usableCores();
+        return this.ledger.plan().usableCores();
     }
 
     @Override
@@ -121,43 +131,40 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     @Override
     public Optional<ResourceBudget> budget(final PoolId pool) {
         Objects.requireNonNull(pool, "pool");
-        if (!this.registry.contains(pool)) {
+        final @Nullable PoolState state = this.state(pool);
+        if (state == null) {
             return Optional.empty();
         }
-        final Optional<PoolBudget> planned = this.plan.pool(pool);
-        if (planned.isEmpty()) {
-            return Optional.empty();
-        }
-        final int cores = planned.get().capacity();
-        return Optional.of(ResourceBudget.fixed(cores, Math.min(planned.get().reservedCores(), cores)));
+        return Optional.of(ResourceBudget.fixed(state.capacity, Math.min(state.reservedCores, state.capacity)));
     }
 
     @Override
     public Lease acquire(final LeaseRequest request) {
         Objects.requireNonNull(request, "request");
         final PoolId poolId = request.pool();
-        final PoolState state = this.pools.get(poolId);
         if (this.closed) {
             throw new IllegalStateException(
                 "the thread manager is not running; pool '" + poolId + "' cannot lease capacity"
             );
         }
-        if (state == null || !this.registry.contains(poolId)) {
-            throw new IllegalStateException("pool '" + poolId + "' is not registered with this controller");
+        final @Nullable PoolState state = this.state(poolId);
+        if (state == null) {
+            throw new IllegalStateException("pool '" + poolId + "' is not registered with the thread manager");
         }
         if (!state.managed) {
             throw new IllegalStateException(
                 "pool '" + poolId + "' is registered below capacity coverage; raise it to L3 before leasing from it"
             );
         }
-        if (!request.immediate() && this.regionThreads.isRegionThread(Thread.currentThread())) {
+        final Thread caller = Thread.currentThread();
+        if (!request.immediate() && this.regionThreads.isRegionThread(caller)) {
             throw new IllegalStateException(
                 "a region execution thread cannot wait for a lease from pool '" + poolId
                     + "': it is the resource the wait would block on; send a non blocking request instead"
             );
         }
         final long startedAt = this.clock.nanoTime();
-        final Optional<LeaseImpl> granted = this.attempt(state, request);
+        final Optional<LeaseImpl> granted = this.attempt(state, request, caller);
         if (granted.isPresent()) {
             return granted.get();
         }
@@ -180,8 +187,8 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     @Override
     public SaturationReport saturation(final PoolId pool) {
         Objects.requireNonNull(pool, "pool");
-        final PoolState state = this.pools.get(pool);
-        if (state == null || !this.registry.contains(pool)) {
+        final @Nullable PoolState state = this.state(pool);
+        if (state == null) {
             return SaturationReport.unknown(pool);
         }
         final long now = this.clock.nanoTime();
@@ -221,14 +228,16 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     }
 
     /**
-     * Returns the single budget plan of this controller.
+     * Returns the budget plan currently backing the ledger.
      *
-     * <p>Read only. It exists so the runtime and commands can print the ledger without recomputing it.
+     * <p>Read only. It is replaced, never mutated, when the registry changes, so a caller either sees the
+     * old plan or the new one, never a half rebuilt ledger. It exists so the runtime and commands can
+     * print the numbers the controller is actually using.
      *
-     * @return the plan
+     * @return the current plan
      */
     public BudgetPlan plan() {
-        return this.plan;
+        return this.ledger.plan();
     }
 
     /**
@@ -240,7 +249,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     public int inUse(final PoolId pool) {
         this.lock.lock();
         try {
-            final PoolState state = this.pools.get(pool);
+            final @Nullable PoolState state = this.ledger.states().get(pool);
             return state == null ? 0 : state.inUse;
         } finally {
             this.lock.unlock();
@@ -256,7 +265,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     public int waiting(final PoolId pool) {
         this.lock.lock();
         try {
-            final PoolState state = this.pools.get(pool);
+            final @Nullable PoolState state = this.ledger.states().get(pool);
             if (state == null) {
                 return 0;
             }
@@ -304,21 +313,25 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     /**
      * Returns a permit to its pool and hands it to the best waiter, if any.
      *
-     * <p>Called by {@link LeaseImpl}; package private so the lease stays the only public handle.
+     * <p>Called by {@link LeaseImpl}; package private so the lease stays the only public handle. The
+     * holder is the thread that requested the lease, not the one releasing it, so the nested acquire
+     * bookkeeping stays correct when release happens on another thread.
      *
      * @param pool   pool the permit belongs to
      * @param global whether the permit also held shared background admission
+     * @param holder thread that asked for the lease
      */
-    void releasePermit(final PoolId pool, final boolean global) {
+    void releasePermit(final PoolId pool, final boolean global, final Thread holder) {
         this.lock.lock();
         try {
-            final PoolState state = this.pools.get(pool);
+            final @Nullable PoolState state = this.ledger.states().get(pool);
             if (state != null && state.inUse > 0) {
                 state.inUse--;
             }
             if (global && this.globalInUse > 0) {
                 this.globalInUse--;
             }
+            this.heldPermits.computeIfPresent(holder, (ignored, count) -> count <= 1 ? null : count - 1);
             this.grantWaitersLocked();
         } finally {
             this.lock.unlock();
@@ -326,14 +339,94 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     }
 
     /**
+     * Resolves a pool state against the registry, refreshing the ledger when the spec changed.
+     *
+     * <p>The fast path is one volatile read, one map read and one spec comparison. A pool that appeared
+     * after construction, or whose spec was replaced under the same id, takes the slow path once and is
+     * then served from the rebuilt ledger like any other pool.
+     *
+     * @param pool pool id
+     * @return the current state, or {@code null} when the pool is not registered
+     */
+    private @Nullable PoolState state(final PoolId pool) {
+        final Ledger current = this.ledger;
+        final @Nullable PoolState state = current.states().get(pool);
+        final Optional<PoolSpec> spec = this.registry.spec(pool);
+        if (sameSpec(state, spec)) {
+            return state;
+        }
+        this.lock.lock();
+        try {
+            final Ledger locked = this.ledger;
+            final @Nullable PoolState lockedState = locked.states().get(pool);
+            final Optional<PoolSpec> lockedSpec = this.registry.spec(pool);
+            if (sameSpec(lockedState, lockedSpec)) {
+                // somebody else rebuilt the ledger while this thread waited for the lock
+                return lockedState;
+            }
+            this.ledger = this.buildLedger(locked.states());
+            return this.ledger.states().get(pool);
+        } finally {
+            this.lock.unlock();
+        }
+    }
+
+    /**
+     * Checks whether a ledger entry already matches the registry.
+     *
+     * @param state ledger entry, may be {@code null}
+     * @param spec  current registry spec
+     * @return {@code true} when the entry can be used as is
+     */
+    private static boolean sameSpec(final @Nullable PoolState state, final Optional<PoolSpec> spec) {
+        return spec.map(current -> state != null && state.spec.equals(current)).orElse(state == null);
+    }
+
+    /**
+     * Rebuilds the plan and reuses the ledger entries that are still registered.
+     *
+     * <p>Entry identity is preserved on purpose: a parked waiter points at its {@link PoolState}, and
+     * replacing the object would make the waiter invisible to saturation and unreleasable. Only the
+     * numbers derived from the spec change, and only while the controller lock is held.
+     *
+     * @param previous entries of the ledger being replaced
+     * @return the new ledger
+     */
+    private Ledger buildLedger(final Map<PoolId, PoolState> previous) {
+        final List<PoolSpec> specs = this.registry.specs();
+        final BudgetPlan plan = new BudgetPlanner(this.topology, this.resources, this.deductions).plan(specs);
+        final Map<PoolId, PoolState> states = new HashMap<>(Math.max(16, specs.size() * 2));
+        for (final PoolSpec spec : specs) {
+            final Optional<PoolBudget> budget = plan.pool(spec.id());
+            if (budget.isEmpty()) {
+                continue;
+            }
+            final @Nullable PoolState existing = previous.get(spec.id());
+            if (existing == null) {
+                states.put(spec.id(), new PoolState(budget.get(), spec));
+            } else {
+                existing.rebase(budget.get(), spec);
+                states.put(spec.id(), existing);
+            }
+        }
+        return new Ledger(plan, Map.copyOf(states));
+    }
+
+    /**
      * Tries to grant a permit, parking the caller when it asked for a wait.
      *
      * @param state   pool state
      * @param request lease request
+     * @param caller  requesting thread
      * @return the granted lease, or empty on timeout
-     * @throws IllegalStateException if admission was closed while the request was in flight
+     * @throws IllegalStateException if admission was closed while the request was in flight, or the
+     *                               caller already holds a permit and asked for a blocking acquire
      */
-    private Optional<LeaseImpl> attempt(final PoolState state, final LeaseRequest request) {
+    private Optional<LeaseImpl> attempt(
+        final PoolState state,
+        final LeaseRequest request,
+        final Thread caller
+    ) {
         final long now = this.clock.nanoTime();
         final Duration budget = waitBudget(request, untilDeadlineNanos(request, now));
         final long budgetNanos = nanos(budget);
@@ -344,15 +437,21 @@ public final class ResourceControllerImpl implements ThreadResourceController {
                     "the thread manager stopped while pool '" + state.id + "' was requesting a lease"
                 );
             }
-            final LeaseImpl immediate = this.tryGrantLocked(state, request, now);
+            final @Nullable LeaseImpl immediate = this.tryGrantLocked(state, request, now, caller);
             if (immediate != null) {
                 return Optional.of(immediate);
             }
             if (budgetNanos <= 0L) {
                 return Optional.empty();
             }
+            if (this.heldPermits.getOrDefault(caller, 0) > 0) {
+                throw new IllegalStateException(
+                    "thread '" + caller.getName() + "' already holds a lease and cannot wait for pool '"
+                        + state.id + "': release the held lease first, or send a non blocking request"
+                );
+            }
             final Waiter waiter = new Waiter(
-                state, request, this.sequence++, now, saturatingAdd(now, budgetNanos)
+                state, request, caller, this.sequence++, now, saturatingAdd(now, budgetNanos)
             );
             this.waiters.add(waiter);
             long remaining = budgetNanos;
@@ -389,7 +488,8 @@ public final class ResourceControllerImpl implements ThreadResourceController {
      * Hands free permits to waiters, highest weight first and FIFO inside a weight.
      *
      * <p>Called under the lock, from release and from admission changes. Never grants after
-     * {@link #close()}: a waiter woken by shutdown must fail, not receive a permit it cannot use.
+     * {@link #close()}: a waiter woken by shutdown must fail, not receive a permit it cannot use. A
+     * waiter whose pool was unregistered while it parked is skipped and left to its timeout.
      */
     private void grantWaitersLocked() {
         if (this.closed || this.waiters.isEmpty()) {
@@ -402,7 +502,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
             if (best == null) {
                 break;
             }
-            final LeaseImpl lease = this.tryGrantLocked(best.state, best.request, now);
+            final @Nullable LeaseImpl lease = this.tryGrantLocked(best.state, best.request, now, best.caller);
             if (lease == null) {
                 break;
             }
@@ -420,10 +520,13 @@ public final class ResourceControllerImpl implements ThreadResourceController {
      * @param now current monotonic time
      * @return the best waiter, or {@code null} when none can be served
      */
-    private Waiter selectWaiterLocked(final long now) {
+    private @Nullable Waiter selectWaiterLocked(final long now) {
         Waiter best = null;
         for (final Waiter waiter : this.waiters) {
-            if (waiter.lease != null || now >= waiter.waitDeadlineNanos || !this.canGrantLocked(waiter.state)) {
+            if (waiter.lease != null
+                || now >= waiter.waitDeadlineNanos
+                || this.ledger.states().get(waiter.state.id) != waiter.state
+                || !this.canGrantLocked(waiter.state)) {
                 continue;
             }
             if (best == null
@@ -454,9 +557,15 @@ public final class ResourceControllerImpl implements ThreadResourceController {
      * @param state   pool state
      * @param request lease request
      * @param now     grant moment
+     * @param caller  thread that asked for the permit
      * @return the lease, or {@code null} when no permit could be taken
      */
-    private LeaseImpl tryGrantLocked(final PoolState state, final LeaseRequest request, final long now) {
+    private @Nullable LeaseImpl tryGrantLocked(
+        final PoolState state,
+        final LeaseRequest request,
+        final long now,
+        final Thread caller
+    ) {
         if (!this.canGrantLocked(state)) {
             return null;
         }
@@ -465,7 +574,8 @@ public final class ResourceControllerImpl implements ThreadResourceController {
         if (global) {
             this.globalInUse++;
         }
-        return new LeaseImpl(this, this.uids.incrementAndGet(), state.id, now, request.deadlineNanos(), global);
+        this.heldPermits.merge(caller, 1, Integer::sum);
+        return new LeaseImpl(this, this.uids.incrementAndGet(), state.id, now, request.deadlineNanos(), global, caller);
     }
 
     /**
@@ -555,26 +665,48 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     }
 
     /**
+     * One immutable view of the ledger: the plan and the entries it was built from.
+     *
+     * <p>The entries themselves are mutable because permits are counted in them, but the map that holds
+     * them is replaced as a whole, so a reader either sees the old ledger or the new one.
+     *
+     * @param plan   budget plan backing this ledger
+     * @param states per pool entries, immutable map of mutable counters
+     */
+    private record Ledger(BudgetPlan plan, Map<PoolId, PoolState> states) {
+    }
+
+    /**
      * Mutable per pool ledger entry.
      *
-     * <p>All fields except {@link #inUse} are fixed at construction; {@code inUse} is only touched under
-     * the controller lock.
+     * <p>{@link #inUse} is only touched under the controller lock. Everything else is derived from the
+     * current spec and is rewritten on a refresh, again under the same lock.
      */
     private static final class PoolState {
 
         private final PoolId id;
-        private final int capacity;
-        private final int weight;
-        private final boolean critical;
-        private final boolean managed;
+        private volatile PoolSpec spec;
+        private volatile int capacity;
+        private volatile int reservedCores;
+        private int weight;
+        private boolean critical;
+        private volatile boolean managed;
         private int inUse;
 
         private PoolState(final PoolBudget budget, final PoolSpec spec) {
             this.id = budget.pool();
+            this.rebase(budget, spec);
+        }
+
+        private void rebase(final PoolBudget budget, final PoolSpec spec) {
+            // spec is published last: a reader that sees the new spec through the volatile field also
+            // sees the capacity and coverage that belong to it, so a mixed view is impossible
             this.capacity = budget.capacity();
+            this.reservedCores = budget.reservedCores();
             this.weight = weightOf(budget.kind());
             this.critical = budget.critical();
             this.managed = spec.managesCapacity();
+            this.spec = spec;
         }
     }
 
@@ -584,12 +716,14 @@ public final class ResourceControllerImpl implements ThreadResourceController {
      * <p>{@link #lease} is {@code null} until a releasing thread hands one over; both the field and the
      * waiters list are guarded by the controller lock. The grant-before-wake handoff is what makes
      * "released permit goes to a specific waiter" atomic, so no permit is ever lost in a race between a
-     * release and a timeout.
+     * release and a timeout. {@link #caller} is the thread the permit is accounted to for nested acquire
+     * detection.
      */
     private static final class Waiter {
 
         private final PoolState state;
         private final LeaseRequest request;
+        private final Thread caller;
         private final long sequence;
         private final long sinceNanos;
         private final long waitDeadlineNanos;
@@ -598,12 +732,14 @@ public final class ResourceControllerImpl implements ThreadResourceController {
         private Waiter(
             final PoolState state,
             final LeaseRequest request,
+            final Thread caller,
             final long sequence,
             final long sinceNanos,
             final long waitDeadlineNanos
         ) {
             this.state = state;
             this.request = request;
+            this.caller = caller;
             this.sequence = sequence;
             this.sinceNanos = sinceNanos;
             this.waitDeadlineNanos = waitDeadlineNanos;

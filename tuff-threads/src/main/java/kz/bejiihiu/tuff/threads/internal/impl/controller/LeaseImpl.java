@@ -12,6 +12,10 @@ import kz.bejiihiu.tuff.threads.PoolId;
  * no-op. That also means a double release can never hand the same permit out twice, which is the leak
  * this handle exists to make impossible.
  *
+ * <p>The requesting thread is kept on the lease so the controller can tell "this thread already holds a
+ * permit and is about to block again" apart from "this thread is doing its first blocking acquire".
+ * Release may legally happen on another thread; the bookkeeping still decrements the original holder.
+ *
  * <p>Package private: the only way to obtain one is {@link ResourceControllerImpl#acquire}.
  */
 final class LeaseImpl implements Lease {
@@ -22,6 +26,7 @@ final class LeaseImpl implements Lease {
     private final long grantedNanos;
     private final long deadlineNanos;
     private final boolean global;
+    private final Thread holder;
     private final AtomicBoolean released = new AtomicBoolean();
 
     /**
@@ -33,6 +38,7 @@ final class LeaseImpl implements Lease {
      * @param grantedNanos  grant moment on the manager clock
      * @param deadlineNanos deadline copied from the request
      * @param global        whether the permit also consumed shared background admission
+     * @param holder        thread that asked for the permit
      */
     LeaseImpl(
         final ResourceControllerImpl owner,
@@ -40,7 +46,8 @@ final class LeaseImpl implements Lease {
         final PoolId pool,
         final long grantedNanos,
         final long deadlineNanos,
-        final boolean global
+        final boolean global,
+        final Thread holder
     ) {
         this.owner = owner;
         this.uid = uid;
@@ -48,6 +55,7 @@ final class LeaseImpl implements Lease {
         this.grantedNanos = grantedNanos;
         this.deadlineNanos = deadlineNanos;
         this.global = global;
+        this.holder = holder;
     }
 
     /**
@@ -87,7 +95,7 @@ final class LeaseImpl implements Lease {
     @Override
     public void release() {
         if (this.released.compareAndSet(false, true)) {
-            this.owner.releasePermit(this.pool, this.global);
+            this.owner.releasePermit(this.pool, this.global, this.holder);
         }
     }
 }

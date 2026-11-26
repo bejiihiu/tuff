@@ -40,7 +40,10 @@ public final class UnregisteredThreads {
         "spark",
         "JLine",
         "jdk.",
-        "JUnit"
+        "JUnit",
+        "Test worker",
+        "Gradle",
+        "ForkJoinPool.commonPool"
     );
 
     private static final Set<String> IGNORED_GROUPS = Set.of(

@@ -12,6 +12,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import kz.bejiihiu.tuff.threads.ExecutionPoolRegistry;
+import kz.bejiihiu.tuff.threads.Lease;
 import kz.bejiihiu.tuff.threads.LeaseRequest;
 import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.PoolKind;
@@ -19,6 +20,7 @@ import kz.bejiihiu.tuff.threads.PoolSnapshot;
 import kz.bejiihiu.tuff.threads.PoolSpec;
 import kz.bejiihiu.tuff.threads.ResourceBudget;
 import kz.bejiihiu.tuff.threads.SaturationReport;
+import kz.bejiihiu.tuff.threads.ThreadResourceController;
 import kz.bejiihiu.tuff.threads.ThreadSnapshot;
 import kz.bejiihiu.tuff.threads.internal.impl.events.MetricsEventSink;
 import kz.bejiihiu.tuff.threads.internal.spi.MonotonicClock;
@@ -331,10 +333,51 @@ final class MetricsFixtures {
     }
 
     /**
+     * Controller that only answers saturation, for wiring the lease wait into the sampler.
+     */
+    static final class FakeLeaseController implements ThreadResourceController {
+
+        private final Map<PoolId, SaturationReport> reports = new HashMap<>();
+
+        void report(final SaturationReport report) {
+            this.reports.put(report.pool(), report);
+        }
+
+        @Override
+        public int usableCores() {
+            return 1;
+        }
+
+        @Override
+        public ResourceBudget totalBudget() {
+            return ResourceBudget.defaults();
+        }
+
+        @Override
+        public Optional<ResourceBudget> budget(final PoolId pool) {
+            return Optional.empty();
+        }
+
+        @Override
+        public Lease acquire(final LeaseRequest request) {
+            throw new UnsupportedOperationException("read only fixture");
+        }
+
+        @Override
+        public void release(final Lease lease) {
+            throw new UnsupportedOperationException("read only fixture");
+        }
+
+        @Override
+        public SaturationReport saturation(final PoolId pool) {
+            return this.reports.getOrDefault(pool, SaturationReport.unknown(pool));
+        }
+    }
+
+    /**
      * Probe with fixed counters and an optional thread list.
      */
     static final class FakeProbe implements PoolProbe {
-
         private final PoolId pool;
         private final PoolObservation observation;
 

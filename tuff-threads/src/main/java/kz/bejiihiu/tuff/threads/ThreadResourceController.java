@@ -77,8 +77,9 @@ public interface ThreadResourceController {
      * @throws NullPointerException  if {@code request} is {@code null}
      * @throws LeaseTimeoutException if the capacity was not granted within the request's wait
      * @throws IllegalStateException if the manager is not running, the pool is unknown, the pool is not
-     *                               managed, or the caller is a region execution thread asking for a
-     *                               blocking wait
+     *                               managed, the caller is a region execution thread asking for a
+     *                               blocking wait, or the caller already holds a lease and asks for
+     *                               another blocking acquire
      */
     Lease acquire(LeaseRequest request);
 

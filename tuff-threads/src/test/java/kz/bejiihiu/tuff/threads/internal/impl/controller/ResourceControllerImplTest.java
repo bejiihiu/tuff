@@ -20,6 +20,8 @@ import kz.bejiihiu.tuff.threads.SaturationReport;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import kz.bejiihiu.tuff.threads.internal.impl.budget.BudgetDeductions;
 import kz.bejiihiu.tuff.threads.internal.impl.budget.FakeTopology;
+import kz.bejiihiu.tuff.threads.internal.impl.registry.ThreadRegistryImpl;
+import kz.bejiihiu.tuff.threads.internal.spi.ThreadRegistry;
 import kz.bejiihiu.tuff.threads.internal.testing.FakePoolRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -44,11 +46,13 @@ class ResourceControllerImplTest {
 
     private FakeClock clock;
     private CountingSink sink;
+    private ThreadRegistry threads;
 
     @BeforeEach
     void setUp() {
         this.clock = new FakeClock();
         this.sink = new CountingSink();
+        this.threads = new ThreadRegistryImpl(this.sink);
     }
 
     @Test
@@ -133,9 +137,10 @@ class ResourceControllerImplTest {
 
     @Test
     void regionThreadCannotWaitForALease() {
-        final ResourceControllerImpl controller = this.controller(
-            16, -1, List.of(this.compute(2, 2)), thread -> true
-        );
+        final ThreadRegistryImpl regionThreads = new ThreadRegistryImpl(this.sink);
+        regionThreads.register(Thread.currentThread(), PoolId.REGION_EXECUTION);
+        this.threads = regionThreads;
+        final ResourceControllerImpl controller = this.controller(16, -1, List.of(this.compute(2, 2)));
 
         final LeaseRequest blocking = new LeaseRequest(COMPUTE, this.deadline(), Duration.ofMillis(50));
 
@@ -143,6 +148,108 @@ class ResourceControllerImplTest {
         try (Lease _ = controller.acquire(LeaseRequest.immediate(COMPUTE, this.deadline()))) {
             assertEquals(1, controller.inUse(COMPUTE));
         }
+        assertEquals(0, controller.inUse(COMPUTE));
+    }
+
+    @Test
+    void aRegisteredNonRegionThreadWithAFoliaLikeNameMayBlock() throws Exception {
+        final ResourceControllerImpl controller = this.controller(16, -1, List.of(this.compute(1, 2)));
+
+        final AtomicReference<Lease> granted = new AtomicReference<>();
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        final Thread caller = Thread.ofPlatform()
+            .name("Folia Region Scheduler Thread #7")
+            .daemon()
+            .unstarted(() -> {
+                try {
+                    granted.set(controller.acquire(
+                        new LeaseRequest(COMPUTE, this.deadline(), Duration.ofMillis(50))
+                    ));
+                } catch (final Throwable throwable) {
+                    failure.set(throwable);
+                }
+            });
+        this.threads.register(caller, COMPUTE);
+        caller.start();
+        caller.join(2_000);
+
+        assertNull(failure.get(), () -> "a registered compute thread was mistaken for a tick thread: " + failure.get());
+        assertNotNull(granted.get());
+        granted.get().release();
+    }
+
+    @Test
+    void poolRegisteredAfterTheControllerCanLease() {
+        final FakePoolRegistry registry = new FakePoolRegistry();
+        final ResourceControllerImpl controller = new ResourceControllerImpl(
+            new FakeTopology(16),
+            registry,
+            this.threads,
+            new ThreadManagementSettings.Resources(true, 1, -1),
+            BudgetDeductions.none(),
+            this.clock,
+            this.sink
+        );
+
+        assertTrue(controller.budget(COMPUTE).isEmpty(), "nothing is registered yet");
+        registry.register(this.compute(2, 2));
+
+        try (Lease _ = controller.acquire(LeaseRequest.immediate(COMPUTE, this.deadline()))) {
+            assertEquals(1, controller.inUse(COMPUTE));
+        }
+        assertEquals(2, controller.budget(COMPUTE).orElseThrow().cores());
+        assertEquals(2, controller.plan().pool(COMPUTE).orElseThrow().capacity());
+    }
+
+    @Test
+    void replacingTheSpecByIdUpdatesTheLedger() {
+        final FakePoolRegistry registry = new FakePoolRegistry();
+        registry.register(PoolSpec.observeOnly(COMPUTE, PoolKind.COMPUTE, "async-compute", "background tasks"));
+        final ResourceControllerImpl controller = new ResourceControllerImpl(
+            new FakeTopology(16),
+            registry,
+            this.threads,
+            new ThreadManagementSettings.Resources(true, 1, -1),
+            BudgetDeductions.none(),
+            this.clock,
+            this.sink
+        );
+
+        assertThrows(
+            IllegalStateException.class,
+            () -> controller.acquire(LeaseRequest.immediate(COMPUTE, this.deadline())),
+            "L1 observe-only cannot lease"
+        );
+
+        // the documented L1 -> L3 path: same id, same kind, new coverage and budget
+        registry.register(this.compute(2, 4));
+
+        final Lease lease = controller.acquire(LeaseRequest.immediate(COMPUTE, this.deadline()));
+        assertEquals(1, controller.inUse(COMPUTE));
+        assertEquals(4, controller.budget(COMPUTE).orElseThrow().cores(), "the ledger must follow the new spec");
+        assertEquals(4, controller.plan().pool(COMPUTE).orElseThrow().capacity());
+        lease.release();
+        assertEquals(0, controller.inUse(COMPUTE));
+    }
+
+    @Test
+    void aThreadHoldingAPermitCannotWaitForAnother() {
+        final ResourceControllerImpl controller = this.controller(16, -1, List.of(this.compute(1, 1)));
+
+        final Lease first = controller.acquire(LeaseRequest.immediate(COMPUTE, this.deadline()));
+        final IllegalStateException rejected = assertThrows(
+            IllegalStateException.class,
+            () -> controller.acquire(new LeaseRequest(COMPUTE, this.deadline(), Duration.ofSeconds(1)))
+        );
+        assertTrue(rejected.getMessage().contains("already holds a lease"), rejected.getMessage());
+        assertEquals(1, controller.inUse(COMPUTE));
+
+        // a non blocking request is still allowed while holding a permit; it just fails fast here
+        assertThrows(
+            LeaseTimeoutException.class,
+            () -> controller.acquire(LeaseRequest.immediate(COMPUTE, this.deadline()))
+        );
+        first.release();
         assertEquals(0, controller.inUse(COMPUTE));
     }
 
@@ -286,10 +393,10 @@ class ResourceControllerImplTest {
         final ResourceControllerImpl controller = new ResourceControllerImpl(
             new FakeTopology(16),
             registry,
+            this.threads,
             new ThreadManagementSettings.Resources(true, 1, -1),
             BudgetDeductions.none(),
             this.clock,
-            RegionThreadDetector.none(),
             this.sink
         );
 
@@ -327,10 +434,10 @@ class ResourceControllerImplTest {
         final ResourceControllerImpl controller = new ResourceControllerImpl(
             topology,
             registry,
+            this.threads,
             new ThreadManagementSettings.Resources(true, 1, -1),
             BudgetDeductions.none(),
             this.clock,
-            RegionThreadDetector.none(),
             this.sink
         );
 
@@ -407,23 +514,14 @@ class ResourceControllerImplTest {
         final int maxConcurrentTasks,
         final List<PoolSpec> specs
     ) {
-        return this.controller(processors, maxConcurrentTasks, specs, RegionThreadDetector.none());
-    }
-
-    private ResourceControllerImpl controller(
-        final int processors,
-        final int maxConcurrentTasks,
-        final List<PoolSpec> specs,
-        final RegionThreadDetector detector
-    ) {
         final ExecutionPoolRegistry registry = this.registry(specs);
         return new ResourceControllerImpl(
             new FakeTopology(processors),
             registry,
+            this.threads,
             new ThreadManagementSettings.Resources(true, 1, maxConcurrentTasks),
             BudgetDeductions.none(),
             this.clock,
-            detector,
             this.sink
         );
     }

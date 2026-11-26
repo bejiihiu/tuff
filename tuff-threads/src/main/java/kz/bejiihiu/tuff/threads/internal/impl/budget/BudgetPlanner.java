@@ -25,14 +25,20 @@ import kz.bejiihiu.tuff.threads.internal.spi.TopologyView;
  * usable  = ceiling - regionThreads - chunkThreads - ioThreads - max(1, configuredReserve)
  * }</pre>
  *
- * <p>Pools whose threads were already subtracted resolve their declared budget against the ceiling, so
- * a fixed budget keeps its value and an elastic one can never claim more than the machine has. Pools
- * that share what is left resolve against {@code usable}. Reserves are the guaranteed part of a budget
- * and are the only thing that can be oversubscribed: elastic shares are caps, and a hundred pools with
- * share {@code 1.0} is normal, not a conflict.
+ * <p>Lanes whose threads were already subtracted resolve their budget against their own thread count,
+ * not against the ceiling: the region pool cannot hand out more leases than there are tick threads
+ * running, and the same holds for chunk workers and chunk IO. Only network resolves against the ceiling,
+ * because netty threads are not part of {@link BudgetDeductions} yet; that is a known gap, not a policy.
  *
- * <p>{@link #plan(List)} may be called once. A second call is rejected instead of returning a slightly
- * different ledger, because two live ledgers are worse than a stale one.
+ * <p>Pools that share what is left (compute, service, virtual) resolve against {@code usable}. Their
+ * declared caps can add up to more than {@code usable} - a hundred elastic pools with share {@code 1.0}
+ * is normal configuration - so the sum is capped proportionally and the plan says so. Reserves are the
+ * guaranteed part of a budget and the only thing that may be oversubscribed; that is reported too.
+ *
+ * <p>{@link #plan(List)} may be called once per planner. A second call is rejected instead of returning
+ * a slightly different ledger, because two live ledgers are worse than a stale one. The controller
+ * builds a fresh planner when the registry changed, so "once" is a property of one ledger, not of the
+ * manager.
  */
 public final class BudgetPlanner {
 
@@ -86,7 +92,7 @@ public final class BudgetPlanner {
         final BudgetPlan built = this.build(specs);
         if (!this.computed.compareAndSet(null, built)) {
             throw new IllegalStateException(
-                "the budget plan is computed once per manager; a second ledger would be a second source of truth"
+                "the budget plan is computed once per ledger; build another planner to rebuild it"
             );
         }
         return built;
@@ -132,21 +138,43 @@ public final class BudgetPlanner {
             .sorted(Comparator.comparing(PoolSpec::id))
             .toList();
         final Set<PoolId> seen = new HashSet<>();
-        final List<PoolBudget> budgets = new ArrayList<>(ordered.size());
-        final List<String> reasons = new ArrayList<>();
-        int reservedTotal = 0;
-
+        final List<PoolBudget> requested = new ArrayList<>(ordered.size());
         for (final PoolSpec spec : ordered) {
             if (!seen.add(spec.id())) {
                 throw new IllegalArgumentException("duplicate pool spec for id '" + spec.id() + "'");
             }
-            final PoolBudget budget = this.budgetFor(spec, ceiling, usable);
-            budgets.add(budget);
+            requested.add(this.budgetFor(spec, ceiling, usable));
+        }
+
+        final List<String> reasons = new ArrayList<>();
+        final int reservedTotal = requested.stream()
+            .filter(budget -> !budget.critical())
+            .mapToInt(PoolBudget::reservedCores)
+            .sum();
+        if (reservedTotal > usable) {
+            reasons.add(
+                "pool reserves reach " + reservedTotal + " cores but only " + usable
+                    + " are usable; not overcommitting them"
+            );
+        }
+
+        final int sharedDemand = requested.stream()
+            .filter(BudgetPlanner::sharesUsable)
+            .mapToInt(PoolBudget::maxCores)
+            .sum();
+        final List<PoolBudget> budgets;
+        if (sharedDemand > usable) {
+            reasons.add(
+                "shared pool caps reach " + sharedDemand + " cores but only " + usable
+                    + " are usable; dividing the remainder proportionally instead of overcommitting"
+            );
+            budgets = divideUsable(requested, sharedDemand, usable);
+        } else {
+            budgets = requested;
+        }
+        for (final PoolBudget budget : budgets) {
             if (!budget.satisfied()) {
                 reasons.add(budget.degradedReason());
-            }
-            if (!budget.critical()) {
-                reservedTotal += budget.reservedCores();
             }
         }
 
@@ -157,12 +185,6 @@ public final class BudgetPlanner {
                     + " + io " + this.deductions.ioThreads()
                     + " + reserve " + reserve
                     + " leaves " + rawUsable + " of the " + ceiling + " thread ceiling"
-            );
-        }
-        if (reservedTotal > usable) {
-            reasons.add(
-                "pool reserves reach " + reservedTotal + " cores but only " + usable
-                    + " are usable; not overcommitting them"
             );
         }
 
@@ -189,15 +211,123 @@ public final class BudgetPlanner {
      * @return the pool budget
      */
     private PoolBudget budgetFor(final PoolSpec spec, final int ceiling, final int usable) {
-        final int base = switch (spec.kind()) {
-            case REGION_EXECUTION, CHUNK, IO, NETWORK -> ceiling;
-            case COMPUTE, SERVICE, VIRTUAL -> usable;
-        };
+        final int base = this.baseFor(spec.kind(), ceiling, usable);
         final int resolved = spec.budget().resolveCores(base);
         final int capped = spec.maxThreads() == -1 ? resolved : Math.min(resolved, spec.maxThreads());
         final boolean critical = spec.kind() == PoolKind.REGION_EXECUTION || spec.kind() == PoolKind.NETWORK;
         final int capacity = critical ? Math.max(capped, spec.minThreads()) : capped;
         final int reserved = Math.min(spec.budget().reservedCores(), capacity);
         return new PoolBudget(spec.id(), spec.kind(), spec.minThreads(), capped, reserved);
+    }
+
+    /**
+     * Returns the core count a pool's budget is resolved against.
+     *
+     * <p>Lanes whose threads were subtracted from {@code usable} resolve against their own population:
+     * a lease for a tick is only useful while a tick thread exists to use it. A zero population still
+     * resolves against one, because {@code resolveCores} rejects a zero base and an unconfigured
+     * deduction means "we do not know", not "no threads ever".
+     *
+     * @param kind    pool kind
+     * @param ceiling thread ceiling of the whole server
+     * @param usable  cores left for the pools that share the remainder
+     * @return the base, at least one
+     */
+    private int baseFor(final PoolKind kind, final int ceiling, final int usable) {
+        return switch (kind) {
+            case REGION_EXECUTION -> Math.max(1, this.deductions.regionThreads());
+            case CHUNK -> Math.max(1, this.deductions.chunkThreads());
+            case IO -> Math.max(1, this.deductions.ioThreads());
+            // netty threads are not deducted yet, so the ceiling is the only honest base for now
+            case NETWORK -> ceiling;
+            case COMPUTE, SERVICE, VIRTUAL -> usable;
+        };
+    }
+
+    /**
+     * Checks whether a pool draws its permits from the shared remainder.
+     *
+     * @param budget pool budget
+     * @return {@code true} for compute, service and virtual lanes
+     */
+    private static boolean sharesUsable(final PoolBudget budget) {
+        return switch (budget.kind()) {
+            case COMPUTE, SERVICE, VIRTUAL -> true;
+            case REGION_EXECUTION, CHUNK, IO, NETWORK -> false;
+        };
+    }
+
+    /**
+     * Splits {@code usable} between the shared pools in proportion to their declared caps.
+     *
+     * <p>Largest remainder first, id order as the tie breaker, so the split is deterministic and the sum
+     * never exceeds the remainder. A pool may end up with zero permits: on a machine where the shared
+     * pools together asked for more than exists, every pool keeping at least one is exactly the
+     * overcommit the ledger is supposed to prevent.
+     *
+     * @param budgets requested budgets in id order
+     * @param demand  sum of the shared caps
+     * @param usable  cores available to the shared pools
+     * @return budgets with capped shared capacities
+     */
+    private static List<PoolBudget> divideUsable(
+        final List<PoolBudget> budgets,
+        final int demand,
+        final int usable
+    ) {
+        final int[] allocated = new int[budgets.size()];
+        final long[] remainder = new long[budgets.size()];
+        int assigned = 0;
+        for (int index = 0; index < budgets.size(); index++) {
+            final PoolBudget budget = budgets.get(index);
+            if (!sharesUsable(budget)) {
+                continue;
+            }
+            final long scaled = (long) usable * budget.maxCores();
+            allocated[index] = (int) (scaled / demand);
+            remainder[index] = scaled % demand;
+            assigned += allocated[index];
+        }
+        int leftover = usable - assigned;
+        while (leftover > 0) {
+            int best = -1;
+            for (int index = 0; index < budgets.size(); index++) {
+                final PoolBudget budget = budgets.get(index);
+                if (!sharesUsable(budget) || allocated[index] >= budget.maxCores()) {
+                    continue;
+                }
+                if (best < 0
+                    || remainder[index] > remainder[best]
+                    || (remainder[index] == remainder[best]
+                        && budget.pool().compareTo(budgets.get(best).pool()) < 0)) {
+                    best = index;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            allocated[best]++;
+            // this pool already got its extra core, so the next pass must consider the others
+            remainder[best] = -1L;
+            leftover--;
+        }
+
+        final List<PoolBudget> capped = new ArrayList<>(budgets.size());
+        for (int index = 0; index < budgets.size(); index++) {
+            final PoolBudget budget = budgets.get(index);
+            if (!sharesUsable(budget)) {
+                capped.add(budget);
+                continue;
+            }
+            final int capacity = Math.min(budget.maxCores(), allocated[index]);
+            capped.add(new PoolBudget(
+                budget.pool(),
+                budget.kind(),
+                budget.minCores(),
+                capacity,
+                Math.min(budget.reservedCores(), capacity)
+            ));
+        }
+        return List.copyOf(capped);
     }
 }
