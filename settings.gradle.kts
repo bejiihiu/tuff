@@ -16,6 +16,7 @@ include("tuff-api")
 include("tuff-server")
 include("tuff-checkstyle")
 include("tuff-compute")
+include("tuff-threads")
 include("tuff-benchmarks")
 
 gradle.lifecycle.beforeProject {
