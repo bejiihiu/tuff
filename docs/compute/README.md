@@ -111,3 +111,6 @@ See [Operations § Command](operations.md#command) for output details and JFR li
   lifecycle and idle latency, with the harness caveats.
 - [Chunk system](chunk-system.md) — why the chunk system's ordered streams stay on their own executors and
   what would break if its tasks were moved onto this queue.
+- [Updating from upstream](../upstream.md) — merging Folia, rebuilding the patch stack, and the build,
+  test and smoke checks that gate a merge. Not specific to the compute module, but every merge has to
+  keep the engine hooks alive.

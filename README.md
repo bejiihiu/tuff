@@ -30,8 +30,9 @@ You need Git and a JDK. Gradle picks up JDK 25 through the toolchain resolver, s
 ```bash
 git clone https://github.com/bejiihiu/tuff.git
 cd tuff
-./gradlew applyAllPatches   # decompiles Minecraft and applies the patch stack
-./gradlew build             # produces tuff-server/build/libs/tuff-paperclip-<version>.jar
+./gradlew applyAllPatches                     # decompiles Minecraft and applies the patch stack
+./gradlew build                               # compiles and tests every module
+./gradlew :tuff-server:createPaperclipJar     # the runnable tuff-paperclip-<version>.jar
 ```
 
 Windows: use `gradlew.bat` (or the helper scripts `patch.bat` / `rb.bat`). Make sure `git config --global core.autocrlf false`
@@ -39,6 +40,15 @@ is set before the first build, otherwise checkstyle fails on CRLF in the generat
 
 Downloads for people who just want to run a server are on the
 [releases page](https://github.com/bejiihiu/tuff/releases).
+
+## Maintenance
+
+Tuff merges [Folia](https://github.com/PaperMC/Folia) directly; Paper arrives through the `paperRef` that
+Folia pins, so there is one upstream and one merge. The fork keeps Folia's patch stack intact and appends
+its own patches at the end, which is what makes the update mechanical.
+
+Merging a new upstream state, rebuilding the patch stack and verifying the result (build, tests, paperclip
+jar, smoke run, rollback) is documented in [`docs/upstream.md`](docs/upstream.md).
 
 ## Using the API
 
