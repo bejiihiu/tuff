@@ -572,7 +572,9 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
      * is the platform size. Every writer of that size goes through
      * {@link #applyPoolSize(int)} or {@link #wireRuntime()}, and both feed the result back into
      * {@link QuotaController#updateTotalLimit(int)}, which is what keeps a relative consumer limit in
-     * step with both lanes.
+     * step with both lanes. The metrics collector resolves reported limits from the same
+     * {@link QuotaController#totalLimit()}, so a resize cannot leave a stale limit behind in
+     * {@code /tuff compute consumers} either.
      *
      * @param platformWorkers workers the platform pool may run at the same time, at least {@code 1}
      * @return platform workers plus the lane permits, or only the workers when the lane is off
@@ -615,7 +617,8 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             recorder,
             this::laneSnapshot,
             this::runningTaskSnapshot,
-            this.recentTasks::snapshot
+            this.recentTasks::snapshot,
+            this.quota::totalLimit
         );
         this.metricsCollector = collector;
         final DispatcherImpl newDispatcher = new DispatcherImpl(

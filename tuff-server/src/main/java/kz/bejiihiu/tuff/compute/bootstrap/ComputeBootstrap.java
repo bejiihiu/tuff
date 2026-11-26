@@ -5,6 +5,7 @@ import io.papermc.paper.threadedregions.TickRegionScheduler;
 import io.papermc.paper.threadedregions.TickRegions;
 import java.time.Duration;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import kz.bejiihiu.tuff.api.compute.TuffCompute;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
@@ -139,13 +140,18 @@ public final class ComputeBootstrap {
         ComputeJfr.shutdown();
         TuffCompute.uninstall();
 
-        final @Nullable AsyncComputeScheduler scheduler = status.engine().orElse(null);
+        final ComputeStatus previous = status;
+        final @Nullable AsyncComputeScheduler scheduler = previous.engine().orElse(null);
         status = ComputeStatus.notInitialised();
         final TuffComputeConfig loaded = config;
         if (loaded != null) {
             loaded.setApplyTarget(null);
         }
         if (scheduler == null) {
+            // one line even when there is nothing to stop, otherwise an operator cannot tell the
+            // hook ran at all (the disabled start already logged its own reason)
+            LOGGER.info("Tuff compute is {}; nothing to stop",
+                previous.state().name().toLowerCase(Locale.ROOT).replace('_', ' '));
             return;
         }
 

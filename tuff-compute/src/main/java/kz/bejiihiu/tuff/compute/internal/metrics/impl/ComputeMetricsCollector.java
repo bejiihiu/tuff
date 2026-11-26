@@ -12,6 +12,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.ComputeConsumer;
@@ -19,6 +20,7 @@ import kz.bejiihiu.tuff.compute.ComputePriority;
 import kz.bejiihiu.tuff.compute.ComputeRejectedException;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ConsumerMetrics;
+import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.internal.metrics.JfrRecorder;
 import kz.bejiihiu.tuff.compute.internal.metrics.MetricsCollector;
@@ -57,12 +59,29 @@ import org.jspecify.annotations.Nullable;
  * be at most one sample interval old for those values; everything derived from lifecycle events is
  * current. Create one collector per scheduler and {@link #close()} it when the scheduler terminates,
  * otherwise the sampler thread outlives the pool.
+ *
+ * <p>Consumer limits are resolved at snapshot time from the policy the consumer registered with and
+ * the execution capacity read from the engine ({@link
+ * kz.bejiihiu.tuff.compute.internal.queue.QuotaController#totalLimit()} through the capacity
+ * supplier). They are deliberately not stored as a resolved number: a resize would then have to walk
+ * every consumer to republish limits, and that walk would land on submission driven growth. Lazy
+ * resolution costs one volatile read per snapshot, it cannot drift from the quota (the quota resolves
+ * the same policy against the same capacity on every admission check), and a shrink is visible in the
+ * very next {@code /tuff compute consumers}. A collector created without a capacity source reports
+ * the limit the caller passed to {@link #onConsumerRegistered(ComputeConsumer, int)} instead, which
+ * keeps standalone and test collectors working.
  */
 public final class ComputeMetricsCollector implements MetricsCollector {
 
     private static final System.Logger LOG = System.getLogger(ComputeMetricsCollector.class.getName());
 
     private static final String SAMPLER_THREAD_PREFIX = "Tuff Compute Metrics";
+
+    /**
+     * Capacity source for collectors that are not attached to a running engine; {@code 0} means
+     * "unknown, report the published limit" and never reaches a policy resolution.
+     */
+    private static final IntSupplier NO_EXECUTION_CAPACITY = () -> 0;
 
     private final ComputeClock clock;
     private final JfrRecorder recorder;
@@ -74,6 +93,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
     private final Supplier<SchedulerMetrics.LaneMetrics> lanes;
     private final Supplier<List<SchedulerMetrics.RunningTaskInfo>> runningTasks;
     private final Supplier<List<SchedulerMetrics.CompletedTaskInfo>> recentTasks;
+    private final IntSupplier executionCapacity;
     private final ConcurrentHashMap<String, ConsumerState> consumers = new ConcurrentHashMap<>();
     private final ThreadLocal<StartedMark> startedMark = ThreadLocal.withInitial(StartedMark::new);
     private final @Nullable ScheduledExecutorService sampler;
@@ -97,7 +117,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
      * @throws NullPointerException if an argument is {@code null}
      */
     public ComputeMetricsCollector(final ComputeSettings settings, final ComputeClock clock, final JfrRecorder recorder) {
-        this(settings, clock, recorder, SchedulerMetrics.LaneMetrics::disabled, List::of, List::of);
+        this(settings, clock, recorder, SchedulerMetrics.LaneMetrics::disabled, List::of, List::of, NO_EXECUTION_CAPACITY);
     }
 
     /**
@@ -115,7 +135,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         final JfrRecorder recorder,
         final Supplier<SchedulerMetrics.LaneMetrics> lanes
     ) {
-        this(settings, clock, recorder, lanes, List::of, List::of);
+        this(settings, clock, recorder, lanes, List::of, List::of, NO_EXECUTION_CAPACITY);
     }
 
     /**
@@ -141,12 +161,41 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         final Supplier<List<SchedulerMetrics.RunningTaskInfo>> runningTasks,
         final Supplier<List<SchedulerMetrics.CompletedTaskInfo>> recentTasks
     ) {
+        this(settings, clock, recorder, lanes, runningTasks, recentTasks, NO_EXECUTION_CAPACITY);
+    }
+
+    /**
+     * Creates a collector that also resolves consumer limits against the live execution capacity.
+     *
+     * <p>The supplier is read once per snapshot, never on the hot path. A value of {@code 0} means
+     * "capacity unknown", and the limits published through
+     * {@link #onConsumerRegistered(ComputeConsumer, int)} are reported as they are.
+     *
+     * @param settings          scheduler settings, the metrics section drives what is collected
+     * @param clock             clock used for snapshot timestamps and throughput sampling
+     * @param recorder          flight recorder bridge, never {@code null}
+     * @param lanes             supplier of the lane snapshot, called once per snapshot
+     * @param runningTasks      supplier of the currently running tasks, called once per snapshot
+     * @param recentTasks       supplier of recently finished tasks, slowest first, called once per snapshot
+     * @param executionCapacity supplier of the capacity relative limits resolve against, {@code 0} when unknown
+     * @throws NullPointerException if an argument is {@code null}
+     */
+    public ComputeMetricsCollector(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final JfrRecorder recorder,
+        final Supplier<SchedulerMetrics.LaneMetrics> lanes,
+        final Supplier<List<SchedulerMetrics.RunningTaskInfo>> runningTasks,
+        final Supplier<List<SchedulerMetrics.CompletedTaskInfo>> recentTasks,
+        final IntSupplier executionCapacity
+    ) {
         Objects.requireNonNull(settings, "settings");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.recorder = Objects.requireNonNull(recorder, "recorder");
         this.lanes = Objects.requireNonNull(lanes, "lanes");
         this.runningTasks = Objects.requireNonNull(runningTasks, "runningTasks");
         this.recentTasks = Objects.requireNonNull(recentTasks, "recentTasks");
+        this.executionCapacity = Objects.requireNonNull(executionCapacity, "executionCapacity");
         final ComputeSettings.Metrics metrics = settings.metrics();
         this.metricsEnabled = metrics.enabled();
         this.jfrEnabled = metrics.jfrEnabled();
@@ -412,8 +461,9 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             return this.disabledSnapshot(capturedAt);
         }
         final Map<String, ConsumerMetrics> consumerSnapshots = new HashMap<>();
+        final int capacity = this.executionCapacity.getAsInt();
         for (final ConsumerState state : this.consumers.values()) {
-            consumerSnapshots.put(state.consumerId, state.snapshot(capturedAt));
+            consumerSnapshots.put(state.consumerId, state.snapshot(capturedAt, capacity));
         }
         final LatencyStats queueWaitStats = current.queueWait.capture();
         final LatencyStats executionStats = current.execution.capture();
@@ -460,8 +510,9 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         }
         final Instant capturedAt = this.clock.instant();
         final Map<String, ConsumerMetrics> snapshots = new HashMap<>();
+        final int capacity = this.executionCapacity.getAsInt();
         for (final ConsumerState state : this.consumers.values()) {
-            snapshots.put(state.consumerId, state.snapshot(capturedAt));
+            snapshots.put(state.consumerId, state.snapshot(capturedAt, capacity));
         }
         return Map.copyOf(snapshots);
     }
@@ -469,7 +520,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
     @Override
     public @Nullable ConsumerMetrics consumerMetrics(final String consumerId) {
         final ConsumerState state = this.consumers.get(consumerId);
-        return state == null ? null : state.snapshot(this.clock.instant());
+        return state == null ? null : state.snapshot(this.clock.instant(), this.executionCapacity.getAsInt());
     }
 
     @Override
@@ -821,6 +872,11 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         volatile int concurrencyLimit;
         volatile int maxQueuedTasks = -1;
 
+        /**
+         * Policy the limit is resolved from at snapshot time, see the class javadoc.
+         */
+        volatile ConsumerPolicy policy = ConsumerPolicy.defaults();
+
         ConsumerState(final String consumerId, final ComputeClock clock, final Duration window) {
             this.consumerId = consumerId;
             for (int i = 0; i < this.rejectedByReason.length; i++) {
@@ -839,6 +895,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
          * @param concurrencyLimit resolved concurrency limit
          */
         void applyPolicy(final ComputeConsumer consumer, final int concurrencyLimit) {
+            this.policy = consumer.policy();
             this.policyEnabled = consumer.policy().enabled();
             this.concurrencyLimit = concurrencyLimit;
             this.maxQueuedTasks = consumer.policy().maxQueuedTasks();
@@ -848,12 +905,19 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         /**
          * Captures this consumer.
          *
-         * @param capturedAt snapshot instant
+         * <p>The reported limit is resolved from the stored policy against the capacity read when the
+         * snapshot started, so a resize is visible without touching any consumer state.
+         *
+         * @param capturedAt        snapshot instant
+         * @param executionCapacity capacity to resolve a relative limit against, {@code 0} when unknown
          * @return the immutable snapshot
          */
-        ConsumerMetrics snapshot(final Instant capturedAt) {
+        ConsumerMetrics snapshot(final Instant capturedAt, final int executionCapacity) {
             final LatencyStats queueWaitStats = this.queueWait.capture();
             final LatencyStats executionStats = this.execution.capture();
+            final int limit = executionCapacity > 0
+                ? this.policy.resolveConcurrencyLimit(executionCapacity)
+                : this.concurrencyLimit;
             final Map<ComputeRejectedException.Reason, Long> rejectedReasons = new EnumMap<>(ComputeRejectedException.Reason.class);
             for (final ComputeRejectedException.Reason reason : ComputeRejectedException.Reason.values()) {
                 rejectedReasons.put(reason, this.rejectedByReason[reason.ordinal()].sum());
@@ -868,7 +932,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
                 this.registered && this.policyEnabled,
                 (int) Math.max(0L, Math.min(Integer.MAX_VALUE, this.active.sum())),
                 (int) Math.max(0L, Math.min(Integer.MAX_VALUE, this.queued.sum())),
-                this.concurrencyLimit,
+                limit,
                 this.maxQueuedTasks,
                 this.submitted.sum(),
                 this.completed.sum(),

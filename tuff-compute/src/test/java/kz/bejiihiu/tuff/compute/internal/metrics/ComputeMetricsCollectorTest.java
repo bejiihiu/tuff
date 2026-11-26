@@ -5,12 +5,14 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.ComputeConsumer;
 import kz.bejiihiu.tuff.compute.ComputePriority;
 import kz.bejiihiu.tuff.compute.ComputeRejectedException;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ConsumerMetrics;
+import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.internal.metrics.impl.ComputeMetricsCollector;
 import kz.bejiihiu.tuff.compute.internal.metrics.impl.FlightJfrRecorder;
@@ -170,6 +172,37 @@ class ComputeMetricsCollectorTest {
         assertTrue(afterRemoval.consumer("ai").isPresent());
         assertFalse(afterRemoval.consumer("ai").orElseThrow().enabled());
         assertNull(collector.consumerMetrics("missing"));
+    }
+
+    @Test
+    void consumerLimitsFollowTheLiveCapacity() {
+        final AtomicInteger capacity = new AtomicInteger(10);
+        final ComputeMetricsCollector collector = new ComputeMetricsCollector(
+            MetricsFixtures.settings(true, false, Duration.ofSeconds(1), false, Duration.ofHours(1)),
+            new MetricsFixtures.FakeClock(),
+            new FlightJfrRecorder(),
+            SchedulerMetrics.LaneMetrics::disabled,
+            List::of,
+            List::of,
+            capacity::get
+        );
+        this.collectors.add(collector);
+
+        collector.onConsumerRegistered(ComputeConsumer.of("half", ConsumerPolicy.relative(0.5d)), 5);
+        assertEquals(5, collector.consumerMetrics("half").concurrencyLimit());
+        assertEquals(5, collector.schedulerMetrics().consumer("half").orElseThrow().concurrencyLimit());
+
+        capacity.set(4);
+        assertEquals(2, collector.consumerMetrics("half").concurrencyLimit(), "a shrink must be visible");
+
+        collector.onConsumerPolicyUpdated(ComputeConsumer.of("half", ConsumerPolicy.relative(1.0d)), 4);
+        assertEquals(4, collector.consumerMetrics("half").concurrencyLimit(), "a policy update must re-resolve");
+
+        collector.onConsumerPolicyUpdated(ComputeConsumer.of("half", ConsumerPolicy.absolute(3)), 4);
+        assertEquals(3, collector.consumerMetrics("half").concurrencyLimit());
+
+        capacity.set(2);
+        assertEquals(3, collector.consumerMetrics("half").concurrencyLimit(), "an absolute limit ignores capacity");
     }
 
     @Test
