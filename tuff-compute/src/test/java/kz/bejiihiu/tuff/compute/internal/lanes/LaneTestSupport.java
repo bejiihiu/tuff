@@ -83,6 +83,22 @@ final class LaneTestSupport {
     }
 
     static void assertEventually(final String what, final Duration timeout, final BooleanSupplier condition) {
+        awaitUntil(what, timeout, condition);
+    }
+
+    /**
+     * Polls until the condition holds, failing with a readable message after the timeout.
+     *
+     * <p>A task future is published before the engine releases the consumer quota slot and emits the
+     * terminal metrics event (and before the lane records the outcome), so a counter read right after
+     * {@code get()}/{@code join()} can still be one event behind.
+     *
+     * @param what      what is being waited for, used in the failure message
+     * @param timeout   maximum wait
+     * @param condition condition to wait for
+     * @throws AssertionError if the condition is still false when the timeout expires
+     */
+    static void awaitUntil(final String what, final Duration timeout, final BooleanSupplier condition) {
         final long deadline = System.nanoTime() + timeout.toNanos();
         while (System.nanoTime() < deadline) {
             if (condition.getAsBoolean()) {
@@ -93,7 +109,7 @@ final class LaneTestSupport {
         if (condition.getAsBoolean()) {
             return;
         }
-        throw new AssertionError("timed out waiting for: " + what);
+        throw new AssertionError("timed out after " + timeout + " waiting for: " + what);
     }
 
     static void sleep(final long millis) {
@@ -202,21 +218,47 @@ final class LaneTestSupport {
     }
 
     /**
-     * Asserts the scheduler wide invariant in its settled form, where the sampled gauges are zero
-     * and therefore cannot hide or fake a term.
+     * Waits for the scheduler to settle and returns the settled snapshot.
      *
-     * @param scheduler scheduler whose current snapshot is checked
-     * @throws AssertionError if the scheduler is not settled or its counters do not add up
+     * <p>Settled means no virtual task runs and the scheduler wide counters add up
+     * ({@code submitted == completed + failed + cancelled}, i.e. nothing is queued or active). The
+     * sampled {@code queuedTasks} gauge is deliberately not part of the condition: after shutdown
+     * the janitor no longer samples, so the last gauge value can stay stale forever while the
+     * lifecycle counters already prove the queue is empty.
+     *
+     * @param scheduler scheduler whose snapshot is checked
+     * @return the snapshot that satisfied the settled state
+     * @throws AssertionError if the scheduler does not settle within the timeout
      */
-    static void assertSettled(final AsyncComputeScheduler scheduler) {
-        final SchedulerMetrics metrics = scheduler.metrics();
+    static SchedulerMetrics assertSettled(final AsyncComputeScheduler scheduler) {
+        return assertSettled(scheduler, NEVER);
+    }
+
+    /**
+     * Waits for the scheduler to settle and returns the settled snapshot.
+     *
+     * @param scheduler scheduler whose snapshot is checked
+     * @param timeout   maximum time to wait for the settled state
+     * @return the snapshot that satisfied the settled state
+     * @throws AssertionError if the scheduler does not settle within the timeout
+     */
+    static SchedulerMetrics assertSettled(final AsyncComputeScheduler scheduler, final Duration timeout) {
+        final long deadline = System.nanoTime() + timeout.toNanos();
+        SchedulerMetrics metrics = scheduler.metrics();
+        while (!isSettled(metrics)) {
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("scheduler did not settle within " + timeout
+                    + ": queued=" + metrics.queuedTasks()
+                    + " virtualRunning=" + metrics.lanes().virtual().running()
+                    + " submitted=" + metrics.submittedTasks()
+                    + " completed=" + metrics.completedTasks()
+                    + " failed=" + metrics.failedTasks()
+                    + " cancelled=" + metrics.cancelledTasks());
+            }
+            sleep(2L);
+            metrics = scheduler.metrics();
+        }
         assertLaneInvariant(metrics);
-        if (metrics.queuedTasks() != 0) {
-            throw new AssertionError("queue is not drained: queued=" + metrics.queuedTasks());
-        }
-        if (metrics.lanes().virtual().running() != 0) {
-            throw new AssertionError("virtual lane still runs " + metrics.lanes().virtual().running() + " tasks");
-        }
         final long terminal = metrics.completedTasks() + metrics.failedTasks() + metrics.cancelledTasks();
         if (metrics.submittedTasks() != terminal) {
             throw new AssertionError("settled scheduler invariant broken: submitted=" + metrics.submittedTasks()
@@ -224,6 +266,19 @@ final class LaneTestSupport {
                 + " cancelled=" + metrics.cancelledTasks());
         }
         assertConsumerInvariant(metrics);
+        return metrics;
+    }
+
+    /**
+     * Checks the cheap part of the settled contract on one snapshot.
+     *
+     * @param metrics snapshot to inspect
+     * @return {@code true} when no virtual task runs and no accepted task is still open
+     */
+    private static boolean isSettled(final SchedulerMetrics metrics) {
+        return metrics.lanes().virtual().running() == 0
+            && metrics.submittedTasks() == metrics.completedTasks() + metrics.failedTasks()
+                + metrics.cancelledTasks();
     }
 
     static void assertStateTerminal(final AsyncComputeScheduler scheduler, final Duration timeout) {

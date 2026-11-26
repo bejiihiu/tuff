@@ -47,6 +47,9 @@ import org.jspecify.annotations.Nullable;
  *     flagged by the engine and its result is discarded by the shared runner;</li>
  *     <li>virtual threads are daemon by definition, and this class tracks every thread it starts so
  *     a terminated lane can be checked for leaks.</li>
+ *     <li>the published snapshot derives {@code running} from {@code started - terminal}, so
+ *     {@code submitted == completed + failed + cancelled + running} holds for every snapshot, even
+ *     one taken while a task is finishing.</li>
  * </ul>
  */
 final class VirtualLane {
@@ -78,6 +81,10 @@ final class VirtualLane {
     private final Condition terminated = this.terminationLock.newCondition();
     private final Set<Thread> liveThreads = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Tasks whose body has not returned yet. This is the execution and termination gate; the public
+     * snapshot does not report it directly, see {@link #snapshot()}.
+     */
     private final AtomicInteger runningTasks = new AtomicInteger();
     private final LongAdder started = new LongAdder();
     private final LongAdder completed = new LongAdder();
@@ -231,19 +238,32 @@ final class VirtualLane {
     /**
      * Returns the lane snapshot.
      *
+     * <p>The terminal counters are read before {@code started}. A task is always started before it
+     * can finish, so a later {@code started} reading can never be smaller than an earlier terminal
+     * count and the derived running value cannot go negative. Deriving it instead of reporting the
+     * separate execution counter is what makes the documented invariant hold for every snapshot:
+     * two independent atomics cannot be read atomically, so a snapshot taken while a task finishes
+     * would otherwise see it both completed and running.
+     *
      * @return the immutable lane metrics
      */
     SchedulerMetrics.LaneMetrics snapshot() {
+        final long completedTasks = this.completed.sum();
+        final long failedTasks = this.failed.sum();
+        final long cancelledTasks = this.cancelled.sum();
+        final long spilledTasks = this.spilled.sum();
+        final long submittedTasks = this.started.sum();
+        final long running = Math.max(0L, submittedTasks - completedTasks - failedTasks - cancelledTasks);
         final SchedulerMetrics.VirtualLaneMetrics virtual = new SchedulerMetrics.VirtualLaneMetrics(
             true,
-            this.runningTasks.get(),
+            (int) Math.min(Integer.MAX_VALUE, running),
             this.config.maxConcurrent(),
             this.queuedForLane(),
-            this.started.sum(),
-            this.completed.sum(),
-            this.failed.sum(),
-            this.cancelled.sum(),
-            this.spilled.sum()
+            submittedTasks,
+            completedTasks,
+            failedTasks,
+            cancelledTasks,
+            spilledTasks
         );
         return new SchedulerMetrics.LaneMetricsSnapshot(virtual);
     }

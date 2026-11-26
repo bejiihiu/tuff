@@ -18,6 +18,15 @@ import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
  * <p>The caller owns the entry and its consumer quota slot before calling {@link #run(QueueEntry)}.
  * When this method returns the slot has been released and the handle has reached a terminal state,
  * including when the task body throws or when cancellation won before the body started.
+ *
+ * <p>Terminal ordering is fixed at the ends: the terminal metrics event is always emitted last, after
+ * the handle published its result (or cancellation) and after the dispatcher released the consumer
+ * quota slot. The middle two are ordered differently on the success and failure paths, which is why
+ * neither may be used as a "metrics are current now" signal. A completed future therefore does not
+ * imply that {@code metrics()} already moved, so anything that reads counters right after
+ * {@code join()} has to wait for them. The order exists because a slot must never be free while the
+ * handle still looks pending, and because the metrics accounting must stay on the thread that saw
+ * {@code onStarted} (the collector's derived queue depth depends on it).
  */
 final class EngineTaskRunner {
 

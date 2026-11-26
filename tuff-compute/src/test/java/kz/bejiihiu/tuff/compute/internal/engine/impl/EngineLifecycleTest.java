@@ -19,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.awaitNoEngineThreads;
+import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.awaitUntil;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.cancellationOf;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.engine;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.engineThreadNames;
@@ -39,7 +40,7 @@ class EngineLifecycleTest {
 
     @Test
     void newEngineAcceptsNoWorkAndOwnsNoThread() {
-        final EngineTestSupport.SettingsBuilder builder = settings();
+        final EngineTestSupport.SettingsBuilder builder = settings().noVirtualLane();
         final ComputeSettings configuration = builder.build();
         final AsyncComputeScheduler compute = scheduler(engine(configuration, new EngineTestSupport.FakeClock()));
         assertEquals(SchedulerState.NEW, compute.state());
@@ -55,7 +56,7 @@ class EngineLifecycleTest {
 
     @Test
     void startIsIdempotentAndTerminationIsFinal() throws Exception {
-        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(2);
+        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(2).noVirtualLane();
         final AsyncComputeScheduler compute = startedScheduler(builder.build(), new EngineTestSupport.FakeClock());
         final String prefix = builder.prefix();
         compute.start();
@@ -88,7 +89,7 @@ class EngineLifecycleTest {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AtomicInteger executed = new AtomicInteger();
-        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(1).grace(millis(100L));
+        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(1).grace(millis(100L)).noVirtualLane();
         final String prefix = builder.prefix();
         final AsyncComputeScheduler compute = startedScheduler(builder.build(), new EngineTestSupport.FakeClock());
         final CompletableFuture<Integer> blocker = compute.submit(() -> {
@@ -118,7 +119,7 @@ class EngineLifecycleTest {
     void shutdownNowCancelsTheQueueImmediatelyButNeverInterruptsRunningWork() throws Exception {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
-        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(1);
+        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(1).noVirtualLane();
         final String prefix = builder.prefix();
         final AsyncComputeSchedulerImpl compute = new AsyncComputeSchedulerImpl(engine(
             builder.build(),
@@ -145,7 +146,7 @@ class EngineLifecycleTest {
 
     @Test
     void disabledSchedulerRunsWithoutThreadsAndRejectsWithItsOwnReason() {
-        final EngineTestSupport.SettingsBuilder builder = settings().enabled(false);
+        final EngineTestSupport.SettingsBuilder builder = settings().enabled(false).noVirtualLane();
         final String prefix = builder.prefix();
         final AsyncComputeScheduler compute = startedScheduler(builder.build(), new EngineTestSupport.FakeClock());
         assertEquals(SchedulerState.RUNNING, compute.state());
@@ -163,7 +164,7 @@ class EngineLifecycleTest {
     @Test
     void shutdownIsIdempotentInEveryOrder() {
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(2).build(),
+            settings().fixedWorkers(2).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         compute.shutdown();
@@ -176,7 +177,7 @@ class EngineLifecycleTest {
     void graceExpiryTerminatesAndLetsTheRunningTaskFinishLater() throws Exception {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
-        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(1).grace(millis(10L));
+        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(1).grace(millis(10L)).noVirtualLane();
         final String prefix = builder.prefix();
         final AsyncComputeScheduler compute = startedScheduler(builder.build(), new EngineTestSupport.FakeClock());
         try {
@@ -196,6 +197,10 @@ class EngineLifecycleTest {
 
             release.countDown();
             assertEquals("finished", future.get(10L, TimeUnit.SECONDS));
+            awaitUntil("the abandoned task is accounted after it finishes", Duration.ofSeconds(10), () -> {
+                final var metrics = compute.metrics();
+                return metrics.submittedTasks() == 1L && metrics.completedTasks() == 1L;
+            });
             assertEquals(1L, compute.metrics().submittedTasks());
             assertEquals(1L, compute.metrics().completedTasks());
             assertEquals(0L, compute.metrics().cancelledTasks());

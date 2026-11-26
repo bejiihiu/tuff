@@ -1,5 +1,6 @@
 package kz.bejiihiu.tuff.compute.internal.engine.impl;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -15,6 +16,7 @@ import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.awaitUntil;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.cancellationOf;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.settings;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.startedScheduler;
@@ -32,7 +34,7 @@ class EngineConsumerTest {
     @Test
     void registrationIsIdempotentAndVisible() {
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(2).dynamicRegistration(false).build(),
+            settings().fixedWorkers(2).dynamicRegistration(false).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -54,7 +56,7 @@ class EngineConsumerTest {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).dynamicRegistration(false).build(),
+            settings().fixedWorkers(1).dynamicRegistration(false).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -99,7 +101,7 @@ class EngineConsumerTest {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).dynamicRegistration(false).build(),
+            settings().fixedWorkers(1).dynamicRegistration(false).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -131,6 +133,8 @@ class EngineConsumerTest {
             assertEquals("late result", handle.get(10L, TimeUnit.SECONDS));
             assertTrue(handle.isDone());
             assertFalse(handle.isCancelled());
+            awaitUntil("the completed and the queued task are accounted", Duration.ofSeconds(10), () ->
+                compute.metrics().completedTasks() == 1L && compute.metrics().cancelledTasks() == 1L);
             assertEquals(1L, compute.metrics().completedTasks());
             assertEquals(1L, compute.metrics().cancelledTasks());
         } finally {
@@ -142,7 +146,7 @@ class EngineConsumerTest {
     @Test
     void reRegistrationAfterUnregisterStartsFresh() throws Exception {
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(2).dynamicRegistration(false).build(),
+            settings().fixedWorkers(2).dynamicRegistration(false).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -167,6 +171,7 @@ class EngineConsumerTest {
             settings()
                 .fixedWorkers(2)
                 .overrides(Map.of("configured", ConsumerPolicy.absolute(1)))
+                .noVirtualLane()
                 .build(),
             new EngineTestSupport.FakeClock()
         );

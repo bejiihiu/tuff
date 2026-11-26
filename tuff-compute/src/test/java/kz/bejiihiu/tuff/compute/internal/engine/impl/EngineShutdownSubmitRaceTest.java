@@ -17,6 +17,7 @@ import kz.bejiihiu.tuff.compute.ComputeTaskType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.awaitUntil;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.settings;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.startedScheduler;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -75,9 +76,22 @@ class EngineShutdownSubmitRaceTest {
 
         assertTrue(compute.awaitTermination(Duration.ofSeconds(10)), "shutdown must terminate");
         assertEquals(SchedulerState.TERMINATED, compute.state());
-        for (final ComputeTaskHandle<Integer> handle : accepted) {
-            assertTrue(handle.isDone(), "accepted task " + handle.taskId() + " is still pending after TERMINATED");
-        }
+        // a task that was still running when the grace expired is abandoned, not failed: its future
+        // and accounting land after TERMINATED, so wait for them instead of reading once
+        awaitUntil("every accepted handle reached a terminal state", Duration.ofSeconds(10), () -> {
+            for (final ComputeTaskHandle<Integer> handle : accepted) {
+                if (!handle.isDone()) {
+                    return false;
+                }
+            }
+            return true;
+        });
+        awaitUntil("the shutdown accounting settles", Duration.ofSeconds(10), () -> {
+            final var metrics = compute.metrics();
+            return metrics.consumer(AsyncComputeScheduler.DEFAULT_CONSUMER_ID).orElseThrow().queuedTasks() == 0
+                && metrics.submittedTasks() == metrics.completedTasks() + metrics.failedTasks()
+                    + metrics.cancelledTasks();
+        });
         assertEquals(0, compute.metrics().consumer(AsyncComputeScheduler.DEFAULT_CONSUMER_ID)
             .orElseThrow()
             .queuedTasks());

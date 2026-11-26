@@ -19,10 +19,12 @@ import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
 import kz.bejiihiu.tuff.compute.ComputeTaskType;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.OverflowPolicy;
+import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.assertEventually;
+import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.awaitUntil;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.cancellationOf;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.millis;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.settings;
@@ -92,6 +94,10 @@ class EngineVirtualLaneTest {
                 assertNotNull(future.get(10L, TimeUnit.SECONDS));
             }
             assertTrue(peak.get() <= 2, "virtual lane exceeded maxConcurrent: " + peak.get());
+            awaitUntil("the lane counted every completed task", Duration.ofSeconds(10), () -> {
+                final SchedulerMetrics.VirtualLane lane = compute.metrics().lanes().virtual();
+                return lane.submitted() == 5L && lane.completed() == 5L;
+            });
             assertEquals(5L, compute.metrics().lanes().virtual().submitted());
             assertEquals(5L, compute.metrics().lanes().virtual().completed());
         } finally {
@@ -467,7 +473,9 @@ class EngineVirtualLaneTest {
     void shutdownStopsTheLaneAndLeavesNoThreads() throws Exception {
         final EngineTestSupport.SettingsBuilder settings = settings()
             .fixedWorkers(1)
-            .virtualLane(true, true, 4, millis(50L), 64);
+            // exactly one lane slot: the running task holds it and the second LOW task cannot be
+            // claimed before shutdown, so "queued at shutdown" is deterministic instead of a race
+            .virtualLane(true, true, 1, millis(50L), 64);
         final EngineTestSupport.FakeClock clock = new EngineTestSupport.FakeClock();
         final ComputeEngineImpl engine = EngineTestSupport.engine(settings.build(), clock);
         final AsyncComputeScheduler compute = new AsyncComputeSchedulerImpl(engine);

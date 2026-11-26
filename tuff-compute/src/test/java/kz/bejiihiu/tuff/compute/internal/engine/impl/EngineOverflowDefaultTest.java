@@ -39,7 +39,7 @@ class EngineOverflowDefaultTest {
         final AsyncComputeScheduler compute = startedScheduler(
             settings()
                 .fixedWorkers(1)
-                .capacity(2)
+                .capacity(2).noVirtualLane()
                 .overflow(OverflowPolicy.DROP_OLDEST)
                 .defaultPolicy(ConsumerPolicy.defaults())
                 .dynamicRegistration(true)
@@ -79,7 +79,7 @@ class EngineOverflowDefaultTest {
         final AsyncComputeScheduler compute = startedScheduler(
             settings()
                 .fixedWorkers(1)
-                .capacity(2)
+                .capacity(2).noVirtualLane()
                 .overflow(OverflowPolicy.REJECT)
                 .defaultPolicy(dropOldestPolicy())
                 .dynamicRegistration(true)
@@ -120,7 +120,7 @@ class EngineOverflowDefaultTest {
         final AsyncComputeScheduler compute = startedScheduler(
             settings()
                 .fixedWorkers(1)
-                .capacity(2)
+                .capacity(2).noVirtualLane()
                 .overflow(OverflowPolicy.DROP_OLDEST)
                 .build(),
             new EngineTestSupport.FakeClock()
@@ -154,7 +154,7 @@ class EngineOverflowDefaultTest {
         final AsyncComputeScheduler compute = startedScheduler(
             settings()
                 .fixedWorkers(1)
-                .capacity(2)
+                .capacity(2).noVirtualLane()
                 .overflow(OverflowPolicy.DROP_OLDEST)
                 .dynamicRegistration(false)
                 .build(),

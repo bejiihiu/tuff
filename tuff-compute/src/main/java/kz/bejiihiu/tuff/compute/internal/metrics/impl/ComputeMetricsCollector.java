@@ -50,6 +50,11 @@ import org.jspecify.annotations.Nullable;
  * which is what the worker loop does by design; a different reporting pattern would make the derived
  * per consumer depth drift, while the authoritative global depth stays correct.
  *
+ * <p>Terminal counters lag completed futures by design: the metrics event is emitted only after the
+ * task's handle published its result and the dispatcher released the quota slot. Poll a snapshot
+ * when you need to observe the accounting of a task you just waited for; {@code future.join()} does
+ * not mean the counters have already moved.
+ *
  * <p>Throughput is sampled, not counted on the hot path: the sampler reads the completion counters
  * once per interval and feeds {@link ThroughputMeter}. TPS is therefore accurate at the sample
  * granularity and cannot add work to a completing task.

@@ -34,7 +34,7 @@ class EngineGhostConsumerTest {
     @Test
     void submissionsRacingUnregisterAlwaysTerminalize() throws Exception {
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(2).dynamicRegistration(false).build(),
+            settings().fixedWorkers(2).dynamicRegistration(false).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {

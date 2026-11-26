@@ -113,15 +113,11 @@ class LaneSoakTest {
 
             compute.shutdown(Duration.ofSeconds(15L));
             assertStateTerminal(compute, Duration.ofSeconds(30L));
-            assertEventually("the queue drains after shutdown", Duration.ofSeconds(30L), () -> {
-                final SchedulerMetrics metrics = compute.metrics();
-                return metrics.queuedTasks() == 0 && metrics.lanes().virtual().running() == 0;
-            });
+            assertSettled(compute, Duration.ofSeconds(30L));
+            assertEventually("accepted submissions match the submitted counter", NEVER,
+                () -> compute.metrics().submittedTasks() == accepted.get());
 
             final SchedulerMetrics metrics = compute.metrics();
-            assertSettled(compute);
-            assertEventually("accepted submissions match the submitted counter", NEVER,
-                () -> metrics.submittedTasks() == accepted.get());
             assertEquals(accepted.get(), metrics.submittedTasks());
             assertTrue(metrics.cancelledTasks() > 0L, "no task was cancelled");
             assertTrue(metrics.failedTasks() > 0L, "no task failed");

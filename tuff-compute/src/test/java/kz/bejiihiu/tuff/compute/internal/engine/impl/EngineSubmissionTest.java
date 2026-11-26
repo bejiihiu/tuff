@@ -105,7 +105,7 @@ class EngineSubmissionTest {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).capacity(2).dynamicRegistration(false).build(),
+            settings().fixedWorkers(1).capacity(2).dynamicRegistration(false).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -165,7 +165,7 @@ class EngineSubmissionTest {
             Duration.ZERO
         );
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).capacity(100).build(),
+            settings().fixedWorkers(1).capacity(100).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {

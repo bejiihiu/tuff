@@ -30,6 +30,7 @@ class EngineAutoScaleTest {
             .autoWorkers(1, 12, millis(50L))
             .metrics(new ComputeSettings.Metrics(true, false, Duration.ofSeconds(10), false, millis(20L)))
             .grace(Duration.ofSeconds(1))
+            .noVirtualLane()
             .build();
         final AsyncComputeScheduler compute = new AsyncComputeSchedulerImpl(engine(configuration, new EngineTestSupport.FakeClock()));
         final CountDownLatch release = new CountDownLatch(1);

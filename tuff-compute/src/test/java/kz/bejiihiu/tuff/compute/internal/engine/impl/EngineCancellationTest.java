@@ -29,7 +29,7 @@ class EngineCancellationTest {
         final CountDownLatch release = new CountDownLatch(1);
         final AtomicBoolean victimRan = new AtomicBoolean();
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).build(),
+            settings().fixedWorkers(1).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -72,7 +72,7 @@ class EngineCancellationTest {
         final CountDownLatch release = new CountDownLatch(1);
         final AtomicBoolean bodyFinished = new AtomicBoolean();
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).build(),
+            settings().fixedWorkers(1).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -107,7 +107,7 @@ class EngineCancellationTest {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).build(),
+            settings().fixedWorkers(1).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -135,7 +135,7 @@ class EngineCancellationTest {
     @Test
     void completedTaskCannotBeCancelled() throws Exception {
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(2).build(),
+            settings().fixedWorkers(2).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {

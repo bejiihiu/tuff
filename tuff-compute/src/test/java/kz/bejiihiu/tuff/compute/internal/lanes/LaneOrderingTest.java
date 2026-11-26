@@ -21,6 +21,7 @@ import static kz.bejiihiu.tuff.compute.internal.lanes.LaneTestSupport.NEVER;
 import static kz.bejiihiu.tuff.compute.internal.lanes.LaneTestSupport.SettingsBuilder;
 import static kz.bejiihiu.tuff.compute.internal.lanes.LaneTestSupport.absolute;
 import static kz.bejiihiu.tuff.compute.internal.lanes.LaneTestSupport.assertEventually;
+import static kz.bejiihiu.tuff.compute.internal.lanes.LaneTestSupport.awaitUntil;
 import static kz.bejiihiu.tuff.compute.internal.lanes.LaneTestSupport.millis;
 import static kz.bejiihiu.tuff.compute.internal.lanes.LaneTestSupport.start;
 import static kz.bejiihiu.tuff.compute.internal.lanes.LaneTestSupport.weighted;
@@ -190,6 +191,11 @@ class LaneOrderingTest {
             for (final CompletableFuture<String> future : futures) {
                 assertNotNull(future.get(20L, TimeUnit.SECONDS));
             }
+            awaitUntil("both consumers accounted every completed task", Duration.ofSeconds(10), () -> {
+                final ConsumerMetrics lightSample = compute.metrics().consumer("light").orElseThrow();
+                final ConsumerMetrics heavySample = compute.metrics().consumer("heavy").orElseThrow();
+                return lightSample.completedTasks() == perConsumer && heavySample.completedTasks() == perConsumer;
+            });
             final ConsumerMetrics light = compute.metrics().consumer("light").orElseThrow();
             final ConsumerMetrics heavy = compute.metrics().consumer("heavy").orElseThrow();
             assertEquals(perConsumer, light.completedTasks());

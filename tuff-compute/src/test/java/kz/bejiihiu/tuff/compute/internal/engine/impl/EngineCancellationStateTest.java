@@ -41,7 +41,7 @@ class EngineCancellationStateTest {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).build(),
+            settings().fixedWorkers(1).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -68,7 +68,7 @@ class EngineCancellationStateTest {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).build(),
+            settings().fixedWorkers(1).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -95,7 +95,7 @@ class EngineCancellationStateTest {
         final CountDownLatch release = new CountDownLatch(1);
         final AtomicBoolean bodyFinished = new AtomicBoolean();
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).build(),
+            settings().fixedWorkers(1).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -165,7 +165,7 @@ class EngineCancellationStateTest {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).capacity(100).build(),
+            settings().fixedWorkers(1).capacity(100).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {
@@ -203,7 +203,7 @@ class EngineCancellationStateTest {
     void shutdownCancelledQueueIsVisibleAsCancelled() throws Exception {
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
-        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(1).grace(millis(10L));
+        final EngineTestSupport.SettingsBuilder builder = settings().fixedWorkers(1).grace(millis(10L)).noVirtualLane();
         final AsyncComputeScheduler compute = startedScheduler(builder.build(), new EngineTestSupport.FakeClock());
         try {
             final CompletableFuture<String> blocker = compute.submit(() -> {

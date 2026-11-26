@@ -21,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.assertEventually;
+import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.awaitUntil;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.settings;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.startedScheduler;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -93,21 +94,12 @@ class EngineStressTest {
             assertTrue(rejected.get() > 0, "the small queue must have produced rejections");
             assertTrue(cancels.get() > 0, "the workload must have produced cancellations");
 
-            final long settleDeadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-            SchedulerMetrics last = compute.metrics();
-            boolean settled = false;
-            while (!settled && System.nanoTime() < settleDeadline) {
-                last = compute.metrics();
-                settled = last.submittedTasks() == last.completedTasks() + last.failedTasks()
-                    + last.cancelledTasks() + last.queuedTasks() + last.activeWorkers();
-                if (!settled) {
-                    Thread.sleep(1L);
-                }
-            }
-            assertTrue(settled, "counters must settle: submitted=" + last.submittedTasks()
-                + " completed=" + last.completedTasks() + " failed=" + last.failedTasks()
-                + " cancelled=" + last.cancelledTasks() + " queued=" + last.queuedTasks()
-                + " active=" + last.activeWorkers() + " rejected=" + last.rejectedTasks());
+            awaitUntil("the counters settle to submitted == terminal + queued + active",
+                Duration.ofSeconds(30), () -> {
+                    final SchedulerMetrics sample = compute.metrics();
+                    return sample.submittedTasks() == sample.completedTasks() + sample.failedTasks()
+                        + sample.cancelledTasks() + sample.queuedTasks() + sample.activeWorkers();
+                });
             final SchedulerMetrics metrics = compute.metrics();
             assertEquals(TASKS, metrics.submittedTasks());
             assertTrue(metrics.completedTasks() > TASKS / 2L, "most tasks must actually complete");

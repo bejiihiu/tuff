@@ -1,6 +1,7 @@
 package kz.bejiihiu.tuff.compute.internal.engine.impl;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
@@ -10,6 +11,7 @@ import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.awaitUntil;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.settings;
 import static kz.bejiihiu.tuff.compute.internal.engine.impl.EngineTestSupport.startedScheduler;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -39,6 +41,8 @@ class EngineFailureTest {
 
             final CompletableFuture<String> next = compute.submit(() -> "still alive");
             assertEquals("still alive", next.get(10L, TimeUnit.SECONDS));
+            awaitUntil("the failure and the following success are accounted", Duration.ofSeconds(10), () ->
+                compute.metrics().failedTasks() == 1L && compute.metrics().completedTasks() == 1L);
             assertEquals(1L, compute.metrics().failedTasks());
             assertEquals(1L, compute.metrics().completedTasks());
         } finally {
@@ -59,6 +63,8 @@ class EngineFailureTest {
             final CompletionException wrapped = assertThrows(CompletionException.class, failed::join);
             assertInstanceOf(AssertionError.class, wrapped.getCause());
             assertEquals("ok", compute.submit(() -> "ok").get(10L, TimeUnit.SECONDS));
+            awaitUntil("the error is counted as a failure", Duration.ofSeconds(10),
+                () -> compute.metrics().failedTasks() == 1L);
             assertEquals(1L, compute.metrics().failedTasks());
         } finally {
             compute.shutdown();
@@ -75,6 +81,8 @@ class EngineFailureTest {
             final CompletableFuture<Object> failed = compute.submit(() -> null);
             final CompletionException wrapped = assertThrows(CompletionException.class, failed::join);
             assertInstanceOf(NullPointerException.class, wrapped.getCause());
+            awaitUntil("the null result is counted as a failure", Duration.ofSeconds(10),
+                () -> compute.metrics().failedTasks() == 1L);
             assertEquals(1L, compute.metrics().failedTasks());
             assertEquals("fine", compute.submit(() -> "fine").get(10L, TimeUnit.SECONDS));
         } finally {

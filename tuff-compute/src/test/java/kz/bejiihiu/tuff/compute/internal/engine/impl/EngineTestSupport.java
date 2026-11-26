@@ -79,6 +79,22 @@ final class EngineTestSupport {
     }
 
     static void assertEventually(final String what, final Duration timeout, final BooleanSupplier condition) {
+        awaitUntil(what, timeout, condition);
+    }
+
+    /**
+     * Polls until the condition holds, failing with a readable message after the timeout.
+     *
+     * <p>A task future is published before the engine emits the terminal metrics event, so a counter
+     * read right after {@code get()}/{@code join()} can still be one event behind. Wait through this
+     * helper instead of reading the counter immediately.
+     *
+     * @param what      what is being waited for, used in the failure message
+     * @param timeout   maximum wait
+     * @param condition condition to wait for
+     * @throws AssertionError if the condition is still false when the timeout expires
+     */
+    static void awaitUntil(final String what, final Duration timeout, final BooleanSupplier condition) {
         final long deadline = System.nanoTime() + timeout.toNanos();
         while (System.nanoTime() < deadline) {
             if (condition.getAsBoolean()) {
@@ -89,7 +105,7 @@ final class EngineTestSupport {
         if (condition.getAsBoolean()) {
             return;
         }
-        throw new AssertionError("timed out waiting for: " + what);
+        throw new AssertionError("timed out after " + timeout + " waiting for: " + what);
     }
 
     static void sleep(final long millis) {

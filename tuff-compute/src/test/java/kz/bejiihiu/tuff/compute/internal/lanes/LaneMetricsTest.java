@@ -44,7 +44,9 @@ class LaneMetricsTest {
             SettingsBuilder.of("metrics-mixed")
                 .fixedWorkers(1)
                 .virtualLane(true, true, 2, Duration.ZERO, 1));
-        compute.registerConsumer(ComputeConsumer.of("low", absolute(4)));
+        // one low permit keeps the cancelled task below queued: with a free lane slot the pump could
+        // claim it before cancel() runs, and "cancelled while queued" would be a coin flip
+        compute.registerConsumer(ComputeConsumer.of("low", absolute(1)));
         compute.registerConsumer(ComputeConsumer.of("normal-block", absolute(1)));
         compute.registerConsumer(ComputeConsumer.of("normal-spill", absolute(1)));
         final CountDownLatch normalStarted = new CountDownLatch(1);
@@ -117,9 +119,7 @@ class LaneMetricsTest {
             assertLaneInvariant(metrics);
             assertConsumerInvariant(metrics);
 
-            assertEventually("the scheduler drains", NEVER, () -> compute.metrics().queuedTasks() == 0);
-            assertSettled(compute);
-            final SchedulerMetrics settled = compute.metrics();
+            final SchedulerMetrics settled = assertSettled(compute);
             assertEquals(5L, settled.submittedTasks());
             assertEquals(3L, settled.completedTasks());
             assertEquals(1L, settled.failedTasks());
