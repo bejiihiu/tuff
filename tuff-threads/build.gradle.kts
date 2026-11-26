@@ -22,6 +22,18 @@ java {
 
 tasks.withType<Test>().configureEach {
     useJUnitPlatform()
+
+    // the raw thread guard test reads sources of sibling modules, which gradle cannot infer from the
+    // classpath. without these inputs a change in compute/api/server leaves this task up to date and
+    // the guard silently skips. it's a cheap file scan over a few hundred sources.
+    inputs.dir(rootProject.file("tuff-compute/src/main/java"))
+        .withPropertyName("guardSources.compute")
+    inputs.dir(rootProject.file("tuff-api/src/main/java"))
+        .withPropertyName("guardSources.api")
+    inputs.dir(rootProject.file("tuff-server/src/main/java/kz/bejiihiu/tuff"))
+        .withPropertyName("guardSources.server")
+    inputs.dir(project.file("src/main/java"))
+        .withPropertyName("guardSources.threads")
 }
 
 tasks.jar {
