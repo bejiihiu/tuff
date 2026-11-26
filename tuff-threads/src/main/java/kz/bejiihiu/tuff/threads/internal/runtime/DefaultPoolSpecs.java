@@ -19,8 +19,9 @@ import kz.bejiihiu.tuff.threads.internal.impl.budget.BudgetDeductions;
  *
  * <p>Compute is the exception that stays visible but shallow: this runtime cannot own the engine's
  * queue or its threads, so {@code compute} and {@code compute-virtual} are always registered at
- * {@link CoverageLevel#L1}. Turning {@code async-compute.managed} on without the compute adapter is a
- * configuration the runtime cannot honour, and it is reported as such instead of being pretended away.
+ * {@link CoverageLevel#L1} here. The compute adapter re-registers them at L4 once the engine hands
+ * its threads over; until that happens a configuration that asks for compute management is reported
+ * as such instead of being pretended away.
  *
  * <p>Budgets are declared honestly. A pool the manager does not manage declares a zero core budget, so
  * the shared remainder is not silently split between pools that cannot use it yet; a pool that does

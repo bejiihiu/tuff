@@ -15,6 +15,7 @@ import kz.bejiihiu.tuff.compute.config.ConfigDiff;
 import kz.bejiihiu.tuff.compute.config.ConfigLoadResult;
 import kz.bejiihiu.tuff.compute.config.TuffComputeConfig;
 import kz.bejiihiu.tuff.compute.internal.engine.impl.ComputeSchedulers;
+import kz.bejiihiu.tuff.compute.internal.spi.ComputeBudgetPort;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
 import kz.bejiihiu.tuff.threads.bootstrap.ThreadsBootstrap;
 import org.apache.logging.log4j.LogManager;
@@ -62,6 +63,7 @@ public final class ComputeBootstrap {
 
     private static volatile ComputeStatus status = ComputeStatus.notInitialised();
     private static volatile @Nullable TuffComputeConfig config;
+    private static volatile @Nullable ComputeUtmiAdapter computeAdapter;
     private static volatile List<String> lastAppliedConsumers = List.of();
     private static volatile List<String> lastDeferredConsumers = List.of();
 
@@ -112,12 +114,18 @@ public final class ComputeBootstrap {
      * that point the region scheduler is not running and its thread count is not final. A no-op when
      * the engine is not running, when the configured pool size is fixed, or when the thread counts
      * cannot be read.
+     *
+     * <p>When the thread layer manages the pool it is the only budget source: the number comes from
+     * {@link ComputeUtmiAdapter#processors()} and {@code ComputeThreadBudget} is not called at all, so
+     * the reserve is subtracted once, in the controller.
      */
     public static void applyRegionBudget() {
         final @Nullable AsyncComputeScheduler scheduler = status.engine().orElse(null);
         if (scheduler == null) {
             return;
         }
+        final @Nullable ComputeUtmiAdapter adapter = computeAdapter;
+        final @Nullable ComputeBudgetPort managed = adapter != null && adapter.isManaged() ? adapter : null;
         final int cores = Runtime.getRuntime().availableProcessors();
         final int regionThreads;
         final int chunkThreads;
@@ -131,19 +139,66 @@ public final class ComputeBootstrap {
             LOGGER.warn("Could not read the server thread counts; the compute pool keeps its startup size", ex);
             return;
         }
-        final int budget = ComputeThreadBudget.resolve(cores, regionThreads, chunkThreads, ioThreads);
+        final int budget = liveBudget(managed, cores, regionThreads, chunkThreads, ioThreads);
         if (!scheduler.settings().workers().automaticThreadCount()) {
             LOGGER.info("Tuff compute: fixed worker count {}, the server processor budget of {} is not applied",
                 scheduler.settings().workers().threads(), budget);
             return;
         }
-        LOGGER.info("Tuff compute: processor budget {} of {} ({} region, {} chunk, {} IO threads)",
-            budget, cores, regionThreads, chunkThreads, ioThreads);
+        if (managed != null) {
+            LOGGER.info("Tuff compute: processor budget {} of {} (source {}, ledger {})",
+                budget, cores, managed.source(), adapter.budgetLedger());
+        } else {
+            LOGGER.info("Tuff compute: processor budget {} of {} ({} region, {} chunk, {} IO threads, source legacy)",
+                budget, cores, regionThreads, chunkThreads, ioThreads);
+        }
         try {
             scheduler.applyProcessorBudget(budget);
         } catch (final Throwable ex) {
             LOGGER.warn("Could not apply the processor budget to the compute engine", ex);
         }
+    }
+
+    /**
+     * Resolves the budget the live pool should adopt by asking exactly one source.
+     *
+     * <p>The managed port already returns a number net of region, chunk, IO and the reserve. The
+     * legacy formula subtracts those itself. Reading both - or subtracting the live counts from the
+     * port's answer - is the double subtraction that collapsed the pool to one worker, so this method
+     * is the only place the choice is made.
+     *
+     * @param managed     thread layer budget port, or {@code null} when the engine owns its budget
+     * @param cores       processors reported by the JVM
+     * @param region      live region tick threads
+     * @param chunk       live chunk worker threads
+     * @param io          live chunk IO threads
+     * @return the processor budget, always at least {@code 1}
+     */
+    static int liveBudget(
+        final @Nullable ComputeBudgetPort managed,
+        final int cores,
+        final int region,
+        final int chunk,
+        final int io
+    ) {
+        if (managed != null) {
+            return managed.processors();
+        }
+        return ComputeThreadBudget.resolve(cores, region, chunk, io);
+    }
+
+    /**
+     * Resolves the budget the engine starts with.
+     *
+     * <p>Same single source rule as {@link #liveBudget}: with a managed port the legacy formula is not
+     * evaluated at all, not even as a fallback.
+     *
+     * @param managed thread layer budget port, or {@code null} when the engine owns its budget
+     * @param cores   processors reported by the JVM
+     * @return the processor budget, always at least {@code 1}
+     */
+    static int startupBudget(final @Nullable ComputeBudgetPort managed, final int cores) {
+        return managed == null ? ComputeThreadBudget.resolve(cores) : managed.processors();
     }
 
     /**
@@ -175,6 +230,7 @@ public final class ComputeBootstrap {
         final ComputeStatus previous = status;
         final @Nullable AsyncComputeScheduler scheduler = previous.engine().orElse(null);
         status = ComputeStatus.notInitialised();
+        computeAdapter = null;
         final TuffComputeConfig loaded = config;
         if (loaded != null) {
             loaded.setApplyTarget(null);
@@ -261,19 +317,34 @@ public final class ComputeBootstrap {
     }
 
     private static void startEngine(final ComputeSettings settings) {
-        final int budget = ComputeThreadBudget.resolve(Runtime.getRuntime().availableProcessors());
+        // the adapter registers the compute pools before the engine spawns its first worker; when the
+        // thread layer is off (or refuses), it is null and nothing about the engine changes
+        final @Nullable ComputeUtmiAdapter adapter = ThreadsBootstrap.computeAdapter(settings);
+        computeAdapter = adapter;
+        final @Nullable ComputeBudgetPort managed = adapter != null && adapter.isManaged() ? adapter : null;
+        final int budget = startupBudget(managed, Runtime.getRuntime().availableProcessors());
         final ComputeSettings.Workers workers = settings.workers();
         final int resolved = workers.resolveThreadCount(budget);
+        final String source = managed == null ? "legacy" : managed.source();
         @Nullable AsyncComputeScheduler scheduler = null;
         try {
-            scheduler = ComputeSchedulers.create(settings, ComputeClock.system(), budget);
+            scheduler = managed == null
+                ? ComputeSchedulers.create(settings, ComputeClock.system(), budget)
+                // a fixed port with the same number the log prints: the engine configures itself from
+                // that value and never asks the controller a second time during start
+                : ComputeSchedulers.create(
+                    settings, ComputeClock.system(), ComputeBudgetPort.fixed(budget, source), adapter
+                );
             scheduler.start();
+            if (adapter != null) {
+                adapter.bind(scheduler);
+            }
             final LimitedConsumerScheduler guarded = LimitedConsumerScheduler.wrap(scheduler);
             TuffCompute.install(guarded);
             status = ComputeStatus.running(guarded);
             final String requested = workers.automaticThreadCount() ? "auto" : Integer.toString(workers.threads());
-            LOGGER.info("Tuff compute enabled: {} worker(s) (requested {}, processor budget {}), queue capacity {}, scheduling {}",
-                resolved, requested, budget, settings.queue().capacity(), settings.scheduling().strategy());
+            LOGGER.info("Tuff compute enabled: {} worker(s) (requested {}, processor budget {}, source {}), queue capacity {}, scheduling {}",
+                resolved, requested, budget, source, settings.queue().capacity(), settings.scheduling().strategy());
             if (settings.consumers().allowDynamicRegistration()) {
                 LOGGER.info("Tuff compute: consumer ids registered on demand are capped at {} (configured ids are not counted)",
                     LimitedConsumerScheduler.MAX_DYNAMIC_CONSUMERS);

@@ -87,8 +87,22 @@ public record ThreadManagementSettings(
      */
     public boolean anyManagementEnabled() {
         return this.regionExecution.managed()
-            || this.asyncCompute.managed()
+            || this.computeManaged()
             || this.executionPools.anyManaged();
+    }
+
+    /**
+     * Checks whether the compute engine's capacity is managed by the thread layer.
+     *
+     * <p>Two keys describe one switch: {@code execution-pools.compute.managed} is the place a compute
+     * pool belongs and {@code async-compute.managed} is the older spelling kept so existing files keep
+     * working. Either turns it on, and reading both here is what keeps the answer single valued - a
+     * caller never has to know which key the operator used.
+     *
+     * @return {@code true} when the compute adapter may take the engine's threads and budget
+     */
+    public boolean computeManaged() {
+        return this.executionPools.compute().managed() || this.asyncCompute.managed();
     }
 
     /**
@@ -250,8 +264,9 @@ public record ThreadManagementSettings(
      * {@code async-compute} section; this record does not duplicate them.
      *
      * @param managed    whether the compute pool is registered as managed capacity; the compute
-     *                   adapter is what would deliver it, so without one the configuration is reported
-     *                   as {@link DegradedReason#CONFIG_CONFLICT} instead of applied
+     *                   adapter is what delivers it, so without one the configuration is reported
+     *                   as {@link DegradedReason#CONFIG_CONFLICT} instead of applied. The same switch
+     *                   lives at {@code execution-pools.compute.managed}; either key turns it on
      * @param maxThreads explicit ceiling, or {@code -1} to keep the engine's own configured maximum
      */
     public record AsyncCompute(boolean managed, int maxThreads) {
@@ -278,12 +293,16 @@ public record ThreadManagementSettings(
     }
 
     /**
-     * Treatment of the specialised pools that are not region execution or compute.
+     * Treatment of the execution pools that are not region execution.
+     *
+     * <p>Network, chunk system and compute each keep their own threads, queue and lifecycle; this is
+     * where the configuration says how deeply the thread layer is allowed to see or influence them.
      *
      * @param network     network event loop pools
      * @param chunkSystem chunk generation and chunk IO pools
+     * @param compute     platform workers and the virtual lane of the compute engine
      */
-    public record Pools(PoolSettings network, PoolSettings chunkSystem) {
+    public record Pools(PoolSettings network, PoolSettings chunkSystem, PoolSettings compute) {
 
         /**
          * Validates the pool settings.
@@ -293,24 +312,36 @@ public record ThreadManagementSettings(
         public Pools {
             Objects.requireNonNull(network, "network");
             Objects.requireNonNull(chunkSystem, "chunkSystem");
+            Objects.requireNonNull(compute, "compute");
+        }
+
+        /**
+         * Creates the pool settings of a configuration that predates the compute section.
+         *
+         * @param network     network event loop pools
+         * @param chunkSystem chunk generation and chunk IO pools
+         * @throws NullPointerException if a section is {@code null}
+         */
+        public Pools(final PoolSettings network, final PoolSettings chunkSystem) {
+            this(network, chunkSystem, PoolSettings.defaults());
         }
 
         /**
          * Returns the default settings for the specialised pools.
          *
-         * @return both pools observed but not managed
+         * @return every pool observed but not managed
          */
         public static Pools defaults() {
-            return new Pools(PoolSettings.defaults(), PoolSettings.defaults());
+            return new Pools(PoolSettings.defaults(), PoolSettings.defaults(), PoolSettings.defaults());
         }
 
         /**
          * Checks whether any specialised pool is managed.
          *
-         * @return {@code true} if network or chunk system capacity is managed
+         * @return {@code true} if network, chunk system or compute capacity is managed
          */
         public boolean anyManaged() {
-            return this.network.managed() || this.chunkSystem.managed();
+            return this.network.managed() || this.chunkSystem.managed() || this.compute.managed();
         }
     }
 

@@ -5,7 +5,10 @@ import java.time.Duration;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Set;
+import kz.bejiihiu.tuff.compute.ComputeSettings;
+import kz.bejiihiu.tuff.compute.bootstrap.ComputeUtmiAdapter;
 import kz.bejiihiu.tuff.compute.config.ConfigProblem;
 import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
@@ -63,6 +66,7 @@ public final class ThreadsBootstrap {
     private final Object lock = new Object();
     private volatile ThreadsStatus status = ThreadsStatus.notInitialised();
     private volatile @Nullable ThreadManagerRuntime runtime;
+    private volatile @Nullable ComputeUtmiAdapter computeAdapter;
     private boolean started;
 
     /**
@@ -160,6 +164,7 @@ public final class ThreadsBootstrap {
             final ThreadManagerRuntime current = this.runtime;
             final ThreadsStatus previous = this.status;
             this.runtime = null;
+            this.computeAdapter = null;
             this.status = ThreadsStatus.notInitialised();
             if (current == null) {
                 // one line even when there is nothing to stop, otherwise an operator cannot tell the hook
@@ -182,6 +187,25 @@ public final class ThreadsBootstrap {
                 LOGGER.error("Failed to stop the Tuff thread layer", ex);
             }
         }
+    }
+
+    /**
+     * Returns the compute adapter of the running thread layer, building it on first use.
+     *
+     * <p>The compute bootstrap asks this before it creates the engine: the adapter registers the
+     * compute pools at their configured coverage and is what the engine then uses as its thread and
+     * budget port. A thread layer that is disabled, failed or already stopped answers {@code null},
+     * which is the signal for "keep the engine's own threads and budget".
+     *
+     * <p>Building the adapter is wrapped, because a broken registration must not take the engine down:
+     * the answer is then {@code null} and the engine runs exactly as it did before.
+     *
+     * @param settings compute configuration the engine is about to run with
+     * @return the adapter, or {@code null} when the thread layer cannot serve the engine
+     * @throws NullPointerException if {@code settings} is {@code null}
+     */
+    public static @Nullable ComputeUtmiAdapter computeAdapter(final ComputeSettings settings) {
+        return SERVER.adapterFor(settings);
     }
 
     /**
@@ -248,6 +272,35 @@ public final class ThreadsBootstrap {
     boolean regionPoolRegistered() {
         final ThreadManagerRuntime current = this.runtime;
         return current != null && current.manager().pools().contains(PoolId.REGION_EXECUTION);
+    }
+
+    /**
+     * Builds (or returns) the compute adapter of the running runtime.
+     *
+     * @param settings compute configuration the engine is about to run with
+     * @return the adapter, or {@code null} when there is no running runtime or it refused the pools
+     * @throws NullPointerException if {@code settings} is {@code null}
+     */
+    @Nullable ComputeUtmiAdapter adapterFor(final ComputeSettings settings) {
+        Objects.requireNonNull(settings, "settings");
+        synchronized (this.lock) {
+            final @Nullable ComputeUtmiAdapter existing = this.computeAdapter;
+            if (existing != null) {
+                return existing;
+            }
+            final ThreadManagerRuntime current = this.runtime;
+            if (current == null) {
+                return null;
+            }
+            try {
+                final ComputeUtmiAdapter created = ComputeUtmiAdapter.attach(current, settings);
+                this.computeAdapter = created;
+                return created;
+            } catch (final Throwable ex) {
+                LOGGER.error("Tuff compute cannot use the thread layer; the engine keeps its own threads and budget", ex);
+                return null;
+            }
+        }
     }
 
     private static void shutdownQuietly(final ThreadManagerRuntime runtime) {

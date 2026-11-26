@@ -60,6 +60,9 @@ class ThreadsConfigParserTest {
                 chunk-system:
                   managed: true
                   preserve-specialization: true
+                compute:
+                  managed: true
+                  preserve-specialization: true
               metrics:
                 enabled: false
                 per-pool: false
@@ -81,12 +84,44 @@ class ThreadsConfigParserTest {
         assertEquals(
             new ThreadManagementSettings.Pools(
                 new ThreadManagementSettings.PoolSettings(true, true),
+                new ThreadManagementSettings.PoolSettings(true, true),
                 new ThreadManagementSettings.PoolSettings(true, true)
             ),
             settings.executionPools()
         );
         assertEquals(new ThreadManagementSettings.Metrics(false, false, false), settings.metrics());
         assertTrue(settings.anyManagementEnabled());
+        assertTrue(settings.computeManaged());
+    }
+
+    @Test
+    void theComputePoolKeyIsTheSameSwitchAsTheAsyncComputeAlias() {
+        final Parsed poolKey = parse("""
+            thread-management:
+              execution-pools:
+                compute:
+                  managed: true
+            """);
+        assertTrue(poolKey.problems().isEmpty(), () -> "unexpected problems: " + poolKey.problems());
+        assertTrue(poolKey.settings().computeManaged());
+        assertFalse(poolKey.settings().asyncCompute().managed());
+        assertTrue(poolKey.settings().anyManagementEnabled());
+
+        final Parsed alias = parse("""
+            thread-management:
+              async-compute:
+                managed: true
+            """);
+        assertTrue(alias.settings().computeManaged(), "the older key must keep working");
+        assertFalse(alias.settings().executionPools().compute().managed());
+        assertTrue(alias.settings().anyManagementEnabled());
+
+        final Parsed neither = parse("""
+            thread-management:
+              enabled: true
+            """);
+        assertFalse(neither.settings().computeManaged());
+        assertFalse(neither.settings().anyManagementEnabled());
     }
 
     @Test
@@ -162,11 +197,12 @@ class ThreadsConfigParserTest {
     void flattenCoversEveryKeyOfTheSection() throws IOException, InvalidConfigurationException {
         final Map<String, String> flat = ThreadsConfigParser.flatten(parse(template()).settings());
 
-        assertEquals(21, flat.size(), () -> "unexpected key count: " + flat.keySet());
+        assertEquals(23, flat.size(), () -> "unexpected key count: " + flat.keySet());
         assertEquals("true", flat.get("thread-management.enabled"));
         assertEquals("edf", flat.get("thread-management.region-execution.scheduler"));
         assertEquals("-1", flat.get("thread-management.region-execution.threads"));
         assertEquals("true", flat.get("thread-management.execution-pools.network.preserve-specialization"));
+        assertEquals("false", flat.get("thread-management.execution-pools.compute.managed"));
     }
 
     private static YamlConfiguration template() throws IOException, InvalidConfigurationException {

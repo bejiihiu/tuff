@@ -65,8 +65,9 @@ thread-management:
     kairos-unstable: false
 
   async-compute:
-    # Let the thread layer own the compute engine's platform pool capacity. Off keeps the engine's
-    # own sizing and its own queue; the engine is observed at L1 either way. Needs a restart.
+    # Older spelling of execution-pools.compute.managed below: both keys describe one switch and
+    # either one turns compute management on. Prefer the execution-pools key. Off keeps the engine's
+    # own sizing and its own queue; the engine is observed either way. Needs a restart.
     managed: false
     # Ceiling for that pool, or -1 to keep the engine's configured maximum.
     max-threads: -1
@@ -83,6 +84,13 @@ thread-management:
       # Influence the chunk generation and chunk IO pools. Off observes them only.
       managed: false
       # Must stay true, for the same reason as above.
+      preserve-specialization: true
+    compute:
+      # managed = the compute engine takes its worker threads and its processor budget from this
+      # thread layer instead of creating both itself. Off keeps the engine's own factory and its own
+      # budget arithmetic; the pool is observed either way. Needs a restart.
+      managed: false
+      # Must stay true. Compute workers are never merged with region, chunk or network threads.
       preserve-specialization: true
 
   metrics:
