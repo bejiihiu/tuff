@@ -9,7 +9,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
-import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
@@ -33,9 +32,10 @@ import org.jspecify.annotations.Nullable;
  * <p>The consumer runs on the owning region thread, so it may safely mutate blocks, entities and
  * inventories that belong to that region. The failure handler runs on the owning region thread
  * when the target can still accept work. If the plugin is disabled or the target scheduler cannot
- * take the task, it runs on the thread that completed the future; if the entity retired, it runs
- * inside the entity scheduler's retired callback. In those cases it must not touch world state and
- * should only log or release plugin owned resources.
+ * take the task, it runs on the thread that completed the future. If the entity retired, it runs
+ * inside the entity scheduler's retired callback, or on the completing thread when the scheduler
+ * reports the retirement before the handoff even schedules. In those cases it must not touch world
+ * state and should only log or release plugin owned resources.
  *
  * <p>Delivery rules:
  *
@@ -44,17 +44,22 @@ import org.jspecify.annotations.Nullable;
  *       error, and it is never reported to the failure handler.</li>
  *   <li>A failed compute task delivers the original throwable to the failure handler on the target
  *       context when possible.</li>
- *   <li>If the entity is removed before the result arrives, the entity scheduler reports the
- *       retired state and the failure handler receives a {@link HandoffException} with
- *       {@link HandoffException.Reason#ENTITY_RETIRED}. That callback runs inside the entity
- *       scheduler's retired path, which is critical region code: it must not load chunks, remove
- *       entities or mutate world state, only log or release plugin owned resources.</li>
+ *   <li>If the entity is removed before the result arrives, the failure handler receives a
+ *       {@link HandoffException} with {@link HandoffException.Reason#ENTITY_RETIRED}. The entity
+ *       scheduler invokes that callback inside its retired path, which is critical region code. If
+ *       the scheduler already reports the retired state when the result is handed over, the
+ *       callback runs on the thread that completed the future instead. In both cases it must not
+ *       load chunks, remove entities or mutate world state, only log or release plugin owned
+ *       resources.</li>
  *   <li>If the plugin is disabled before the result can be scheduled, the failure handler receives
  *       {@link HandoffException.Reason#PLUGIN_DISABLED}. A task that was already scheduled and is
  *       then cancelled by Bukkit because the plugin got disabled is dropped silently, because the
  *       server does not invoke any callback for that case.</li>
  *   <li>If the target region or world is gone, the server discards the scheduled task. This is a
  *       silent skip by design; no result can be applied to a world that no longer exists.</li>
+ *   <li>A future that completes with a {@code null} value violates the compute contract; it is
+ *       reported to the failure handler as a {@link NullPointerException} instead of being applied
+ *       to the world.</li>
  * </ul>
  *
  * <p>Every call delivers at most once and never blocks or joins the future. Do not hand the same
@@ -64,7 +69,28 @@ public final class ComputeHandoff {
 
     private static final System.Logger LOGGER = System.getLogger("TuffCompute");
 
+    private static volatile HandoffBackend backend = HandoffBackend.bukkit();
+
     private ComputeHandoff() {
+    }
+
+    /**
+     * Replaces the scheduler seam. Package private on purpose: this is a test hook, not part of the
+     * plugin contract, and plugins must never call it.
+     *
+     * @param replacement backend the delivery paths should use
+     * @throws NullPointerException if {@code replacement} is {@code null}
+     */
+    static void useBackend(final HandoffBackend replacement) {
+        backend = Objects.requireNonNull(replacement, "replacement");
+    }
+
+    /**
+     * Restores the production seam after a test replaced it. Package private on purpose, see
+     * {@link #useBackend(HandoffBackend)}.
+     */
+    static void resetBackend() {
+        backend = HandoffBackend.bukkit();
     }
 
     /**
@@ -168,9 +194,10 @@ public final class ComputeHandoff {
     ) {
         Objects.requireNonNull(plugin, "plugin");
         Objects.requireNonNull(world, "world");
+        final HandoffBackend target = backend;
         handoff(result, apply, onFailure, (action, failure, originalFailure) -> {
             try {
-                Bukkit.getRegionScheduler().run(plugin, world, chunkX, chunkZ, task -> action.run());
+                target.scheduleInRegion(plugin, world, chunkX, chunkZ, action);
             } catch (final IllegalPluginAccessException disabled) {
                 report(failure, new HandoffException(
                     HandoffException.Reason.PLUGIN_DISABLED,
@@ -231,13 +258,14 @@ public final class ComputeHandoff {
     ) {
         Objects.requireNonNull(plugin, "plugin");
         Objects.requireNonNull(entity, "entity");
+        final HandoffBackend target = backend;
         handoff(result, apply, onFailure, (action, failure, originalFailure) -> {
             final Runnable retired = () -> report(failure, new HandoffException(
                 HandoffException.Reason.ENTITY_RETIRED,
                 "The entity was removed before the compute result could be applied"
             ), originalFailure);
             try {
-                final @Nullable ScheduledTask scheduled = entity.getScheduler().run(plugin, task -> action.run(), retired);
+                final @Nullable ScheduledTask scheduled = target.scheduleOnEntity(plugin, entity, action, retired);
                 if (scheduled == null) {
                     retired.run();
                 }
@@ -294,9 +322,10 @@ public final class ComputeHandoff {
         final Consumer<? super Throwable> onFailure
     ) {
         Objects.requireNonNull(plugin, "plugin");
+        final HandoffBackend target = backend;
         handoff(result, apply, onFailure, (action, failure, originalFailure) -> {
             try {
-                Bukkit.getGlobalRegionScheduler().run(plugin, task -> action.run());
+                target.scheduleInGlobal(plugin, action);
             } catch (final IllegalPluginAccessException disabled) {
                 report(failure, new HandoffException(
                     HandoffException.Reason.PLUGIN_DISABLED,
