@@ -114,3 +114,9 @@ See [Operations § Command](operations.md#command) for output details and JFR li
 - [Updating from upstream](../upstream.md) — merging Folia, rebuilding the patch stack, and the build,
   test and smoke checks that gate a merge. Not specific to the compute module, but every merge has to
   keep the engine hooks alive.
+
+## See also
+
+The engine's threads are one of the pools the unified thread layer observes. That layer keeps a registry
+and a CPU budget ledger over every pool while Folia and this engine keep their own scheduling:
+[thread management](../utmi/README.md).

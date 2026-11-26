@@ -88,6 +88,16 @@ the engine state and controls its JFR recording. The chunk system keeps its own 
 see [why](docs/compute/chunk-system.md). Start with [`docs/compute/`](docs/compute/README.md) and the
 server presets in [`tuning.md`](docs/compute/tuning.md).
 
+## Thread management (UTMI)
+
+Tuff also has a unified thread layer: one registry of every execution pool, one CPU budget ledger, a
+central thread factory and one metrics view over the threads the server already runs. It is observe-only
+by default and does not change how Folia ticks regions or how the compute engine orders tasks. The
+`/tuff threads` command lists the registered pools with their coverage level and the reason a pool is not
+managed yet; the configuration is the `thread-management` section of `config/tuff.yml`. Start with
+[`docs/utmi/`](docs/utmi/README.md): [architecture](docs/utmi/architecture.md),
+[configuration](docs/utmi/configuration.md), [observability](docs/utmi/observability.md).
+
 ## Region threading (the Folia part)
 
 Folia groups nearby loaded chunks into an "independent region". See
