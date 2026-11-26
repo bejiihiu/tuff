@@ -27,6 +27,8 @@ class EngineAdaptiveTest {
         final ComputeSettings configuration = settings()
             .autoWorkers(1, 8, Duration.ofSeconds(30))
             .adaptive(new ComputeSettings.Adaptive(true, 1, 8, millis(100L), 5, 0.5d, 0.5d, 0.9d))
+            // without the lane the capacity is the platform count, which is what the controller moves
+            .noVirtualLane()
             .build();
         final ComputeEngineImpl compute = engine(configuration, clock);
         compute.start();
@@ -58,6 +60,7 @@ class EngineAdaptiveTest {
         final ComputeSettings configuration = settings()
             .fixedWorkers(4)
             .adaptive(new ComputeSettings.Adaptive(true, 1, 8, millis(100L), 5, 0.5d, 0.5d, 0.9d))
+            .noVirtualLane()
             .build();
         final ComputeEngineImpl compute = engine(configuration, clock);
         compute.start();

@@ -32,6 +32,8 @@ class EngineProcessorBudgetTest {
         final EngineTestSupport.SettingsBuilder builder = settings()
             .autoWorkers(1, -1, Duration.ofSeconds(30))
             .metrics(new ComputeSettings.Metrics(true, false, Duration.ofSeconds(10), false, millis(20L)))
+            // capacity is the platform count here: the assertions compare it with the pool size
+            .noVirtualLane()
             .grace(Duration.ofSeconds(1));
         final ComputeEngineImpl engine = engine(builder.build(), new EngineTestSupport.FakeClock(), 8);
         final AsyncComputeScheduler compute = new AsyncComputeSchedulerImpl(engine);
@@ -74,6 +76,7 @@ class EngineProcessorBudgetTest {
             settings()
                 .autoWorkers(1, -1, Duration.ofSeconds(30))
                 .metrics(new ComputeSettings.Metrics(true, false, Duration.ofSeconds(10), false, millis(20L)))
+                .noVirtualLane()
                 .build(),
             clock,
             4
@@ -111,6 +114,7 @@ class EngineProcessorBudgetTest {
             settings()
                 .autoWorkers(1, 5, Duration.ofSeconds(30))
                 .metrics(new ComputeSettings.Metrics(true, false, Duration.ofSeconds(10), false, millis(20L)))
+                .noVirtualLane()
                 .build(),
             new EngineTestSupport.FakeClock(),
             8
@@ -137,7 +141,7 @@ class EngineProcessorBudgetTest {
     @Test
     void minimumWinsOverASmallBudget() {
         final ComputeEngineImpl engine = engine(
-            settings().autoWorkers(4, -1, Duration.ofSeconds(30)).build(),
+            settings().autoWorkers(4, -1, Duration.ofSeconds(30)).noVirtualLane().build(),
             new EngineTestSupport.FakeClock(),
             8
         );
@@ -155,7 +159,7 @@ class EngineProcessorBudgetTest {
     @Test
     void fixedPoolIgnoresTheBudget() {
         final ComputeEngineImpl engine = engine(
-            settings().fixedWorkers(3).build(),
+            settings().fixedWorkers(3).noVirtualLane().build(),
             new EngineTestSupport.FakeClock(),
             8
         );
@@ -200,6 +204,7 @@ class EngineProcessorBudgetTest {
             settings()
                 .autoWorkers(1, 8, Duration.ofSeconds(30))
                 .adaptive(new ComputeSettings.Adaptive(true, 1, 8, millis(100L), 5, 0.5d, 0.5d, 0.9d))
+                .noVirtualLane()
                 .build(),
             clock,
             8

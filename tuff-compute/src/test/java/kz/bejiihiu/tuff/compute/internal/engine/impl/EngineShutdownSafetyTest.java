@@ -38,6 +38,8 @@ class EngineShutdownSafetyTest {
     void blockingContinuationOfAnExpiredTaskCannotWedgeShutdown() throws Exception {
         final EngineTestSupport.SettingsBuilder builder = settings()
             .fixedWorkers(1)
+            // no lane: the queued NORMAL entry must expire instead of spilling onto a virtual thread
+            .noVirtualLane()
             .metrics(new ComputeSettings.Metrics(true, false, Duration.ofSeconds(10), false, millis(20L)))
             .grace(millis(100L));
         final AsyncComputeScheduler compute = startedScheduler(builder.build(), ComputeClock.system());

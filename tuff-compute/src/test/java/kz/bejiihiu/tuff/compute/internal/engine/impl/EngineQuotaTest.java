@@ -150,9 +150,10 @@ class EngineQuotaTest {
     }
 
     @Test
-    void relativeLimitFollowsThePoolSize() {
+    void relativeLimitFollowsTheCapacity() {
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(4).build(),
+            // without the lane the capacity is the platform count, so the half share is two again
+            settings().fixedWorkers(4).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {

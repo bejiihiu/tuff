@@ -39,7 +39,7 @@ class AtomicQuotaControllerTest {
     }
 
     @Test
-    void relativeLimitFollowsThePoolLimit() {
+    void relativeLimitFollowsTheCapacity() {
         final AtomicQuotaController controller = new AtomicQuotaController(4);
         controller.updateConsumerPolicy("a", ConsumerPolicy.relative(0.5d));
 
@@ -54,7 +54,10 @@ class AtomicQuotaControllerTest {
     @Test
     void loweringTheLimitDoesNotInterruptAnything() {
         final AtomicQuotaController controller = new AtomicQuotaController(4);
-        controller.updateConsumerPolicy("a", ConsumerPolicy.absolute(3));
+        // a relative limit so that lowering the capacity really lowers the resolved limit; an
+        // absolute limit is deliberately not capped by the capacity
+        controller.updateConsumerPolicy("a", ConsumerPolicy.relative(0.75d));
+        assertEquals(3, controller.limit("a"));
         assertTrue(controller.tryAcquire("a"));
         assertTrue(controller.tryAcquire("a"));
         assertTrue(controller.tryAcquire("a"));
@@ -70,6 +73,19 @@ class AtomicQuotaControllerTest {
         assertFalse(controller.admits("a"));
         controller.release("a");
         assertTrue(controller.admits("a"));
+    }
+
+    @Test
+    void absoluteLimitIsNotCappedByTheCapacity() {
+        final AtomicQuotaController controller = new AtomicQuotaController(2);
+        controller.updateConsumerPolicy("a", ConsumerPolicy.absolute(3));
+
+        assertEquals(3, controller.limit("a"), "an absolute limit is not a share of the capacity");
+        assertTrue(controller.tryAcquire("a"));
+        assertTrue(controller.tryAcquire("a"));
+        assertTrue(controller.tryAcquire("a"));
+        assertFalse(controller.tryAcquire("a"), "an absolute limit is still a hard bound");
+        assertEquals(3, controller.activeTasks("a"));
     }
 
     @Test

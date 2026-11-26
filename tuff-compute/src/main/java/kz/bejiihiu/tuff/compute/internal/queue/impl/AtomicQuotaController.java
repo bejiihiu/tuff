@@ -11,10 +11,10 @@ import kz.bejiihiu.tuff.compute.internal.util.Preconditions;
  * Lock free quota controller backed by one atomic active counter per consumer.
  *
  * <p>A slot is reserved with a compare and set loop against the limit resolved from the consumer's
- * current policy and the current pool wide limit, so the configured bound is never exceeded even
+ * current policy and the current execution capacity, so the configured bound is never exceeded even
  * when a hundred workers call {@link #tryAcquire(String)} at the same moment. Limits are resolved
- * lazily on every check: a policy update or a pool resize takes effect immediately, without having
- * to recompute stored per consumer values.
+ * lazily on every check: a policy update, a pool resize or a virtual lane limit change takes effect
+ * immediately, without having to recompute stored per consumer values.
  *
  * <p>Lowering a limit never touches a running task. It only makes the next {@link #admits(String)}
  * or {@link #tryAcquire(String)} fail until enough slots were released, which is exactly what the
@@ -25,15 +25,16 @@ public final class AtomicQuotaController implements QuotaController {
     private final ConcurrentHashMap<String, Quota> quotas = new ConcurrentHashMap<>();
 
     /**
-     * Current pool wide limit. Volatile because the adaptive controller publishes new values from
-     * its own thread while workers read it on every admission check.
+     * Current execution capacity relative limits are resolved against. Volatile because the adaptive
+     * controller publishes new values from its own thread while workers read it on every admission
+     * check.
      */
     private volatile int totalLimit;
 
     /**
      * Creates a controller.
      *
-     * @param totalLimit pool wide maximum number of concurrently executing tasks, at least {@code 1}
+     * @param totalLimit execution capacity relative limits are resolved against, at least {@code 1}
      * @throws IllegalArgumentException if the limit is not positive
      */
     public AtomicQuotaController(final int totalLimit) {
@@ -160,8 +161,8 @@ public final class AtomicQuotaController implements QuotaController {
     }
 
     @Override
-    public void updateTotalLimit(final int totalLimit) {
-        this.totalLimit = Preconditions.checkPositive(totalLimit, "totalLimit");
+    public void updateTotalLimit(final int executionCapacity) {
+        this.totalLimit = Preconditions.checkPositive(executionCapacity, "executionCapacity");
     }
 
     @Override
@@ -172,7 +173,7 @@ public final class AtomicQuotaController implements QuotaController {
     }
 
     /**
-     * Resolves the effective limit of one consumer against the current pool limit.
+     * Resolves the effective limit of one consumer against the current execution capacity.
      *
      * @param quota quota to resolve
      * @return the number of tasks that may run concurrently, at least {@code 1}

@@ -43,6 +43,8 @@ class EngineSizingSyncTest {
         final ComputeSettings built = settings()
             .autoWorkers(1, -1, Duration.ofSeconds(30))
             .metrics(new ComputeSettings.Metrics(true, false, Duration.ofSeconds(10), false, millis(20L)))
+            // the test counts platform bodies, so the capacity must be the platform count
+            .noVirtualLane()
             .grace(Duration.ofSeconds(1))
             .build();
         final ComputeEngineImpl engine = engine(built, new EngineTestSupport.FakeClock(), 4);
@@ -95,6 +97,7 @@ class EngineSizingSyncTest {
         final ComputeSettings built = settings()
             .autoWorkers(1, -1, Duration.ofSeconds(30))
             .metrics(new ComputeSettings.Metrics(true, false, Duration.ofSeconds(10), false, millis(20L)))
+            .noVirtualLane()
             .grace(Duration.ofSeconds(1))
             .build();
         final ComputeEngineImpl engine = engine(built, new EngineTestSupport.FakeClock(), 2);

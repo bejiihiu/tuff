@@ -69,17 +69,20 @@ public interface QuotaController extends ComputeQueue.ConsumerAdmission {
     int limit(String consumerId);
 
     /**
-     * Returns the current pool wide limit.
+     * Returns the current execution capacity.
      *
-     * @return the maximum number of concurrently executing tasks across all consumers
+     * <p>Relative consumer limits are resolved against this number: it is the platform worker count
+     * plus the virtual lane permits when the lane is enabled. Absolute limits ignore it.
+     *
+     * @return the maximum number of slots relative limits are derived from, at least {@code 1}
      */
     int totalLimit();
 
     /**
      * Applies a new policy to a registered consumer.
      *
-     * <p>The relative limits are resolved lazily against {@link #totalLimit()}, so a policy update
-     * does not need to know the pool size.
+     * <p>Relative limits are resolved lazily against {@link #totalLimit()}, so this method does not
+     * need to know the capacity and a later capacity change takes effect on the next check.
      *
      * @param consumerId consumer to update
      * @param policy     replacement policy
@@ -97,14 +100,15 @@ public interface QuotaController extends ComputeQueue.ConsumerAdmission {
     void removeConsumer(String consumerId);
 
     /**
-     * Updates the pool wide limit.
+     * Updates the execution capacity relative limits are resolved against.
      *
-     * <p>Called when the worker pool grows, shrinks or when adaptive concurrency moves the limit.
-     * Per consumer relative limits are re-resolved against the new value.
+     * <p>Called when the worker pool grows or shrinks, when the processor budget moves it, or when
+     * the virtual lane limit changes. It is the platform size plus the lane permits, so a relative
+     * limit can cover both lanes; absolute limits are not affected.
      *
-     * @param totalLimit new maximum number of concurrently executing tasks, at least {@code 1}
+     * @param executionCapacity new capacity, at least {@code 1}
      */
-    void updateTotalLimit(int totalLimit);
+    void updateTotalLimit(int executionCapacity);
 
     /**
      * Clears all counters and reservations.

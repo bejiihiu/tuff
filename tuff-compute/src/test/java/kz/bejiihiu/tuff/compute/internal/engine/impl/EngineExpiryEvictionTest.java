@@ -37,7 +37,8 @@ class EngineExpiryEvictionTest {
     @Test
     void expiredQueuedTaskIsCancelledByTheSweepAndNeverRuns() throws Exception {
         final EngineTestSupport.FakeClock clock = new EngineTestSupport.FakeClock();
-        final ComputeEngineImpl engine = engine(settings().fixedWorkers(1).build(), clock);
+        // no lane: the queued entry must wait for the sweep instead of spilling onto a virtual thread
+        final ComputeEngineImpl engine = engine(settings().fixedWorkers(1).noVirtualLane().build(), clock);
         final AsyncComputeScheduler compute = new AsyncComputeSchedulerImpl(engine);
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
@@ -75,6 +76,8 @@ class EngineExpiryEvictionTest {
     void janitorThreadExpiresQueuedWorkOnItsOwn() throws Exception {
         final ComputeSettings configuration = settings()
             .fixedWorkers(1)
+            // no lane: NORMAL work that cannot get the blocked worker has to wait and expire
+            .noVirtualLane()
             .metrics(new ComputeSettings.Metrics(true, false, Duration.ofSeconds(10), false, millis(20L)))
             .build();
         final ComputeEngineImpl engine = new ComputeEngineImpl(configuration, ComputeClock.system(), EngineTestSupport.PROCESSORS);

@@ -40,7 +40,9 @@ class LaneShutdownTest {
     void gracefulShutdownCancelsQueuedLowAndLetsRunningLowFinish() throws Exception {
         final SettingsBuilder settings = SettingsBuilder.of("shutdown-grace")
             .fixedWorkers(2)
-            .virtualLane(true, true, 4, millis(50L), 64);
+            // exactly two lane slots: the two running tasks fill them, so the rest stays queued and
+            // is still queued when the shutdown starts
+            .virtualLane(true, true, 2, millis(50L), 64);
         final AsyncComputeScheduler compute = start(settings);
         final LaneTestSupport.TaskProbe probe = new LaneTestSupport.TaskProbe();
         final CountDownLatch twoStarted = new CountDownLatch(2);

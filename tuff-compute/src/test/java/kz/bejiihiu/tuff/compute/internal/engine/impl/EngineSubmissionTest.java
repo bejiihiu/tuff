@@ -59,7 +59,8 @@ class EngineSubmissionTest {
         final CountDownLatch release = new CountDownLatch(1);
         final ConcurrentLinkedQueue<String> order = new ConcurrentLinkedQueue<>();
         final AsyncComputeScheduler compute = startedScheduler(
-            settings().fixedWorkers(1).build(),
+            // priority order is a platform lane property; LOW work goes to the virtual lane
+            settings().fixedWorkers(1).noVirtualLane().build(),
             new EngineTestSupport.FakeClock()
         );
         try {

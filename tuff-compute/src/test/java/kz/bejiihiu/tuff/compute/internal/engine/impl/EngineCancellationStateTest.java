@@ -122,7 +122,8 @@ class EngineCancellationStateTest {
     @Test
     void expiredTaskIsVisibleAsCancelled() throws Exception {
         final EngineTestSupport.FakeClock clock = new EngineTestSupport.FakeClock();
-        final ComputeEngineImpl engine = engine(settings().fixedWorkers(1).build(), clock);
+        // a single platform worker and no lane: a NORMAL entry that waits stays queued and can expire
+        final ComputeEngineImpl engine = engine(settings().fixedWorkers(1).noVirtualLane().build(), clock);
         final AsyncComputeScheduler compute = new AsyncComputeSchedulerImpl(engine);
         final CountDownLatch running = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);

@@ -534,12 +534,35 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     }
 
     /**
-     * Returns the current pool wide concurrency limit.
+     * Returns the execution capacity the quota controller resolves relative limits against.
      *
-     * @return the limit the quota controller enforces
+     * <p>It is the platform pool size plus the virtual lane permits when the lane is enabled, not
+     * just the worker count: blocking LOW work runs on the lane without holding a platform worker, so
+     * a share of the platform pool alone would starve it. Absolute limits are not capped by this
+     * value.
+     *
+     * @return the current execution capacity, at least {@code 1}
      */
     int totalLimit() {
         return this.quota.totalLimit();
+    }
+
+    /**
+     * Adds the virtual lane permits to the platform worker count.
+     *
+     * <p>The lane config is fixed for the life of the engine, so the only part that moves at runtime
+     * is the platform size. Every writer of that size goes through
+     * {@link #applyPoolSize(int)} or {@link #wireRuntime()}, and both feed the result back into
+     * {@link QuotaController#updateTotalLimit(int)}, which is what keeps a relative consumer limit in
+     * step with both lanes.
+     *
+     * @param platformWorkers workers the platform pool may run at the same time, at least {@code 1}
+     * @return platform workers plus the lane permits, or only the workers when the lane is off
+     */
+    private int executionCapacity(final int platformWorkers) {
+        final ComputeSettings.Lanes.Virtual lane = this.settings.lanes().virtual();
+        final int lanePermits = lane.enabled() ? lane.maxConcurrent() : 0;
+        return platformWorkers + lanePermits;
     }
 
     /**
@@ -625,7 +648,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
                 this.settings.workers().threadNamePrefix()
             );
         }
-        this.quota.updateTotalLimit(newPool.concurrencyLimit());
+        this.quota.updateTotalLimit(this.executionCapacity(newPool.concurrencyLimit()));
         this.appliedLimit.set(newPool.concurrencyLimit());
         final AdaptiveConcurrencyController controller = new AimdAdaptiveConcurrencyController(
             this.settings,
@@ -969,7 +992,9 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             // the pool owns the min/max clamp, so the limit follows the applied size, not the request
             final int applied = currentPool.desiredWorkers();
             currentPool.setConcurrencyLimit(applied);
-            this.quota.updateTotalLimit(applied);
+            // the quota resolves relative limits against the total execution capacity, so the
+            // virtual lane permits are part of the number too
+            this.quota.updateTotalLimit(this.executionCapacity(currentPool.concurrencyLimit()));
             this.appliedLimit.set(applied);
         }
     }
