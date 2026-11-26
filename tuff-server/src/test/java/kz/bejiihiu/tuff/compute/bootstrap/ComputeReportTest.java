@@ -21,6 +21,9 @@ import kz.bejiihiu.tuff.compute.config.ConfigLoadResult;
 import kz.bejiihiu.tuff.compute.config.ConfigProblem;
 import kz.bejiihiu.tuff.compute.internal.engine.impl.ComputeSchedulers;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
+import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
+import kz.bejiihiu.tuff.threads.bootstrap.ThreadsReport;
+import kz.bejiihiu.tuff.threads.bootstrap.ThreadsStatus;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -266,6 +269,20 @@ class ComputeReportTest {
 
         assertEquals(1, lines.size());
         assertTrue(lines.get(0).contains("nothing changed"), lines.get(0));
+    }
+
+    @Test
+    void everyCommandSurfaceSurvivesBothSubsystemsBeingDisabled() {
+        // /tuff and /tuff compute with the engine off: the summary, consumer and task branches all
+        // fall back to an explanation instead of dereferencing a missing scheduler
+        assertFalse(ComputeReport.overview(ComputeStatus.disabled()).isEmpty());
+        assertFalse(ComputeReport.consumers(ComputeStatus.disabled()).isEmpty());
+        assertFalse(ComputeReport.tasks(ComputeStatus.disabled(), 5).isEmpty());
+
+        // /tuff threads with UTMI disabled, and with a bootstrap that was never started
+        assertFalse(ThreadsReport.overview(
+            ThreadsStatus.disabled(ThreadManagementSettings.defaults())).isEmpty());
+        assertFalse(ThreadsReport.overview(ThreadsStatus.notInitialised()).isEmpty());
     }
 
     @Test
