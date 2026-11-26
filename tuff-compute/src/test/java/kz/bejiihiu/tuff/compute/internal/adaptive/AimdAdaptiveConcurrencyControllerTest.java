@@ -1,13 +1,22 @@
 package kz.bejiihiu.tuff.compute.internal.adaptive;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.OptionalDouble;
 import java.util.concurrent.atomic.AtomicInteger;
+import jdk.jfr.Recording;
+import jdk.jfr.consumer.RecordedEvent;
+import jdk.jfr.consumer.RecordingFile;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
+import kz.bejiihiu.tuff.compute.internal.adaptive.impl.AdaptiveDecisionEvent;
 import kz.bejiihiu.tuff.compute.internal.adaptive.impl.AimdAdaptiveConcurrencyController;
 import kz.bejiihiu.tuff.compute.internal.adaptive.impl.AimdAdaptiveConcurrencyController.DecisionReason;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 
 import static kz.bejiihiu.tuff.compute.internal.adaptive.AdaptiveTestSupport.automatic;
 import static kz.bejiihiu.tuff.compute.internal.adaptive.AdaptiveTestSupport.controller;
@@ -22,6 +31,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class AimdAdaptiveConcurrencyControllerTest {
 
     private static final Duration WINDOW = Duration.ofSeconds(1);
+
+    @TempDir
+    Path tempDir;
 
     @Test
     void newControllerDoesNothingUntilStarted() {
@@ -309,5 +321,52 @@ class AimdAdaptiveConcurrencyControllerTest {
             controller.evaluate();
         }
         assertEquals(1, controller.currentLimit());
+    }
+
+    @Test
+    void oneDecisionEmitsExactlyOneJfrEvent() throws IOException {
+        try (Recording recording = new Recording()) {
+            recording.enable(AdaptiveDecisionEvent.class);
+            recording.start();
+
+            final TestComputeClock clock = new TestComputeClock();
+            final AimdAdaptiveConcurrencyController controller = controller(jfrSettings(), clock, 2);
+            clock.advance(WINDOW);
+            feed(controller, 20, 5L, 100L);
+            controller.onQueueState(4, 8192);
+            assertEquals(3, controller.evaluate());
+            assertEquals(DecisionReason.GROW_BACKLOG, controller.lastDecisionReason());
+
+            recording.stop();
+            final Path dump = this.tempDir.resolve("adaptive-decision.jfr");
+            recording.dump(dump);
+            final List<RecordedEvent> events = new ArrayList<>();
+            try (RecordingFile file = new RecordingFile(dump)) {
+                while (file.hasMoreEvents()) {
+                    events.add(file.readEvent());
+                }
+            }
+            final List<RecordedEvent> decisions = events.stream()
+                .filter(event -> "tuff.compute.AdaptiveDecision".equals(event.getEventType().getName()))
+                .toList();
+            assertEquals(1, decisions.size(), "one evaluation must emit exactly one decision event");
+            final RecordedEvent decision = decisions.getFirst();
+            assertEquals("GROW_BACKLOG", decision.getString("reason"));
+            assertEquals(2, decision.getInt("currentLimit"), "the limit before the decision");
+            assertEquals(3, decision.getInt("desiredLimit"), "the limit after the decision");
+        }
+    }
+
+    private static ComputeSettings jfrSettings() {
+        final ComputeSettings base = settings(automatic(1, 8), true, 1, 8, 2, 0.5d, 0.5d, 0.8d);
+        return new ComputeSettings(
+            base.enabled(),
+            base.workers(),
+            base.queue(),
+            base.scheduling(),
+            base.consumers(),
+            new ComputeSettings.Metrics(true, true, Duration.ofSeconds(10), false, Duration.ofSeconds(1)),
+            base.adaptive(),
+            base.shutdownGracePeriod());
     }
 }

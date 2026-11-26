@@ -1,13 +1,11 @@
 package kz.bejiihiu.tuff.compute.internal.metrics.impl;
 
-import java.util.Objects;
 import jdk.jfr.EventType;
 import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.ComputePriority;
 import kz.bejiihiu.tuff.compute.ComputeRejectedException;
 import kz.bejiihiu.tuff.compute.ComputeTaskType;
 import kz.bejiihiu.tuff.compute.internal.metrics.JfrRecorder;
-import kz.bejiihiu.tuff.compute.internal.metrics.event.AgingActivatedEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.QueueDepthSampleEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.TaskCancelledEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.TaskCompletedEvent;
@@ -339,38 +337,6 @@ public final class FlightJfrRecorder implements JfrRecorder {
     }
 
     /**
-     * Emits an aging event.
-     *
-     * <p>Not part of the frozen recorder contract; the dispatcher calls it once it reports aging
-     * decisions. Keeping the method here means no metric code has to change when that happens.
-     *
-     * @param consumerId   consumer of the aged task
-     * @param fromPriority priority the task was submitted with
-     * @param toPriority   effective priority after the aging step
-     * @param waitedNanos  how long the task had been waiting
-     */
-    public void agingActivated(
-        final String consumerId,
-        final ComputePriority fromPriority,
-        final ComputePriority toPriority,
-        final long waitedNanos
-    ) {
-        if (this.types == null || !Types.AGING.isEnabled()) {
-            return;
-        }
-        try {
-            final AgingActivatedEvent event = new AgingActivatedEvent();
-            event.consumerId = consumerId;
-            event.fromPriority = Objects.requireNonNull(fromPriority, "fromPriority").name();
-            event.toPriority = Objects.requireNonNull(toPriority, "toPriority").name();
-            event.waitedNanos = waitedNanos;
-            event.commit();
-        } catch (Throwable _) {
-            // profiling must never break a task
-        }
-    }
-
-    /**
      * Lazily loaded holder for the flight recorder types.
      *
      * <p>It exists so that a JVM without {@code jdk.jfr} fails while loading this nested class, which
@@ -388,7 +354,6 @@ public final class FlightJfrRecorder implements JfrRecorder {
         static final EventType QUEUE_SAMPLE = EventType.getEventType(QueueDepthSampleEvent.class);
         static final EventType WORKER_SAMPLE = EventType.getEventType(WorkerPoolStateEvent.class);
         static final EventType WORKER_RESIZED = EventType.getEventType(WorkerPoolResizedEvent.class);
-        static final EventType AGING = EventType.getEventType(AgingActivatedEvent.class);
         static final EventType VIRTUAL_TASK = EventType.getEventType(VirtualTaskEvent.class);
 
         private Types() {

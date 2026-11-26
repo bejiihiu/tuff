@@ -12,7 +12,6 @@ import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.ComputePriority;
 import kz.bejiihiu.tuff.compute.ComputeRejectedException;
 import kz.bejiihiu.tuff.compute.ComputeTaskType;
-import kz.bejiihiu.tuff.compute.internal.metrics.event.AgingActivatedEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.QueueDepthSampleEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.TaskCancelledEvent;
 import kz.bejiihiu.tuff.compute.internal.metrics.event.TaskCompletedEvent;
@@ -51,7 +50,6 @@ class FlightJfrRecorderTest {
             recording.enable(QueueDepthSampleEvent.class);
             recording.enable(WorkerPoolStateEvent.class);
             recording.enable(WorkerPoolResizedEvent.class);
-            recording.enable(AgingActivatedEvent.class);
             recording.start();
 
             final FlightJfrRecorder recorder = new FlightJfrRecorder();
@@ -74,7 +72,6 @@ class FlightJfrRecorderTest {
             recorder.queueState(12, 100);
             recorder.workerState(4, 3, 1, 4);
             recorder.workerState(6, 5, 1, 6);
-            recorder.agingActivated("path", ComputePriority.LOW, ComputePriority.NORMAL, 900L);
 
             recording.stop();
 
@@ -121,12 +118,6 @@ class FlightJfrRecorderTest {
             final RecordedEvent resized = single(events, "tuff.compute.WorkerPoolResized");
             assertEquals(6, resized.getInt("totalWorkers"));
             assertEquals(6, resized.getInt("concurrencyLimit"));
-
-            final RecordedEvent aging = single(events, "tuff.compute.AgingActivated");
-            assertEquals("path", aging.getString("consumerId"));
-            assertEquals("LOW", aging.getString("fromPriority"));
-            assertEquals("NORMAL", aging.getString("toPriority"));
-            assertEquals(900L, aging.getLong("waitedNanos"));
         }
     }
 
@@ -169,7 +160,6 @@ class FlightJfrRecorderTest {
             recorder.taskRejected("chunk", ComputeRejectedException.Reason.QUEUE_FULL);
             recorder.queueState(0, 0);
             recorder.workerState(0, 0, 0, 0);
-            recorder.agingActivated("chunk", ComputePriority.LOW, ComputePriority.NORMAL, 0L);
         });
     }
 
