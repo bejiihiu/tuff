@@ -3,6 +3,7 @@ package kz.bejiihiu.tuff.threads.bootstrap;
 import java.util.Objects;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
+import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -27,6 +28,8 @@ import org.jspecify.annotations.Nullable;
  * @param unregisteredThreads threads no pool accounts for, or {@code -1} when not measured
  * @param sampleAgeMillis     age of the cached sample, or {@code -1} when there is none
  * @param metricsEnabled      whether the runtime samples pool and thread state at all
+ * @param pressure            last tick pressure decision, or {@code null} when the feature is off or
+ *                            has not decided yet
  */
 public record ThreadsStatus(
     State state,
@@ -34,7 +37,8 @@ public record ThreadsStatus(
     @Nullable ResourceSnapshot snapshot,
     int unregisteredThreads,
     long sampleAgeMillis,
-    boolean metricsEnabled
+    boolean metricsEnabled,
+    @Nullable TickPressureSnapshot pressure
 ) {
 
     /**
@@ -63,7 +67,7 @@ public record ThreadsStatus(
      * @return the not-initialised status
      */
     public static ThreadsStatus notInitialised() {
-        return new ThreadsStatus(State.NOT_INITIALISED, null, null, -1, -1L, false);
+        return new ThreadsStatus(State.NOT_INITIALISED, null, null, -1, -1L, false, null);
     }
 
     /**
@@ -81,7 +85,8 @@ public record ThreadsStatus(
             null,
             -1,
             -1L,
-            settings.metrics().enabled() && settings.lifecycle().monitorThreads()
+            settings.metrics().enabled() && settings.lifecycle().monitorThreads(),
+            null
         );
     }
 
@@ -94,7 +99,7 @@ public record ThreadsStatus(
      */
     public static ThreadsStatus disabled(final ThreadManagementSettings settings) {
         return new ThreadsStatus(
-            State.DISABLED, Objects.requireNonNull(settings, "settings"), null, -1, -1L, false
+            State.DISABLED, Objects.requireNonNull(settings, "settings"), null, -1, -1L, false, null
         );
     }
 
@@ -104,7 +109,7 @@ public record ThreadsStatus(
      * @return the failed status
      */
     public static ThreadsStatus failed() {
-        return new ThreadsStatus(State.FAILED, null, null, -1, -1L, false);
+        return new ThreadsStatus(State.FAILED, null, null, -1, -1L, false, null);
     }
 
     /**
@@ -128,7 +133,26 @@ public record ThreadsStatus(
             Objects.requireNonNull(snapshot, "snapshot"),
             unregisteredThreads,
             sampleAgeMillis,
-            this.metricsEnabled
+            this.metricsEnabled,
+            this.pressure
+        );
+    }
+
+    /**
+     * Returns a copy that carries the last tick pressure decision.
+     *
+     * @param pressure the decision to publish, or {@code null} when the feature is off
+     * @return the copy
+     */
+    public ThreadsStatus withPressure(final @Nullable TickPressureSnapshot pressure) {
+        return new ThreadsStatus(
+            this.state,
+            this.settings,
+            this.snapshot,
+            this.unregisteredThreads,
+            this.sampleAgeMillis,
+            this.metricsEnabled,
+            pressure
         );
     }
 

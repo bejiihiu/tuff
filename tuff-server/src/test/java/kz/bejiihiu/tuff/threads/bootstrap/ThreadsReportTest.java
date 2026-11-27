@@ -12,7 +12,11 @@ import kz.bejiihiu.tuff.threads.PoolSpec;
 import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.SaturationReport;
+import kz.bejiihiu.tuff.threads.SheddingReport;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
+import kz.bejiihiu.tuff.threads.pressure.TickPressureController;
+import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
+import kz.bejiihiu.tuff.threads.pressure.TickSignal;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -76,10 +80,10 @@ class ThreadsReportTest {
             SaturationReport.unknown(PoolId.REGION_EXECUTION), List.of()
         );
         final ResourceSnapshot snapshot = new ResourceSnapshot(
-            Instant.EPOCH, 8, 1, 4, 0, 0, 4, 0.0d, 0.0d, -1.0d, List.of(pool), List.of(), Set.of(), Optional.empty()
+            Instant.EPOCH, 8, 1, 4, 0, 0, 4, 0.0d, 0.0d, -1.0d, List.of(pool), List.of(), Set.of()
         );
         final ThreadsStatus status = new ThreadsStatus(
-            ThreadsStatus.State.RUNNING, ThreadManagementSettings.defaults(), snapshot, 0, 10L, true
+            ThreadsStatus.State.RUNNING, ThreadManagementSettings.defaults(), snapshot, 0, 10L, true, null
         );
 
         final String text = String.join("\n", ThreadsReport.overview(status));
@@ -114,7 +118,7 @@ class ThreadsReportTest {
             Set.of(DegradedReason.OBSERVE_ONLY)
         );
         final ThreadsStatus status = new ThreadsStatus(
-            ThreadsStatus.State.RUNNING, ThreadManagementSettings.defaults(), snapshot, 0, 10L, true
+            ThreadsStatus.State.RUNNING, ThreadManagementSettings.defaults(), snapshot, 0, 10L, true, null
         );
 
         final String text = String.join("\n", ThreadsReport.overview(status));
@@ -130,6 +134,116 @@ class ThreadsReportTest {
 
         assertFalse(text.contains("regions "), "an observe-only pool with no source must not claim zero regions");
         assertFalse(text.contains("avg MSPT"));
+    }
+
+    @Test
+    void tickPressureIsDisabledInTheShippedConfiguration() {
+        final String text = String.join("\n", ThreadsReport.overview(runningStatus(0)));
+
+        assertTrue(text.contains("pressure: disabled"), text);
+        assertTrue(text.contains("async-compute.tick-pressure.enabled: false"), text);
+    }
+
+    @Test
+    void tickPressurePrintsTheReserveTheSignalAndTheReason() {
+        final TickPressureSnapshot pressure = new TickPressureSnapshot(
+            true,
+            TickPressureController.State.PRESSURE,
+            2,
+            2,
+            6,
+            8,
+            TickPressureController.Reason.LAG_STEP_UP,
+            new TickSignal(true, 4, 0.5d, 17.2d, 41.0d)
+        );
+        final ThreadsStatus status = new ThreadsStatus(
+            ThreadsStatus.State.RUNNING,
+            settingsWithPressure(),
+            runningStatus(0).snapshot(),
+            0,
+            412L,
+            true,
+            pressure
+        );
+
+        final String text = String.join("\n", ThreadsReport.overview(status));
+
+        assertTrue(text.contains("pressure: yielding, reserve 2 of 2 core(s), budget 6 of 8"), text);
+        assertTrue(text.contains("lag 50%, min TPS 17.2, max MSPT 41.0 ms"), text);
+        assertTrue(text.contains("(LAG_STEP_UP)"), text);
+    }
+
+    @Test
+    void enabledTickPressureWithoutASignalSaysItIsWaiting() {
+        final ThreadsStatus status = new ThreadsStatus(
+            ThreadsStatus.State.RUNNING,
+            settingsWithPressure(),
+            runningStatus(0).snapshot(),
+            0,
+            412L,
+            true,
+            null
+        );
+
+        assertTrue(
+            String.join("\n", ThreadsReport.overview(status)).contains("pressure: enabled, waiting for a region reading")
+        );
+    }
+
+    @Test
+    void theReserveLineExplainsTheCriticalReserveAndTheShed() {
+        final SheddingReport report = new SheddingReport(
+            2, true, 1, List.of(PoolId.COMPUTE),
+            "load shedding withholding 1 core(s) from compute while a critical pool waits; "
+                + "2 core(s) held for the critical lanes"
+        );
+        final ResourceSnapshot snapshot = new ResourceSnapshot(
+            Instant.EPOCH, 8, 1, 8, 3, 5, 8, 0.0d, 0.0d, -1.0d, List.of(), List.of(), Set.of(), report
+        );
+        final ThreadManagementSettings defaults = ThreadManagementSettings.defaults();
+        final ThreadManagementSettings settings = new ThreadManagementSettings(
+            defaults.enabled(),
+            new ThreadManagementSettings.Resources(true, 1, -1, true),
+            defaults.lifecycle(),
+            defaults.regionExecution(),
+            defaults.asyncCompute(),
+            defaults.executionPools(),
+            defaults.metrics()
+        );
+        final ThreadsStatus status = new ThreadsStatus(
+            ThreadsStatus.State.RUNNING, settings, snapshot, 0, 412L, true, null
+        );
+
+        final String text = String.join("\n", ThreadsReport.overview(status));
+
+        assertTrue(text.contains("reserve: load shedding withholding 1 core(s) from compute"), text);
+        assertTrue(text.contains("2 core(s) held for the critical lanes"), text);
+    }
+
+    @Test
+    void theReserveLineSaysWhenSheddingIsOff() {
+        final String text = String.join("\n", ThreadsReport.overview(runningStatus(0)));
+
+        assertTrue(
+            text.contains("reserve: 0 core(s) held for the critical lanes; load shedding off "
+                + "(thread-management.resources.load-shedding: false)"),
+            text
+        );
+    }
+
+    private static ThreadManagementSettings settingsWithPressure() {
+        final ThreadManagementSettings defaults = ThreadManagementSettings.defaults();
+        final ThreadManagementSettings.AsyncCompute.TickPressure policy =
+            new ThreadManagementSettings.AsyncCompute.TickPressure(true, 0.25d, 19.0d, 19.5d, 3, 5, 2, 1);
+        return new ThreadManagementSettings(
+            defaults.enabled(),
+            defaults.resources(),
+            defaults.lifecycle(),
+            defaults.regionExecution(),
+            new ThreadManagementSettings.AsyncCompute(false, -1, policy),
+            defaults.executionPools(),
+            defaults.metrics()
+        );
     }
 
     private static ThreadsStatus runningStatus(final int unregisteredThreads) {
@@ -156,20 +270,8 @@ class ThreadsReportTest {
             List.of(DegradedReason.OBSERVE_ONLY)
         );
         final ResourceSnapshot snapshot = new ResourceSnapshot(
-            Instant.EPOCH,
-            8,
-            1,
-            8,
-            3,
-            5,
-            8,
-            0.0d,
-            0.0d,
-            -1.0d,
-            List.of(pool),
-            List.of(),
-            Set.of(DegradedReason.OBSERVE_ONLY),
-            Optional.empty()
+            Instant.EPOCH, 8, 1, 8, 3, 5, 8, 0.0d, 0.0d, -1.0d, List.of(pool), List.of(),
+            Set.of(DegradedReason.OBSERVE_ONLY)
         );
         return new ThreadsStatus(
             ThreadsStatus.State.RUNNING,
@@ -177,7 +279,8 @@ class ThreadsReportTest {
             snapshot,
             unregisteredThreads,
             412L,
-            metricsEnabled
+            metricsEnabled,
+            null
         );
     }
 

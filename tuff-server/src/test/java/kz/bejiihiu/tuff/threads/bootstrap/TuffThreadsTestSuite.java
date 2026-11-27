@@ -15,6 +15,7 @@ import org.junit.platform.suite.api.SuiteDisplayName;
     "kz.bejiihiu.tuff.threads.bootstrap",
     "kz.bejiihiu.tuff.threads.bridge",
     "kz.bejiihiu.tuff.threads.observe",
+    "kz.bejiihiu.tuff.threads.pressure",
     "kz.bejiihiu.tuff.threads.probe",
     "kz.bejiihiu.tuff.threads.region"
 })

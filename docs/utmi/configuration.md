@@ -11,6 +11,7 @@ thread-management:
     cpu-aware: true
     reserve-cores: 1
     max-concurrent-tasks: -1
+    load-shedding: false
   lifecycle:
     centralized-thread-factory: true
     monitor-threads: true
@@ -24,6 +25,15 @@ thread-management:
   async-compute:
     managed: false
     max-threads: -1
+    tick-pressure:
+      enabled: false
+      enter-lag-fraction: 0.25
+      enter-min-tps: 19.0
+      exit-min-tps: 19.5
+      exit-windows: 3
+      cooldown-seconds: 5
+      max-reserve-cores: 2
+      step-cores: 1
   execution-pools:
     network:
       managed: false
@@ -61,6 +71,7 @@ thread-management:
 | `resources.cpu-aware` | boolean | `true` | restart | Size from the platform's real processor count and container limits instead of a static table. Keep it on; `false` is a diagnostic for a wrong topology reading |
 | `resources.reserve-cores` | integer, ≥ 0 | `1` | restart | Processors never handed to managed pools, kept for GC, JIT, the kernel and unexpected work. The budget floors the effective reserve at one core; zero is legal but risky on small machines |
 | `resources.max-concurrent-tasks` | integer, `-1` or ≥ 1 | `-1` | restart | Global cap on concurrently leased tasks across pools. critical pools (`region-execution`, `network`) bypass it by policy; `-1` disables the cap and leaves only per-pool permits |
+| `resources.load-shedding` | boolean | `false` | restart | Let a starving critical pool take capacity back from the non critical ones. While a critical pool has a request parked and every non critical pool is at its capacity, one core is withheld per cooldown (never below the pool's declared minimum) and given back after the critical queue has been calm. Held work is never interrupted; only new leases are refused. Off keeps the budget fixed whatever happens; the critical reserve itself does not depend on this key |
 | `lifecycle.centralized-thread-factory` | boolean | `true` | restart | Policy statement: new server-owned threads should come from `ThreadFactoryProvider`. It does not move existing threads and is enforced by code review and the static guard, not by the flag alone |
 | `lifecycle.monitor-threads` | boolean | `true` | restart | Sample thread states, CPU time and creation/termination rates. Combined with `metrics.enabled` with AND: either switch off leaves the layer running with a structural snapshot (registered pools and registry-known thread counts, no measured values) |
 | `region-execution.managed` | boolean | `false` | restart | Registers the region pool at L2 instead of L1 and binds the `RegionThreads` bridge, so every region tick body goes through `ThreadFactoryProvider.wrap`. What changes: the pool spec (`min 1`, elastic budget), per-thread registration for the duration of each body, the printed level, and `SCHEDULER_LIMITATION` under EDF (L2 is the deepest an unresizable scheduler can promise). What stays Folia's: thread creation, class (`TickThreadRunner`), name, group, daemon flag, uncaught handler, tick order and region ownership. Restart only: the bridge is installed before the region scheduler is constructed; see [architecture](architecture.md#region-bridge-and-installation-order) |
@@ -71,6 +82,14 @@ thread-management:
 | `region-execution.kairos-unstable` | boolean | `false` | restart | Explicit opt-in for the experimental Kairos scheduler. Never enabled implicitly. Selecting `kairos` without it rejects the whole region section |
 | `async-compute.managed` | boolean | `false` | restart | Older spelling of `execution-pools.compute.managed`; either key turns compute management on. With it on, the compute adapter registers the platform pool at L4 and the virtual lane at L2, and the engine takes its threads and processor budget from the thread layer. Off keeps the engine's own factory and `ComputeThreadBudget`; the pool is observed through its probe either way |
 | `async-compute.max-threads` | integer, `-1` or ≥ 1 | `-1` | restart | Ceiling for the registered compute pool only. `-1` keeps the engine's own `max-threads`. The engine's queue and priorities are untouched either way |
+| `async-compute.tick-pressure.enabled` | boolean | `false` | restart | Let the compute pool yield cores while regions lag. The decision is made from the region summary the sampler already publishes; on a change the compute adapter re-applies the processor budget through `applyProcessorBudget`, the same entry point the startup budget uses. Only a managed pool (`execution-pools.compute.managed` or `async-compute.managed`) can apply it; otherwise decisions are logged and shown by `/tuff threads` but nothing is resized. Off by default |
+| `async-compute.tick-pressure.enter-lag-fraction` | number, `(0, 1]` | `0.25` | restart | Share of regions below 18 TPS that starts pressure; `0.25` is one lagging region out of four. Ignored while the slowest region already trips `enter-min-tps` |
+| `async-compute.tick-pressure.enter-min-tps` | number, `(0, 20]` | `19.0` | restart | Slowest region TPS below which one core is yielded even when the lag share is zero |
+| `async-compute.tick-pressure.exit-min-tps` | number, `(0, 20]` | `19.5` | restart | Slowest region TPS at or above which a sample counts as calm. Must not be below `enter-min-tps`; the gap is the hysteresis band where nothing moves |
+| `async-compute.tick-pressure.exit-windows` | integer, ≥ 1 | `3` | restart | Consecutive calm one-second samples before a core is returned. One more step follows each cooldown, so the ramp down is as gradual as the ramp up |
+| `async-compute.tick-pressure.cooldown-seconds` | integer, ≥ 1 | `5` | restart | Minimum time between two reserve changes. A sawtooth signal cannot resize the pool every second |
+| `async-compute.tick-pressure.max-reserve-cores` | integer, ≥ 1 | `2` | restart | Most cores the pool may give up. The adapter lowers this further so the pool's `min-threads` still fits in the budget; a pool that cannot yield reports the ceiling as its reason |
+| `async-compute.tick-pressure.step-cores` | integer, `[1, max-reserve-cores]` | `1` | restart | Cores moved per decision. One means a ramp rather than a jump |
 | `execution-pools.compute.managed` | boolean | `false` | restart | The preferred spelling of the compute switch. Same effect as `async-compute.managed`, and the one `ThreadManagementSettings.computeManaged()` reads first |
 | `execution-pools.network.managed` | boolean | `false` | restart | Raises the network pool's registered coverage. Netty keeps its event loops, sizing and affinity |
 | `execution-pools.network.preserve-specialization` | boolean | `true` | n/a | Must stay `true`: network loops cannot be merged or reshaped without changing their semantics |
@@ -93,6 +112,7 @@ fields rather than levers that move threads today.
 | `region-execution.grid-exponent` | The model value changes. The regioniser's shift is fixed at the first initialisation |
 | `execution-pools.chunk-system.managed` or `network.managed` | The pool is registered with coverage L2 instead of L1, and `/tuff threads` prints the deeper level. No thread is created or wrapped, because no owner hands its factory or its bodies over yet. The manager does not flag this as a conflict for these kinds — treat the printed level as a registration claim, not proof of accounting. `region-execution.managed` is different: that pool's bodies are really wrapped |
 | `execution-pools.compute.managed` (or `async-compute.managed`) | The compute adapter registers `compute` at L4 and `compute-virtual` at L2, and the engine creates its platform workers through the provider and reads its budget from the resource controller. The engine's queue, priorities and fairness are unchanged |
+| `async-compute.tick-pressure.enabled: true` without a managed compute pool | Nothing is resized. The controller still evaluates every one-second pass, logs each change with its reason and publishes the reserve for `/tuff threads`; the sink is simply not bound. This is the documented behaviour on an observe-only server, not a silent failure |
 | `metrics.per-pool: false` | Pool entries disappear from the snapshot and `/tuff threads`. Degradation reasons are still collected at the top level; measurement continues |
 | `lifecycle.centralized-thread-factory: false` | Nothing. The flag is a policy statement; the guard and review remain the enforcement |
 
@@ -162,6 +182,91 @@ The flag is only honest on a build that carries the region factory hook (`Tuff -
 bodies`). A jar without it prints L2 from the spec while no body is wrapped; the flag itself cannot
 detect that, because no factory calls the bridge.
 
+## Tick pressure: let the compute pool give cores back
+
+This is the one key group that changes a live pool without a restart of the feature itself: while a
+region is late, the compute pool's processor budget is lowered, and when the regions are calm it is
+raised again. It is off by default because it trades background throughput for tick headroom, and that
+trade needs its own load test on the target server.
+
+The signal comes from the thread layer's sampler, never from a tick report read on a region thread. Every
+second the sampler publishes the region summary - the share of regions below 18 TPS, the slowest region's
+TPS and the worst single tick - and the controller evaluates exactly that snapshot:
+
+- **enter** when the lag share reaches `enter-lag-fraction`, or when the slowest region is below
+  `enter-min-tps`;
+- **grow** by `step-cores` on each cooldown while the regions are still behind, up to
+  `max-reserve-cores` and never below the pool's `min-threads`;
+- **stay** in the band between `enter-min-tps` and `exit-min-tps`;
+- **release** one step per cooldown after `exit-windows` consecutive calm samples, where calm means no
+  region below 18 TPS and the slowest region at or above `exit-min-tps`.
+
+Every decision that moves the reserve is one log line with its reason and one `tuff.threads.TickPressure`
+event; a pass that could not read the regions keeps the current reserve instead of guessing. The budget
+is applied through the compute adapter and `applyProcessorBudget`, the same single writer the startup
+budget uses, so there is no second sizing path. With the pool unmanaged the decisions are still logged
+and printed, but nothing changes.
+
+The policy is read once at startup and is restart-only, like the rest of this section: the thresholds
+describe the monitor that was built, and silently changing them under a running controller would make
+its hysteresis and cooldown impossible to reason about.
+
+```yaml
+thread-management:
+  async-compute:
+    tick-pressure:
+      enabled: true
+```
+
+## Critical reserve and load shedding: keep the tick and network lanes alive
+
+Two mechanisms protect the pools the server cannot run without (`region-execution` and `network`), and
+only one of them is a key.
+
+**The reserve is always on and is arithmetic.** The budget planner subtracts the critical lanes'
+guaranteed minimum before the shared pools see the remainder: the network minimum, plus any region
+minimum the configured tick thread deduction did not cover, plus a critical pool's own declared
+`reserved-cores` when that is larger. A compute pool whose caps add up to twenty cores therefore still
+only sees what is left, and an elastic compute budget cannot resolve past it. When the reserve eats the
+whole remainder the shared pools get **zero** permits and the plan says so - zero is the honest answer,
+because the alternative is a permit the machine does not have. The same number is printed by
+`/tuff threads` as the `reserve:` line and carried by the snapshot's `shedding.criticalReserveCores`.
+
+The reserve is not a new sizing knob: it is derived from specs the pools already declare, so there is no
+second ledger to keep in sync. Its weak spot is documented rather than hidden: netty threads are not
+deducted from the ceiling yet, so a managed network pool's capacity above its minimum is best effort.
+
+**Shedding is the temporary half and needs `resources.load-shedding: true`.** Its trigger is a
+combination, not a single number: a critical pool has a live parked request **and** every non critical
+managed pool is already at its capacity. A critical queue that waits on its own accounting, with idle
+background pools, is normal back pressure and does not move anything.
+
+Once it fires, the policy is fixed (there are no keys for it, because a policy tuned per second is not a
+policy):
+
+| Step | Value | Why |
+| --- | --- | --- |
+| Withheld per decision | 1 core | A ramp, so an operator sees the reduction grow |
+| Cooldown between decisions | 5 s | At most one core per five seconds, up and down |
+| Calm evaluations before returning a core | 3 | Three admission decisions with no pressure, on top of the cooldown |
+| Floor | the pool's declared minimum (or its reserve, if larger) | A guarantee is never shed |
+| Order | lowest admission weight first: `service`, `compute-virtual`, `compute`, then `chunk-worker`/`chunk-io` | Cheap background work yields before work closer to the critical lanes |
+
+The decision runs on the admission and release paths, so it needs no thread of its own: with no traffic
+there is nothing to shed for, and the cooldown is measured on the injected monotonic clock. A shed is
+never a revocation - permits already granted keep working to completion and are released normally; only
+new leases are refused until the core comes back. Because an idle server may hold a shed until the next
+request or release, the state is visible in the snapshot and the command instead of being a guess.
+
+With the key off, the ledger, the reserve and every capacity are identical to the previous build: the
+flag only adds the emergency reduction, it is not a second budget.
+
+```yaml
+thread-management:
+  resources:
+    load-shedding: true
+```
+
 ## Validation errors you can hit
 
 | Message | Cause | Fix |
@@ -173,6 +278,10 @@ detect that, because no factory calls the bridge.
 | `preserveSpecialization must stay true` | Attempt to make a specialised pool mergeable | Set it back |
 | `Kairos is experimental; set kairosUnstable to true` | `scheduler: kairos` alone | Add the opt-in, and expect EDF behaviour: the scheduler is not implemented |
 | `expected true or false, got '…'` | String instead of a boolean | Use literal `true` / `false` |
+| `enterLagFraction must be in (0, 1]` | A share outside the range, e.g. `1.5` or `0` | Use a fraction such as `0.25` |
+| `exitMinTps must not be below enterMinTps` | Inverted hysteresis band | Keep `exit-min-tps` at or above `enter-min-tps` |
+| `stepCores must be in [1, max-reserve-cores]` | A step larger than the ceiling | Lower `step-cores` or raise `max-reserve-cores` |
+| `expected a number, got '…'` | A TPS or share written as text that is not numeric | Use a plain number |
 | `expected a whole number, got …` | Fractional or non-numeric count | Use an integer |
 | `unknown key, ignored` | Typo or a key from a newer build | Remove it; the default stays in force |
 

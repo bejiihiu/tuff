@@ -32,6 +32,12 @@ thread-management:
     # Global cap on concurrently executing leased tasks, or -1 for no cap. Pools still apply their
     # own limits on top.
     max-concurrent-tasks: -1
+    # Load shedding. When true and a critical pool (region ticks, network loops) is at its capacity
+    # with requests waiting while every non critical pool is already fully leased, the background pools
+    # give up one core at a time (never below their declared minimum) and get it back after the critical
+    # queue has been calm for a few seconds. Held work is never interrupted; only new leases are
+    # refused. Off keeps the budget fixed whatever the pressure. Needs a restart.
+    load-shedding: false
 
   lifecycle:
     # New server owned threads must come from the central factory. This is a policy statement that
@@ -71,6 +77,28 @@ thread-management:
     managed: false
     # Ceiling for that pool, or -1 to keep the engine's configured maximum.
     max-threads: -1
+
+    # Cores the compute pool gives back while the regions fall behind. Off by default: it changes the
+    # size of a live pool and needs its own load test. Only a managed compute pool can apply it; an
+    # observed one logs the decisions and /tuff threads shows them, but nothing is resized.
+    tick-pressure:
+      enabled: false
+      # Pressure starts when at least this share of regions is below 18 TPS (0.25 = one of four
+      # regions), or when the slowest region drops below enter-min-tps.
+      enter-lag-fraction: 0.25
+      enter-min-tps: 19.0
+      # The reserve is released only when no region is below 18 TPS and the slowest region is at or
+      # above exit-min-tps. The gap between the two TPS values is the hysteresis band.
+      exit-min-tps: 19.5
+      # Consecutive one-second samples that must be calm before a core is returned.
+      exit-windows: 3
+      # Minimum seconds between two reserve changes. Keeps a sawtooth from resizing the pool every
+      # second.
+      cooldown-seconds: 5
+      # Most cores the pool may give up, and how many move per decision. The pool never falls below
+      # its own min-threads.
+      max-reserve-cores: 2
+      step-cores: 1
 
   execution-pools:
     network:

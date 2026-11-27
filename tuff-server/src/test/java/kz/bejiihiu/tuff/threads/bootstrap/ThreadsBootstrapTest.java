@@ -7,7 +7,6 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
@@ -278,8 +277,7 @@ class ThreadsBootstrapTest {
             List.of(),
             List.of(new ThreadSnapshot(7L, "Folia Region Scheduler Thread #1", PoolId.REGION_EXECUTION,
                 Thread.State.RUNNABLE, false, Thread.NORM_PRIORITY, -1L)),
-            Set.of(),
-            Optional.empty()
+            Set.of()
         );
         final List<ThreadSnapshot> unregistered = List.of(
             new ThreadSnapshot(7L, "Folia Region Scheduler Thread #1", PoolId.of("unregistered"),
@@ -346,8 +344,7 @@ class ThreadsBootstrapTest {
             Instant.EPOCH, 1, 0, 1, 1, 0, 1, 0.0d, 0.0d, -1.0d,
             List.of(),
             observed,
-            Set.of(),
-            Optional.empty()
+            Set.of()
         );
         final List<ThreadSnapshot> unregistered = List.of(
             new ThreadSnapshot(11L, "Netty NIO IO #0", PoolId.of("unregistered"),

@@ -27,7 +27,8 @@ counts such as threads and unknown threads vary with the JVM and the load:
 
 ```
 Tuff thread layer: running, some pools managed
-  cores: 11 usable after the reserve, 1 reserved; 4 registered thread(s) (peak 4)
+  cores: 10 usable after the reserve, 1 reserved; 4 registered thread(s) (peak 4)
+  reserve: 1 core(s) held for the critical lanes; load shedding off (thread-management.resources.load-shedding: false)
   sample: taken 412 ms ago
   pools: 9 registered
     background        L1  alive 3  active 1  idle 2  cpu 0%
@@ -41,6 +42,7 @@ Tuff thread layer: running, some pools managed
       regions 1 / avg MSPT 0.5 ms / min TPS 20.0 / lag 0% (0 of 1)
       ticks: 5s max 1.1 ms, 15s avg 0.8 ms max 32.5 ms; entities 0 / players 0 / chunks 25
     service           L2  alive 1  active 0  idle 0  cpu 0%
+  pressure: disabled (thread-management.async-compute.tick-pressure.enabled: false)
   degraded: FEATURE_DISABLED, OBSERVE_ONLY, SCHEDULER_LIMITATION
   unknown threads: 32
   settings: reserve 1 core(s), region scheduler edf, region threads unknown; changes take effect after a restart
@@ -55,10 +57,18 @@ How to read it:
 - **`running, all pools observed only` / `running, some pools managed`** comes from the configuration
   (`anyManagementEnabled()` derived from the `managed` flags), not from the measured coverage.
 - **`cores: N usable after the reserve, R reserved`** is the snapshot's `usableCores`, which is the
-  budget ledger's `usable`: `floor(processors × 0.8)` minus the deducted lanes and the effective reserve,
-  floored at one. `R` is the configured reserve before that floor. The raw subtraction and every term are
-  in the snapshot's `budgetLedger`, the same line `ThreadResourceController.budgetLedger()` returns, so
-  there is no second "usable" number to compare against.
+  budget ledger's `usable`: `floor(processors × 0.8)` minus the deducted lanes, the effective reserve and
+  the critical reserve, floored at one. `R` is the configured reserve before that floor. The raw
+  subtraction and every term are in the snapshot's `budgetLedger`, the same line
+  `ThreadResourceController.budgetLedger()` returns, so there is no second "usable" number to compare
+  against.
+- **`reserve:`** is the critical reserve and the load shedding state in one line. The reserve is the part
+  of the budget the non critical pools may never lease, whatever they declare; it is already subtracted
+  from `cores:`. With shedding off the line names the switch; with it on the line is the controller's own
+  summary, e.g. `load shedding withholding 2 core(s) from compute while a critical pool waits; 2 core(s)
+  held for the critical lanes`. `nothing withheld` means the policy is armed and no critical pool is
+  waiting. A pool can hold fewer permits than its spec says for exactly these two reasons, and
+  `degraded:` names them (`CRITICAL_POOL_PRESSURE`, `LOAD_SHEDDING`).
 - **`sample: taken ... ago`** is the age of the cached sample the refresher published. The command never
   measures; a value of `unknown` means no sample exists yet and the summary is the `warming up` line.
 - **`N registered thread(s)`** is the sum of per-pool `alive`. It includes threads a probe reports and
@@ -90,8 +100,12 @@ How to read it:
   still `RUNNING`. With `region-execution.managed: true` that pool contributes
   `SCHEDULER_LIMITATION` under EDF instead of `OBSERVE_ONLY`, while the pools still at L1 keep
   `OBSERVE_ONLY` in the union. Observe-only is a statement of coverage, not a failure, and only
-  reasons such as `BUDGET_EXHAUSTED`, `SCHEDULER_LIMITATION`, `CONFIG_CONFLICT` or
-  `THREAD_CREATION_FAILED` move the manager state to `DEGRADED`.
+  reasons such as `BUDGET_EXHAUSTED`, `SCHEDULER_LIMITATION`, `CONFIG_CONFLICT`,
+  `CRITICAL_POOL_PRESSURE` or `THREAD_CREATION_FAILED` move the manager state to `DEGRADED`.
+  `CRITICAL_POOL_PRESSURE` means a critical pool is at its capacity with requests parked, or its
+  declared minimum only fits by overcommitting; `LOAD_SHEDDING` means the capacity of that non critical
+  pool is temporarily below its budget on purpose. The second is the policy working, and it always
+  travels with the first, because shedding only fires for a critical pool that is waiting.
 - **`unknown threads:`** is a count, `n/a (no sample yet)` before the first pass, or
   `n/a (metrics collection is disabled)` when metrics are off. The report does not list their names;
   the snapshot does. Every thread a probe lists - region, chunk, netty, chat, background and compute -
@@ -99,6 +113,13 @@ How to read it:
 - **`settings:`** repeats the three values that most often explain a surprise: the reserve, the region
   scheduler and the configured region thread count (`unknown` when the config says "auto"). Every key of
   the section needs a restart.
+- **`pressure:`** is the compute pool's tick pressure decision. `disabled` names the switch. With the
+  feature on it prints the state (`normal` or `pressure`), the reserve against its ceiling, the budget
+  against the ledger's usable cores, and the signal the decision was made from: lag share, slowest
+  region TPS, worst tick and the reason (`LAG_ENTER`, `LAG_STEP_UP`, `CALM_STEP_DOWN`, `CALM_EXIT`,
+  `CEILING_REACHED`). `waiting for a region reading` means the feature is on but no pass has seen a
+  region summary yet, which is normal on a server with no loaded regions. The reserve is only applied
+  when the compute pool is managed; an observed pool shows the same numbers, with nothing resized.
 
 ## What a snapshot contains
 
@@ -109,6 +130,8 @@ How to read it:
 | `capturedAt` | monotonic clock | Wall-clock instant for display |
 | `usableCores` | The budget ledger's `usable` | Minimum one; also exposed by `ThreadResourceController` |
 | `reservedCores` | `resources.reserve-cores` | As configured, without the controller's floor at one |
+| `shedding` | `ThreadResourceController.sheddingReport()` | Critical reserve in cores, whether the policy is on, cores withheld and the pools they came from, plus a printable summary. `SheddingReport.none()` on a hand-built snapshot |
+| `shedding.criticalReserveCores` | Derived from the pool specs by the budget planner | Also a shortcut on the snapshot: `criticalReserveCores()`. The part of `ceiling` the non critical pools may not lease |
 | `totalThreads`, `activeThreads`, `idleThreads`, `peakThreads` | Per-pool sums | `peak` is the highest total seen since start |
 | `creationRatePerSecond`, `terminationRatePerSecond` | `ThreadMXBean.getTotalStartedThreadCount` | JVM-wide deltas over the sampling window, not per pool |
 | `processCpuLoad` | `OperatingSystemMXBean` | Process-wide; `-1` when unavailable |
@@ -234,7 +257,7 @@ Two honest caveats:
 
 ## JFR
 
-Seven events, all named under `tuff.threads`:
+Eight events, all named under `tuff.threads`:
 
 | Event | Fields | When |
 | --- | --- | --- |
@@ -245,6 +268,7 @@ Seven events, all named under `tuff.threads`:
 | `tuff.threads.ThreadCreated` | `threadId`, `threadName`, `poolId`, `daemon`, `priority` | When the factory creates a thread or adopts a wrapped one |
 | `tuff.threads.ThreadTerminated` | `threadId`, `threadName`, `poolId`, `state`, `cpuTimeNanos` | When an accounted thread ends |
 | `tuff.threads.UnknownThreads` | `threadId`, `threadName` | Per finding during the unaccounted-thread scan |
+| `tuff.threads.TickPressure` | `state`, `reason`, `reserveCores`, `maxReserveCores`, `budget`, `usableCores`, `regions`, `lagFraction`, `minimumTps`, `maximumMspt` | When the compute pool's tick pressure reserve moves; never per pass |
 
 Emission is gated on `EventType.isEnabled()` before the event object is built, so a server with no
 recording pays one check per hook. There is no `thread-management` key that switches these events on
@@ -320,6 +344,7 @@ writing an integration that reads this data, obey the same rule.
 | `region-execution` prints `L2` but `unknown threads` is unchanged | Expected: `alive` is `max(registry, probe)` and the count of unaccounted threads is dominated by Folia, netty and plugins | Prove the wrap with the bridge unit test, not with the console |
 | Region TPS disagrees with `/tps` | `/tuff threads` shows the slowest region and a mean over regions; `/tps` shows per-region windows, including 1 m and beyond | Different aggregates, both honest |
 | No `tuff.threads.*` events in a recording | The recording does not have those events enabled, or it is the compute recording (category `tuff.compute` only) | Start a recording with the events enabled |
+| A background pool holds fewer permits than its spec says | Either the critical reserve (`reserve:` line, `criticalReserveCores`) or an active load shed (`LOAD_SHEDDING`) | Compare `reserve:` with `budgetLedger`: the ledger prints `+ critical N` when the reserve is not zero, and the shed is always temporary |
 | TPS looks wrong in a profiler | The profiler uses server-wide tick hooks, which Folia does not feed | Use `/tps` or a region-aware profiler |
 | `pools: 0 registered` while the layer is running | `metrics.per-pool: false` (publication off), not `metrics.enabled: false` — with collection off the pools are still listed with unmeasured values | Check the `metrics` keys and the `degraded:` line (`METRICS_UNAVAILABLE` means collection is off) |
 

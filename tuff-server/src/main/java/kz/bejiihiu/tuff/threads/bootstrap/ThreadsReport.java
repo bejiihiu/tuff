@@ -10,7 +10,10 @@ import kz.bejiihiu.tuff.threads.PoolSnapshot;
 import kz.bejiihiu.tuff.threads.PoolSpec;
 import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
+import kz.bejiihiu.tuff.threads.SheddingReport;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
+import kz.bejiihiu.tuff.threads.pressure.TickPressureController;
+import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -81,6 +84,7 @@ public final class ThreadsReport {
         lines.add(INDENT + "cores: " + snapshot.usableCores() + " usable after the reserve, "
             + snapshot.reservedCores() + " reserved; " + snapshot.totalThreads()
             + " registered thread(s) (peak " + snapshot.peakThreads() + ')');
+        lines.add(INDENT + "reserve: " + describeShedding(snapshot.shedding(), settings));
         lines.add(INDENT + "sample: taken " + describeAge(status.sampleAgeMillis()));
         lines.add(INDENT + "pools: " + snapshot.pools().size() + " registered");
 
@@ -99,6 +103,7 @@ public final class ThreadsReport {
             lines.add(INDENT + "metrics: disabled (thread-management.metrics.enabled: false); pool counters and "
                 + "the thread list are not collected");
         }
+        lines.add(INDENT + describePressure(status, settings));
         lines.add(INDENT + "degraded: " + (status.metricsEnabled()
             ? describeReasons(snapshot.degradedReasons())
             : "unknown (metrics are disabled)"));
@@ -162,6 +167,61 @@ public final class ThreadsReport {
 
     private static String describeTps(final double tps) {
         return tps < 0.0d ? "unknown" : String.format(Locale.ROOT, "%.1f", tps);
+    }
+
+    /**
+     * Describes the compute pool's tick pressure decision.
+     *
+     * <p>One line, always printed while the layer runs: "disabled" is information too, and an operator
+     * who wonders why the compute pool never yields needs to see that the switch is off without
+     * reading the file. The line carries the decision's reason so a reserve that sits at its ceiling
+     * does not look like a stuck controller.
+     *
+     * @param status   current status
+     * @param settings effective settings
+     * @return the line, without the leading indent
+     */
+    private static String describePressure(final ThreadsStatus status, final ThreadManagementSettings settings) {
+        if (!settings.tickPressure().enabled()) {
+            return "pressure: disabled (thread-management.async-compute.tick-pressure.enabled: false)";
+        }
+        final @Nullable TickPressureSnapshot pressure = status.pressure();
+        if (pressure == null || !pressure.signal().measured()) {
+            return "pressure: enabled, waiting for a region reading";
+        }
+        return "pressure: " + (pressure.state() == TickPressureController.State.PRESSURE ? "yielding" : "normal")
+            + ", reserve " + pressure.reserve() + " of " + pressure.maxReserve() + " core(s)"
+            + ", budget " + pressure.budget() + " of " + pressure.usableCores()
+            + "; lag " + Math.round(pressure.signal().lagFraction() * 100.0d) + '%'
+            + ", min TPS " + describeTps(pressure.signal().minimumTps())
+            + ", max MSPT " + describeMspt(pressure.signal().maximumMspt())
+            + " (" + pressure.reason().name() + ')';
+    }
+
+    /**
+     * Describes the critical reserve and the load shedding state in one line.
+     *
+     * <p>The controller's report already spells out the numbers and the pools, so it is printed as is
+     * while the policy is on. With the policy off the line still explains the reserve, because a pool
+     * smaller than its configuration is the question an operator asks first, and "off" is part of the
+     * answer.
+     *
+     * @param shedding report carried by the snapshot
+     * @param settings effective settings, the source of the switch
+     * @return the line body
+     */
+    private static String describeShedding(
+        final SheddingReport shedding,
+        final ThreadManagementSettings settings
+    ) {
+        final String held = shedding.criticalReserveCores() + " core(s) held for the critical lanes";
+        if (!settings.resources().loadShedding()) {
+            return held + "; load shedding off (thread-management.resources.load-shedding: false)";
+        }
+        if (!shedding.enabled()) {
+            return held + "; load shedding on";
+        }
+        return shedding.summary();
     }
 
     private static int idWidth(final List<PoolSnapshot> pools) {

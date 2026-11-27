@@ -40,6 +40,7 @@ class ThreadsConfigParserTest {
                 cpu-aware: false
                 reserve-cores: 3
                 max-concurrent-tasks: 12
+                load-shedding: true
               lifecycle:
                 centralized-thread-factory: false
                 monitor-threads: false
@@ -72,7 +73,7 @@ class ThreadsConfigParserTest {
         assertTrue(parsed.problems().isEmpty(), () -> "unexpected problems: " + parsed.problems());
         final ThreadManagementSettings settings = parsed.settings();
         assertFalse(settings.enabled());
-        assertEquals(new ThreadManagementSettings.Resources(false, 3, 12), settings.resources());
+        assertEquals(new ThreadManagementSettings.Resources(false, 3, 12, true), settings.resources());
         assertEquals(new ThreadManagementSettings.Lifecycle(false, false), settings.lifecycle());
         assertEquals(
             new ThreadManagementSettings.RegionExecution(
@@ -92,6 +93,59 @@ class ThreadsConfigParserTest {
         assertEquals(new ThreadManagementSettings.Metrics(false, false, false), settings.metrics());
         assertTrue(settings.anyManagementEnabled());
         assertTrue(settings.computeManaged());
+    }
+
+    @Test
+    void tickPressureKeysMapOneToOne() {
+        final Parsed parsed = parse("""
+            thread-management:
+              async-compute:
+                tick-pressure:
+                  enabled: true
+                  enter-lag-fraction: 0.5
+                  enter-min-tps: 18.5
+                  exit-min-tps: 19.8
+                  exit-windows: 4
+                  cooldown-seconds: 9
+                  max-reserve-cores: 3
+                  step-cores: 2
+            """);
+
+        assertTrue(parsed.problems().isEmpty(), () -> "unexpected problems: " + parsed.problems());
+        assertEquals(
+            new ThreadManagementSettings.AsyncCompute.TickPressure(true, 0.5d, 18.5d, 19.8d, 4, 9, 3, 2),
+            parsed.settings().tickPressure()
+        );
+    }
+
+    @Test
+    void anInvertedHysteresisBandRejectsTheTickPressureSection() {
+        final Parsed parsed = parse("""
+            thread-management:
+              async-compute:
+                tick-pressure:
+                  enabled: true
+                  exit-min-tps: 18.0
+            """);
+
+        assertEquals(ThreadManagementSettings.AsyncCompute.TickPressure.defaults(), parsed.settings().tickPressure());
+        assertEquals(1, parsed.problems().size(), () -> "expected one problem, got " + parsed.problems());
+        assertEquals("thread-management.async-compute.tick-pressure", parsed.problems().getFirst().key());
+    }
+
+    @Test
+    void anUnknownTickPressureKeyIsReported() {
+        final Parsed parsed = parse("""
+            thread-management:
+              async-compute:
+                tick-pressure:
+                  enabled: true
+                  sparkles: true
+            """);
+
+        assertTrue(parsed.settings().tickPressure().enabled());
+        assertTrue(parsed.problems().stream().anyMatch(problem ->
+            problem.key().equals("thread-management.async-compute.tick-pressure.sparkles")));
     }
 
     @Test
@@ -197,12 +251,16 @@ class ThreadsConfigParserTest {
     void flattenCoversEveryKeyOfTheSection() throws IOException, InvalidConfigurationException {
         final Map<String, String> flat = ThreadsConfigParser.flatten(parse(template()).settings());
 
-        assertEquals(23, flat.size(), () -> "unexpected key count: " + flat.keySet());
+        assertEquals(32, flat.size(), () -> "unexpected key count: " + flat.keySet());
         assertEquals("true", flat.get("thread-management.enabled"));
+        assertEquals("false", flat.get("thread-management.resources.load-shedding"));
         assertEquals("edf", flat.get("thread-management.region-execution.scheduler"));
         assertEquals("-1", flat.get("thread-management.region-execution.threads"));
         assertEquals("true", flat.get("thread-management.execution-pools.network.preserve-specialization"));
         assertEquals("false", flat.get("thread-management.execution-pools.compute.managed"));
+        assertEquals("false", flat.get("thread-management.async-compute.tick-pressure.enabled"));
+        assertEquals("0.25", flat.get("thread-management.async-compute.tick-pressure.enter-lag-fraction"));
+        assertEquals("19.5", flat.get("thread-management.async-compute.tick-pressure.exit-min-tps"));
     }
 
     private static YamlConfiguration template() throws IOException, InvalidConfigurationException {

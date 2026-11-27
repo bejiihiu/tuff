@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import kz.bejiihiu.tuff.threads.CoverageLevel;
 import kz.bejiihiu.tuff.threads.PoolId;
@@ -75,6 +76,38 @@ class ThreadsSamplerTest {
             assertEquals(9, sample.snapshot().pools().size(), "the canonical pool set is measured");
             assertTrue(sample.unknownThreads() >= 0, "the refresher measures the unaccounted threads");
             assertTrue(sample.ageMillis() < 60_000L, "the first sample is fresh");
+        } finally {
+            sampler.stop();
+            stop(runtime);
+        }
+    }
+
+    @Test
+    void everyPassReachesTheListenerOnTheSamplerThread() throws InterruptedException {
+        final ThreadManagerRuntime runtime = this.runtime();
+        final AtomicInteger passes = new AtomicInteger();
+        final AtomicReference<Thread> caller = new AtomicReference<>();
+        final ThreadsSampler sampler = ThreadsSampler.start(runtime, (snapshot, takenAtNanos) -> {
+            passes.incrementAndGet();
+            caller.set(Thread.currentThread());
+        });
+        try {
+            assertTrue(passes.get() >= 1, "the warm pass must reach the listener");
+
+            final long deadline = System.nanoTime() + 10_000_000_000L;
+            while (passes.get() < 2 && System.nanoTime() < deadline) {
+                Thread.sleep(50L);
+            }
+
+            assertTrue(passes.get() >= 2, "the one-second loop must keep feeding the listener");
+            final Thread thread = caller.get();
+            assertNotNull(thread);
+            assertTrue(thread.getName().startsWith(ThreadsSampler.THREAD_NAME), thread.getName());
+
+            sampler.stop();
+            final int atStop = passes.get();
+            Thread.sleep(1_500L);
+            assertTrue(passes.get() <= atStop + 1, "a stopped sampler must not keep calling its listener");
         } finally {
             sampler.stop();
             stop(runtime);

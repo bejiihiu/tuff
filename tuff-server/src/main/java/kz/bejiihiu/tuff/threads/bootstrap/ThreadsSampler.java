@@ -17,6 +17,7 @@ import kz.bejiihiu.tuff.threads.ThreadSpec;
 import kz.bejiihiu.tuff.threads.UnifiedThreadManager;
 import kz.bejiihiu.tuff.threads.internal.runtime.ThreadManagerImpl;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
+import kz.bejiihiu.tuff.threads.pressure.TickSampleListener;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jspecify.annotations.Nullable;
@@ -73,10 +74,12 @@ final class ThreadsSampler {
     private final ThreadManagerRuntime runtime;
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final AtomicReference<Sample> sample = new AtomicReference<>();
+    private final @Nullable TickSampleListener listener;
     private volatile @Nullable Thread thread;
 
-    private ThreadsSampler(final ThreadManagerRuntime runtime) {
+    private ThreadsSampler(final ThreadManagerRuntime runtime, final @Nullable TickSampleListener listener) {
         this.runtime = runtime;
+        this.listener = listener;
     }
 
     /**
@@ -92,9 +95,27 @@ final class ThreadsSampler {
      * @throws IllegalStateException if the manager refuses the pool or the thread
      */
     static ThreadsSampler start(final ThreadManagerRuntime runtime) {
+        return start(runtime, null);
+    }
+
+    /**
+     * Registers the refresher pool, creates its daemon thread and takes the first pass, handing every
+     * published pass to a listener.
+     *
+     * <p>The listener is how the tick pressure monitor gets its numbers without a timer of its own:
+     * it runs on this thread, right after the pass is published, so the console never waits for it and
+     * the server never gets a second sampling thread.
+     *
+     * @param runtime  running thread manager
+     * @param listener receiver of every published pass, or {@code null} for none
+     * @return the started refresher
+     * @throws NullPointerException  if {@code runtime} is {@code null}
+     * @throws IllegalStateException if the manager refuses the pool or the thread
+     */
+    static ThreadsSampler start(final ThreadManagerRuntime runtime, final @Nullable TickSampleListener listener) {
         final UnifiedThreadManager manager = runtime.manager();
         manager.pools().register(serviceSpec());
-        final ThreadsSampler sampler = new ThreadsSampler(runtime);
+        final ThreadsSampler sampler = new ThreadsSampler(runtime, listener);
         final Thread thread = manager.threadFactory().newThread(
             ThreadSpec.of(PoolId.SERVICE, THREAD_NAME, FAILURE).withDaemon(true),
             sampler::loop
@@ -177,7 +198,18 @@ final class ThreadsSampler {
                 // the structural snapshot is not a measurement; saying zero unknown would be a lie
                 unknown = -1;
             }
-            this.sample.set(new Sample(snapshot, unknown, System.nanoTime()));
+            final Sample published = new Sample(snapshot, unknown, System.nanoTime());
+            this.sample.set(published);
+            final @Nullable TickSampleListener current = this.listener;
+            if (current != null && this.running.get()) {
+                // the pressure monitor runs here on purpose: same one-second clock, same thread, no
+                // second timer. it is not allowed to break the pass, but it may apply a budget
+                try {
+                    current.onSample(snapshot, published.takenAtNanos());
+                } catch (RuntimeException | LinkageError ex) {
+                    LOGGER.warn("Could not hand the Tuff thread sample to its listener", ex);
+                }
+            }
         } catch (RuntimeException | LinkageError ex) {
             LOGGER.warn("Could not refresh the Tuff thread sample", ex);
         }

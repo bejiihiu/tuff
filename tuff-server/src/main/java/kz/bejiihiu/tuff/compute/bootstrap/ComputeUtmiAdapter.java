@@ -19,6 +19,8 @@ import kz.bejiihiu.tuff.threads.ThreadSpec;
 import kz.bejiihiu.tuff.threads.UnifiedThreadManager;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
+import kz.bejiihiu.tuff.threads.pressure.PressureBudgetSink;
+import kz.bejiihiu.tuff.threads.pressure.TickPressureMonitor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jspecify.annotations.Nullable;
@@ -69,6 +71,8 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
     private final ComputeThreadFactoryPort legacy = ComputeThreadFactoryPort.legacy();
     private final ComputePoolProbe platformProbe;
     private final ComputePoolProbe virtualProbe;
+    private final @Nullable TickPressureMonitor pressure;
+    private final PressureBudgetSink pressureSink = new AdapterPressureSink();
     private final AtomicBoolean fallbackLogged = new AtomicBoolean();
 
     private volatile boolean managed;
@@ -77,11 +81,13 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
     private ComputeUtmiAdapter(
         final ThreadManagerRuntime runtime,
         final UnifiedThreadManager manager,
-        final ComputeSettings settings
+        final ComputeSettings settings,
+        final @Nullable TickPressureMonitor pressure
     ) {
         this.runtime = runtime;
         this.manager = manager;
         this.settings = settings;
+        this.pressure = pressure;
         this.provider = manager.threadFactory();
         this.controller = manager.resources();
         final String prefix = settings.workers().threadNamePrefix();
@@ -107,13 +113,32 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
         final ThreadManagerRuntime runtime,
         final ComputeSettings settings
     ) {
+        return attach(runtime, settings, null);
+    }
+
+    /**
+     * Binds the adapter to a running thread manager and registers the compute pools, with the tick
+     * pressure monitor that may lower the pool's budget.
+     *
+     * @param runtime  running thread manager runtime
+     * @param settings compute configuration the engine will run with
+     * @param pressure tick pressure monitor, or {@code null} when the policy is off
+     * @return the adapter, never {@code null}
+     * @throws NullPointerException  if a required argument is {@code null}
+     * @throws IllegalStateException if the thread manager is not running
+     */
+    public static ComputeUtmiAdapter attach(
+        final ThreadManagerRuntime runtime,
+        final ComputeSettings settings,
+        final @Nullable TickPressureMonitor pressure
+    ) {
         Objects.requireNonNull(runtime, "runtime");
         Objects.requireNonNull(settings, "settings");
         final UnifiedThreadManager manager = runtime.manager();
         if (!manager.isRunning()) {
             throw new IllegalStateException("the thread manager is " + manager.state() + ", not running");
         }
-        final ComputeUtmiAdapter adapter = new ComputeUtmiAdapter(runtime, manager, settings);
+        final ComputeUtmiAdapter adapter = new ComputeUtmiAdapter(runtime, manager, settings, pressure);
         adapter.register();
         return adapter;
     }
@@ -161,11 +186,26 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
     @Override
     public int processors() {
         // the controller's budget is already net of the reserves; asking it here is the whole point of
-        // the port, so nothing below subtracts region, chunk or IO threads a second time
+        // the port, so nothing below subtracts region, chunk or IO threads a second time. the tick
+        // pressure reserve is the one subtraction on top: regions are late and the pool gives cores back
         final int usable = Math.max(1, this.controller.usableCores());
-        return this.controller.budget(PoolId.COMPUTE)
+        final int poolBudget = this.controller.budget(PoolId.COMPUTE)
             .map(budget -> Math.max(1, budget.resolveCores(usable)))
             .orElse(usable);
+        final @Nullable TickPressureMonitor monitor = this.pressure;
+        return TickPressureMonitor.budgetFor(poolBudget, monitor == null ? 0 : monitor.reserve());
+    }
+
+    /**
+     * Returns the sink that applies a tick pressure reserve to the engine.
+     *
+     * <p>The thread layer binds it only when the pool is managed; an observed pool keeps logging its
+     * decisions without touching the engine's size.
+     *
+     * @return the sink, never {@code null}
+     */
+    public PressureBudgetSink pressureSink() {
+        return this.pressureSink;
     }
 
     @Override
@@ -327,6 +367,48 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
                 + "rest of this run", label, failure);
         } else {
             LOGGER.debug("Compute thread '{}' fell back to the legacy factory: {}", label, failure.getMessage());
+        }
+    }
+
+    /**
+     * Applies a reserve the tick pressure controller decided on.
+     *
+     * <p>The reserve is capped by {@code workers.min-threads} on this machine: the pool never gives
+     * away so many cores that fewer than its minimum workers fit in the budget. Everything goes
+     * through {@link AsyncComputeScheduler#applyProcessorBudget(int)}, the same single entry point the
+     * startup budget uses, so there is no second way to size the pool.
+     */
+    private final class AdapterPressureSink implements PressureBudgetSink {
+
+        @Override
+        public int maxReserve(final int usableCores) {
+            final @Nullable TickPressureMonitor monitor = ComputeUtmiAdapter.this.pressure;
+            if (monitor == null) {
+                return 0;
+            }
+            final int configured = Math.max(0, monitor.maxReserveCores());
+            final int floor = Math.max(0, usableCores - ComputeUtmiAdapter.this.settings.workers().minThreads());
+            return Math.min(configured, floor);
+        }
+
+        @Override
+        public void reserveChanged(final int reserve) {
+            final @Nullable AsyncComputeScheduler current = ComputeUtmiAdapter.this.engine;
+            if (!ComputeUtmiAdapter.this.managed) {
+                LOGGER.debug("Tuff compute pressure: reserve {} core(s) not applied, the pool is observed only", reserve);
+                return;
+            }
+            if (current == null) {
+                // the engine has not started yet; its startup budget already asks processors() for the
+                // current reserve, so nothing is lost
+                LOGGER.debug("Tuff compute pressure: reserve {} core(s) not applied yet, the engine is not bound",
+                    reserve);
+                return;
+            }
+            final int budget = ComputeUtmiAdapter.this.processors();
+            current.applyProcessorBudget(budget);
+            LOGGER.debug("Tuff compute pressure: pool budget is now {} ({} core(s) yielded, {} usable)",
+                budget, reserve, ComputeUtmiAdapter.this.controller.usableCores());
         }
     }
 }

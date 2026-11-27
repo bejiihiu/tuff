@@ -14,6 +14,8 @@ import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
 import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
+import kz.bejiihiu.tuff.threads.pressure.TickPressureMonitor;
+import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
 import kz.bejiihiu.tuff.threads.probe.BackgroundPoolProbe;
 import kz.bejiihiu.tuff.threads.probe.ChatPoolProbe;
 import kz.bejiihiu.tuff.threads.probe.ChunkPoolProbe;
@@ -70,6 +72,7 @@ public final class ThreadsBootstrap {
     private volatile ThreadsStatus status = ThreadsStatus.notInitialised();
     private volatile @Nullable ThreadManagerRuntime runtime;
     private volatile @Nullable ThreadsSampler sampler;
+    private volatile @Nullable TickPressureMonitor pressure;
     private volatile @Nullable ComputeUtmiAdapter computeAdapter;
     private boolean started;
 
@@ -163,9 +166,11 @@ public final class ThreadsBootstrap {
                 attachObservedPools(created);
                 // every heavy read (region walk, thread table, probes) happens on this thread from now
                 // on: the console command is itself on a region tick thread in Folia and must not do it
-                final ThreadsSampler createdSampler = ThreadsSampler.start(created);
+                final TickPressureMonitor createdPressure = pressureMonitor(settings, created);
+                final ThreadsSampler createdSampler = ThreadsSampler.start(created, createdPressure);
                 this.runtime = created;
                 this.sampler = createdSampler;
+                this.pressure = createdPressure;
                 this.status = ThreadsStatus.running(settings);
                 logStarted(created.manager());
             } catch (final Throwable ex) {
@@ -196,9 +201,11 @@ public final class ThreadsBootstrap {
         synchronized (this.lock) {
             final ThreadManagerRuntime current = this.runtime;
             final ThreadsSampler currentSampler = this.sampler;
+            final TickPressureMonitor currentPressure = this.pressure;
             final ThreadsStatus previous = this.status;
             this.runtime = null;
             this.sampler = null;
+            this.pressure = null;
             this.computeAdapter = null;
             this.started = false;
             this.status = ThreadsStatus.notInitialised();
@@ -208,6 +215,9 @@ public final class ThreadsBootstrap {
             // a blocking wait would look like a hung server. The thread is a daemon and exits on its own
             if (currentSampler != null) {
                 currentSampler.stop();
+            }
+            if (currentPressure != null) {
+                currentPressure.stop();
             }
             if (current == null) {
                 // one line even when there is nothing to stop, otherwise an operator cannot tell the hook
@@ -266,12 +276,14 @@ public final class ThreadsBootstrap {
         if (!base.isRunning()) {
             return base;
         }
+        final TickPressureSnapshot pressure = this.pressure == null ? null : this.pressure.snapshot();
         final ThreadsSampler current = this.sampler;
         final ThreadsSampler.@Nullable Sample sample = current == null ? null : current.sample();
         if (sample == null) {
-            return base;
+            return base.withPressure(pressure);
         }
-        return base.withSnapshot(sample.snapshot(), sample.unknownThreads(), sample.ageMillis());
+        return base.withSnapshot(sample.snapshot(), sample.unknownThreads(), sample.ageMillis())
+            .withPressure(pressure);
     }
 
     /**
@@ -304,8 +316,13 @@ public final class ThreadsBootstrap {
                 return null;
             }
             try {
-                final ComputeUtmiAdapter created = ComputeUtmiAdapter.attach(current, settings);
+                final ComputeUtmiAdapter created = ComputeUtmiAdapter.attach(current, settings, this.pressure);
                 this.computeAdapter = created;
+                final TickPressureMonitor monitor = this.pressure;
+                if (monitor != null && created.isManaged()) {
+                    // only a managed pool can apply a reserve; an observed one keeps logging and reporting
+                    monitor.bind(created.pressureSink());
+                }
                 return created;
             } catch (final Throwable ex) {
                 LOGGER.error("Tuff compute cannot use the thread layer; the engine keeps its own threads and budget", ex);
@@ -337,6 +354,32 @@ public final class ThreadsBootstrap {
         } catch (RuntimeException | LinkageError ex) {
             LOGGER.warn("Could not attach the {} pool probe; the pool stays registered without one", probe.pool(), ex);
         }
+    }
+
+    /**
+     * Builds the tick pressure monitor when the policy is on.
+     *
+     * <p>One line at startup states the whole policy, so an operator does not have to reverse the
+     * thresholds from the file to understand what the pool will do. The monitor is {@code null} when
+     * the feature is off, which is also what makes {@code /tuff threads} print "disabled".
+     *
+     * @param settings effective thread settings
+     * @param runtime  running thread manager
+     * @return the monitor, or {@code null} when the policy is off
+     */
+    private static @Nullable TickPressureMonitor pressureMonitor(
+        final ThreadManagementSettings settings,
+        final ThreadManagerRuntime runtime
+    ) {
+        final ThreadManagementSettings.AsyncCompute.TickPressure policy = settings.tickPressure();
+        if (!policy.enabled()) {
+            return null;
+        }
+        LOGGER.info("Tuff compute pressure enabled: a region below {} TPS (or {}% of regions lagging) yields up to "
+                + "{} core(s) in steps of {}, released after {} calm sample(s) at {} TPS, cooldown {} s",
+            policy.enterMinTps(), Math.round(policy.enterLagFraction() * 100.0d), policy.maxReserveCores(),
+            policy.stepCores(), policy.exitWindows(), policy.exitMinTps(), policy.cooldownSeconds());
+        return new TickPressureMonitor(policy, () -> runtime.manager().resources().usableCores());
     }
 
     private static void shutdownQuietly(final ThreadManagerRuntime runtime) {

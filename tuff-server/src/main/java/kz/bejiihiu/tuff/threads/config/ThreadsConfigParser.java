@@ -37,17 +37,30 @@ final class ThreadsConfigParser {
     private static final String NETWORK_PATH = POOLS_PATH + ".network";
     private static final String CHUNK_PATH = POOLS_PATH + ".chunk-system";
     private static final String COMPUTE_POOL_PATH = POOLS_PATH + ".compute";
+    private static final String TICK_PRESSURE_PATH = ASYNC_COMPUTE_PATH + ".tick-pressure";
     private static final String METRICS_PATH = SECTION + ".metrics";
 
     private static final Set<String> SETTINGS_KEYS = Set.of(
         "enabled", "resources", "lifecycle", "region-execution", "async-compute", "execution-pools", "metrics"
     );
-    private static final Set<String> RESOURCE_KEYS = Set.of("cpu-aware", "reserve-cores", "max-concurrent-tasks");
+    private static final Set<String> RESOURCE_KEYS = Set.of(
+        "cpu-aware", "reserve-cores", "max-concurrent-tasks", "load-shedding"
+    );
     private static final Set<String> LIFECYCLE_KEYS = Set.of("centralized-thread-factory", "monitor-threads");
     private static final Set<String> REGION_KEYS = Set.of(
         "managed", "preserve-folia-scheduling", "scheduler", "threads", "grid-exponent", "kairos-unstable"
     );
-    private static final Set<String> ASYNC_COMPUTE_KEYS = Set.of("managed", "max-threads");
+    private static final Set<String> ASYNC_COMPUTE_KEYS = Set.of("managed", "max-threads", "tick-pressure");
+    private static final Set<String> TICK_PRESSURE_KEYS = Set.of(
+        "enabled",
+        "enter-lag-fraction",
+        "enter-min-tps",
+        "exit-min-tps",
+        "exit-windows",
+        "cooldown-seconds",
+        "max-reserve-cores",
+        "step-cores"
+    );
     private static final Set<String> POOL_KEYS = Set.of("managed", "preserve-specialization");
     private static final Set<String> METRICS_KEYS = Set.of("enabled", "per-pool", "per-thread");
 
@@ -109,6 +122,7 @@ final class ThreadsConfigParser {
         flat.put(RESOURCES_PATH + ".cpu-aware", Boolean.toString(resources.cpuAware()));
         flat.put(RESOURCES_PATH + ".reserve-cores", Integer.toString(resources.reserveCores()));
         flat.put(RESOURCES_PATH + ".max-concurrent-tasks", Integer.toString(resources.maxConcurrentTasks()));
+        flat.put(RESOURCES_PATH + ".load-shedding", Boolean.toString(resources.loadShedding()));
 
         final ThreadManagementSettings.Lifecycle lifecycle = settings.lifecycle();
         flat.put(LIFECYCLE_PATH + ".centralized-thread-factory", Boolean.toString(lifecycle.centralizedThreadFactory()));
@@ -125,6 +139,15 @@ final class ThreadsConfigParser {
         final ThreadManagementSettings.AsyncCompute asyncCompute = settings.asyncCompute();
         flat.put(ASYNC_COMPUTE_PATH + ".managed", Boolean.toString(asyncCompute.managed()));
         flat.put(ASYNC_COMPUTE_PATH + ".max-threads", Integer.toString(asyncCompute.maxThreads()));
+        final ThreadManagementSettings.AsyncCompute.TickPressure pressure = asyncCompute.tickPressure();
+        flat.put(TICK_PRESSURE_PATH + ".enabled", Boolean.toString(pressure.enabled()));
+        flat.put(TICK_PRESSURE_PATH + ".enter-lag-fraction", Double.toString(pressure.enterLagFraction()));
+        flat.put(TICK_PRESSURE_PATH + ".enter-min-tps", Double.toString(pressure.enterMinTps()));
+        flat.put(TICK_PRESSURE_PATH + ".exit-min-tps", Double.toString(pressure.exitMinTps()));
+        flat.put(TICK_PRESSURE_PATH + ".exit-windows", Integer.toString(pressure.exitWindows()));
+        flat.put(TICK_PRESSURE_PATH + ".cooldown-seconds", Integer.toString(pressure.cooldownSeconds()));
+        flat.put(TICK_PRESSURE_PATH + ".max-reserve-cores", Integer.toString(pressure.maxReserveCores()));
+        flat.put(TICK_PRESSURE_PATH + ".step-cores", Integer.toString(pressure.stepCores()));
 
         final ThreadManagementSettings.Pools pools = settings.executionPools();
         flat.put(NETWORK_PATH + ".managed", Boolean.toString(pools.network().managed()));
@@ -154,8 +177,11 @@ final class ThreadsConfigParser {
         final int maxTasks = readInt(
             section, "max-concurrent-tasks", fallback.maxConcurrentTasks(), RESOURCES_PATH + ".max-concurrent-tasks", problems
         );
+        final boolean loadShedding = readBoolean(
+            section, "load-shedding", fallback.loadShedding(), RESOURCES_PATH + ".load-shedding", problems
+        );
         try {
-            return new ThreadManagementSettings.Resources(cpuAware, reserve, maxTasks);
+            return new ThreadManagementSettings.Resources(cpuAware, reserve, maxTasks, loadShedding);
         } catch (final IllegalArgumentException ex) {
             problems.add(new ConfigProblem(RESOURCES_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
             return fallback;
@@ -223,10 +249,56 @@ final class ThreadsConfigParser {
         final int maxThreads = readInt(
             section, "max-threads", fallback.maxThreads(), ASYNC_COMPUTE_PATH + ".max-threads", problems
         );
+        final ThreadManagementSettings.AsyncCompute.TickPressure pressure = parseTickPressure(
+            readSection(section, "tick-pressure", TICK_PRESSURE_PATH, problems), fallback.tickPressure(), problems
+        );
         try {
-            return new ThreadManagementSettings.AsyncCompute(managed, maxThreads);
+            return new ThreadManagementSettings.AsyncCompute(managed, maxThreads, pressure);
         } catch (final IllegalArgumentException ex) {
             problems.add(new ConfigProblem(ASYNC_COMPUTE_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
+            return fallback;
+        }
+    }
+
+    private static ThreadManagementSettings.AsyncCompute.TickPressure parseTickPressure(
+        final @Nullable ConfigurationSection section,
+        final ThreadManagementSettings.AsyncCompute.TickPressure fallback,
+        final List<ConfigProblem> problems
+    ) {
+        if (section == null) {
+            return fallback;
+        }
+        final boolean enabled = readBoolean(
+            section, "enabled", fallback.enabled(), TICK_PRESSURE_PATH + ".enabled", problems
+        );
+        final double lagFraction = readDouble(
+            section, "enter-lag-fraction", fallback.enterLagFraction(),
+            TICK_PRESSURE_PATH + ".enter-lag-fraction", problems
+        );
+        final double enterMinTps = readDouble(
+            section, "enter-min-tps", fallback.enterMinTps(), TICK_PRESSURE_PATH + ".enter-min-tps", problems
+        );
+        final double exitMinTps = readDouble(
+            section, "exit-min-tps", fallback.exitMinTps(), TICK_PRESSURE_PATH + ".exit-min-tps", problems
+        );
+        final int exitWindows = readInt(
+            section, "exit-windows", fallback.exitWindows(), TICK_PRESSURE_PATH + ".exit-windows", problems
+        );
+        final int cooldown = readInt(
+            section, "cooldown-seconds", fallback.cooldownSeconds(), TICK_PRESSURE_PATH + ".cooldown-seconds", problems
+        );
+        final int maxReserve = readInt(
+            section, "max-reserve-cores", fallback.maxReserveCores(), TICK_PRESSURE_PATH + ".max-reserve-cores", problems
+        );
+        final int step = readInt(
+            section, "step-cores", fallback.stepCores(), TICK_PRESSURE_PATH + ".step-cores", problems
+        );
+        try {
+            return new ThreadManagementSettings.AsyncCompute.TickPressure(
+                enabled, lagFraction, enterMinTps, exitMinTps, exitWindows, cooldown, maxReserve, step
+            );
+        } catch (final IllegalArgumentException ex) {
+            problems.add(new ConfigProblem(TICK_PRESSURE_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
             return fallback;
         }
     }
@@ -378,6 +450,37 @@ final class ThreadsConfigParser {
         return fallback;
     }
 
+    private static double readDouble(
+        final ConfigurationSection section,
+        final String key,
+        final double fallback,
+        final String path,
+        final List<ConfigProblem> problems
+    ) {
+        final Object raw = section.get(key);
+        if (raw == null) {
+            return fallback;
+        }
+        if (raw instanceof Number number) {
+            final double value = number.doubleValue();
+            if (Double.isFinite(value)) {
+                return value;
+            }
+        }
+        if (raw instanceof String text) {
+            try {
+                final double value = Double.parseDouble(text.trim());
+                if (Double.isFinite(value)) {
+                    return value;
+                }
+            } catch (NumberFormatException _) {
+                // falls through to the problem below
+            }
+        }
+        problems.add(new ConfigProblem(path, "expected a number, got '" + raw + "'; using " + fallback));
+        return fallback;
+    }
+
     private static @Nullable ConfigurationSection readSection(
         final ConfigurationSection parent,
         final String key,
@@ -401,6 +504,10 @@ final class ThreadsConfigParser {
         reportUnknownIn(root.getConfigurationSection("lifecycle"), LIFECYCLE_PATH, LIFECYCLE_KEYS, problems);
         reportUnknownIn(root.getConfigurationSection("region-execution"), REGION_PATH, REGION_KEYS, problems);
         reportUnknownIn(root.getConfigurationSection("async-compute"), ASYNC_COMPUTE_PATH, ASYNC_COMPUTE_KEYS, problems);
+        final ConfigurationSection asyncCompute = root.getConfigurationSection("async-compute");
+        if (asyncCompute != null) {
+            reportUnknownIn(asyncCompute.getConfigurationSection("tick-pressure"), TICK_PRESSURE_PATH, TICK_PRESSURE_KEYS, problems);
+        }
         reportUnknownIn(root.getConfigurationSection("metrics"), METRICS_PATH, METRICS_KEYS, problems);
 
         final ConfigurationSection pools = root.getConfigurationSection("execution-pools");
