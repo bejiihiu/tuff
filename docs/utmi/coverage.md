@@ -99,6 +99,24 @@ One line per pool, in id order:
 
 [`observability.md`](observability.md) explains the rest of the line and when values are `-1`.
 
+## Critical lanes inside the coverage model
+
+Two pools are critical by contract - `region-execution` and `network` - and coverage does not change
+that. What coverage changes is how much the manager may *take* from them; the reserve and load shedding
+are about how much it may take from everybody else on their behalf.
+
+- **The reserve is arithmetic, not a level.** The planner subtracts the critical lanes' guaranteed
+  minimum before the shared pools resolve their budgets, so a non critical pool at L3 cannot lease it
+  even when its own cap is larger than the machine. A shared pool may therefore end up with zero permits
+  while its spec says more; the plan reports it and `usableCores` excludes the reserve.
+- **Shedding never touches a critical pool.** Only pools whose `kind` is not `REGION_EXECUTION` or
+  `NETWORK` and whose coverage is at least L3 (they are the ones with permits to withhold) can lose
+  capacity, and never below their declared minimum. An L1/L2 pool has no permits of its own, so it is
+  not a shedding target.
+- **The reserve is not a coverage promise.** `region-execution` at L2 still has Folia's threads and
+  `network` at L2 still has netty's loops: the reserve protects the leases those pools may hold, not the
+  threads their owners create. Nothing here moves a pool to L3/L4, and nothing here reshapes a queue.
+
 ## Related pages
 
 - [Architecture](architecture.md) — levels, pool kinds, the region bridge and the invariants.
