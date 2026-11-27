@@ -3,6 +3,7 @@ package kz.bejiihiu.tuff.compute.internal.engine.impl;
 import java.util.Objects;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
+import kz.bejiihiu.tuff.compute.RegionReliefSettings;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeBudgetPort;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
@@ -120,5 +121,64 @@ public final class ComputeSchedulers {
         Objects.requireNonNull(settings, "settings");
         Objects.requireNonNull(clock, "clock");
         return new AsyncComputeSchedulerImpl(new ComputeEngineImpl(settings, clock, budget, threads));
+    }
+
+    /**
+     * Creates a stopped scheduler with region relief configuration.
+     *
+     * @param settings configuration of the scheduler
+     * @param clock    clock every component must use
+     * @param budget   source of the initial processor budget
+     * @param threads  source of every thread the engine creates
+     * @param relief   region relief configuration
+     * @return a scheduler in {@link AsyncComputeScheduler.SchedulerState#NEW}
+     * @throws NullPointerException if an argument is {@code null}
+     */
+    public static AsyncComputeScheduler create(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final ComputeBudgetPort budget,
+        final ComputeThreadFactoryPort threads,
+        final RegionReliefSettings relief
+    ) {
+        return create(settings, clock, budget, threads, relief, false);
+    }
+
+    /**
+     * Creates a stopped scheduler whose first worker spawn waits for the first processor budget.
+     *
+     * <p>Use this only when the real budget is not known yet. The pool is running and accepts work
+     * from the start, but creates no worker until {@link AsyncComputeScheduler#applyProcessorBudget(int)}
+     * is called; that call spawns the pool at the real size exactly once. An embedder that knows its
+     * budget at construction must use the overloads without the flag.
+     *
+     * @param settings         configuration of the scheduler
+     * @param clock            clock every component must use
+     * @param budget           source of the initial processor budget
+     * @param threads          source of every thread the engine creates
+     * @param relief           region relief configuration
+     * @param deferWorkerSpawn whether the first worker spawn waits for the first processor budget
+     * @return a scheduler in {@link AsyncComputeScheduler.SchedulerState#NEW}
+     * @throws NullPointerException if an argument is {@code null}
+     */
+    public static AsyncComputeScheduler create(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final ComputeBudgetPort budget,
+        final ComputeThreadFactoryPort threads,
+        final RegionReliefSettings relief,
+        final boolean deferWorkerSpawn
+    ) {
+        Objects.requireNonNull(settings, "settings");
+        Objects.requireNonNull(clock, "clock");
+        final int processors = Objects.requireNonNull(budget, "budget").processors();
+        return new AsyncComputeSchedulerImpl(new ComputeEngineImpl(
+            settings,
+            clock,
+            processors,
+            threads,
+            relief,
+            deferWorkerSpawn
+        ));
     }
 }

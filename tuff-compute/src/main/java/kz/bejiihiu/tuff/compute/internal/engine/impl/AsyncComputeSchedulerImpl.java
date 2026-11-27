@@ -13,6 +13,7 @@ import kz.bejiihiu.tuff.compute.ComputeTask;
 import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
 import kz.bejiihiu.tuff.compute.ComputeTaskType;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
+import kz.bejiihiu.tuff.compute.RegionRelief;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.internal.engine.ComputeEngine;
 
@@ -95,6 +96,11 @@ public final class AsyncComputeSchedulerImpl implements AsyncComputeScheduler {
     @Override
     public SchedulerMetrics metrics() {
         return this.engine.metrics();
+    }
+
+    @Override
+    public Optional<RegionRelief> regionRelief() {
+        return Optional.of(this.engine.regionRelief());
     }
 
     @Override

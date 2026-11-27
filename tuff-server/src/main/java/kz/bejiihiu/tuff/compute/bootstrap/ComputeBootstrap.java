@@ -7,15 +7,19 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import kz.bejiihiu.tuff.api.compute.TuffCompute;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
+import kz.bejiihiu.tuff.compute.RegionRelief;
+import kz.bejiihiu.tuff.compute.RegionReliefSettings;
 import kz.bejiihiu.tuff.compute.config.ComputeThreadBudget;
 import kz.bejiihiu.tuff.compute.config.ConfigDiff;
 import kz.bejiihiu.tuff.compute.config.ConfigLoadResult;
 import kz.bejiihiu.tuff.compute.config.TuffComputeConfig;
 import kz.bejiihiu.tuff.compute.internal.engine.impl.ComputeSchedulers;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeBudgetPort;
+import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
 import kz.bejiihiu.tuff.threads.bootstrap.ThreadsBootstrap;
 import org.apache.logging.log4j.LogManager;
@@ -127,31 +131,32 @@ public final class ComputeBootstrap {
         final @Nullable ComputeUtmiAdapter adapter = computeAdapter;
         final @Nullable ComputeBudgetPort managed = adapter != null && adapter.isManaged() ? adapter : null;
         final int cores = Runtime.getRuntime().availableProcessors();
-        final int regionThreads;
-        final int chunkThreads;
-        final int ioThreads;
+        if (!scheduler.settings().workers().automaticThreadCount()) {
+            LOGGER.info("Tuff compute: fixed worker count {}, the server processor budget is not applied",
+                scheduler.settings().workers().threads());
+            return;
+        }
+        int resolved;
         try {
             final @Nullable TickRegionScheduler regionScheduler = TickRegions.getScheduler();
-            regionThreads = regionScheduler == null ? 0 : regionScheduler.getTotalThreadCount();
-            chunkThreads = MoonriseCommon.WORKER_POOL.getAliveThreads().length;
-            ioThreads = MoonriseCommon.IO_POOL.getAliveThreads().length;
+            final int regionThreads = regionScheduler == null ? 0 : regionScheduler.getTotalThreadCount();
+            final int chunkThreads = MoonriseCommon.WORKER_POOL.getAliveThreads().length;
+            final int ioThreads = MoonriseCommon.IO_POOL.getAliveThreads().length;
+            resolved = liveBudget(managed, cores, regionThreads, chunkThreads, ioThreads);
+            if (managed != null) {
+                LOGGER.info("Tuff compute: processor budget {} of {} (source {}, ledger {})",
+                    resolved, cores, managed.source(), adapter.budgetLedger());
+            } else {
+                LOGGER.info("Tuff compute: processor budget {} of {} ({} region, {} chunk, {} IO threads, source legacy)",
+                    resolved, cores, regionThreads, chunkThreads, ioThreads);
+            }
         } catch (final Throwable ex) {
-            LOGGER.warn("Could not read the server thread counts; the compute pool keeps its startup size", ex);
-            return;
+            // the engine is waiting for its first budget: falling back to the startup number is still
+            // better than leaving the pool without a single worker
+            LOGGER.warn("Could not read the server thread counts; the compute pool is created with the startup budget", ex);
+            resolved = startupBudget(managed, cores);
         }
-        final int budget = liveBudget(managed, cores, regionThreads, chunkThreads, ioThreads);
-        if (!scheduler.settings().workers().automaticThreadCount()) {
-            LOGGER.info("Tuff compute: fixed worker count {}, the server processor budget of {} is not applied",
-                scheduler.settings().workers().threads(), budget);
-            return;
-        }
-        if (managed != null) {
-            LOGGER.info("Tuff compute: processor budget {} of {} (source {}, ledger {})",
-                budget, cores, managed.source(), adapter.budgetLedger());
-        } else {
-            LOGGER.info("Tuff compute: processor budget {} of {} ({} region, {} chunk, {} IO threads, source legacy)",
-                budget, cores, regionThreads, chunkThreads, ioThreads);
-        }
+        final int budget = resolved;
         try {
             scheduler.applyProcessorBudget(budget);
         } catch (final Throwable ex) {
@@ -290,6 +295,19 @@ public final class ComputeBootstrap {
     }
 
     /**
+     * Returns the region relief service of the running engine.
+     *
+     * <p>The empty result means the engine is not running or failed to start; relief itself being
+     * switched off does not hide the service, because submissions still fall back to running inline.
+     * This is the entry point a region subsystem uses when it decides to shed work.
+     *
+     * @return the relief service, or an empty optional when no engine is available
+     */
+    public static Optional<RegionRelief> regionRelief() {
+        return status.engine().flatMap(AsyncComputeScheduler::regionRelief);
+    }
+
+    /**
      * Re-reads {@code config/tuff.yml} and applies what a live pool can adopt.
      *
      * <p>Must run on the global tick thread, like any other configuration mutation. The answer is
@@ -326,15 +344,22 @@ public final class ComputeBootstrap {
         final ComputeSettings.Workers workers = settings.workers();
         final int resolved = workers.resolveThreadCount(budget);
         final String source = managed == null ? "legacy" : managed.source();
+        final RegionReliefSettings relief = config == null
+            ? RegionReliefSettings.defaults()
+            : config.reliefSettings();
+        // the budget is provisional until the region scheduler reports its threads; spawning now and
+        // shrinking a moment later would report a peak the server never needed
+        final boolean deferWorkers = workers.automaticThreadCount();
         @Nullable AsyncComputeScheduler scheduler = null;
         try {
-            scheduler = managed == null
-                ? ComputeSchedulers.create(settings, ComputeClock.system(), budget)
-                // a fixed port with the same number the log prints: the engine configures itself from
-                // that value and never asks the controller a second time during start
-                : ComputeSchedulers.create(
-                    settings, ComputeClock.system(), ComputeBudgetPort.fixed(budget, source), adapter
-                );
+            scheduler = ComputeSchedulers.create(
+                settings,
+                ComputeClock.system(),
+                ComputeBudgetPort.fixed(budget, source),
+                adapter == null ? ComputeThreadFactoryPort.legacy() : adapter,
+                relief,
+                deferWorkers
+            );
             scheduler.start();
             if (adapter != null) {
                 adapter.bind(scheduler);
@@ -343,8 +368,15 @@ public final class ComputeBootstrap {
             TuffCompute.install(guarded);
             status = ComputeStatus.running(guarded);
             final String requested = workers.automaticThreadCount() ? "auto" : Integer.toString(workers.threads());
-            LOGGER.info("Tuff compute enabled: {} worker(s) (requested {}, processor budget {}, source {}), queue capacity {}, scheduling {}",
-                resolved, requested, budget, source, settings.queue().capacity(), settings.scheduling().strategy());
+            final String sizing = deferWorkers
+                ? resolved + " worker(s) once the region budget is known (startup estimate)"
+                : resolved + " worker(s)";
+            LOGGER.info("Tuff compute enabled: {} (requested {}, processor budget {}, source {}), queue capacity {}, scheduling {}",
+                sizing, requested, budget, source, settings.queue().capacity(), settings.scheduling().strategy());
+            if (deferWorkers) {
+                LOGGER.info("Tuff compute: the worker pool is created with the first region processor budget, so its size "
+                    + "matches what the server actually owns; submissions queue until then");
+            }
             if (settings.consumers().allowDynamicRegistration()) {
                 LOGGER.info("Tuff compute: consumer ids registered on demand are capped at {} (configured ids are not counted)",
                     LimitedConsumerScheduler.MAX_DYNAMIC_CONSUMERS);

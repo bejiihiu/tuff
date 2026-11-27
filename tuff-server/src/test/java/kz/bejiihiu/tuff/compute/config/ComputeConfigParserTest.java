@@ -6,10 +6,12 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.OverflowPolicy;
+import kz.bejiihiu.tuff.compute.RegionReliefSettings;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.junit.jupiter.api.Test;
@@ -549,6 +551,106 @@ class ComputeConfigParserTest {
                 "the default of -1 must stay in effect for " + broken);
             assertProblem(parsed.problems(), "async-compute.adaptive.max-concurrency", "must be -1");
         }
+    }
+
+    @Test
+    void theReliefSectionParsesItsOwnKeysAndKeepsTheDefaultsOff() {
+        final ParsedRelief missing = parseRelief("""
+            async-compute:
+              enabled: true
+            """);
+        assertTrue(missing.problems().isEmpty(), () -> "unexpected problems " + missing.problems());
+        assertEquals(RegionReliefSettings.defaults(), missing.settings());
+        assertEquals(0, missing.settings().effectiveReservedCores(),
+            "the trigger is off by default, so no core is held back from tick pressure");
+
+        final ParsedRelief parsed = parseRelief("""
+            async-compute:
+              relief:
+                enabled: true
+                max-in-flight-per-region: 3
+                reserved-cores: 2
+                consumer:
+                  enabled: true
+                  max-concurrent: 0.5
+                  fair-share-weight: 2.0
+                  max-queued-tasks: 32
+                  overflow-policy: reject
+                  max-queue-wait-seconds: 4
+            """);
+
+        assertTrue(parsed.problems().isEmpty(), () -> "unexpected problems " + parsed.problems());
+        final RegionReliefSettings settings = parsed.settings();
+        assertTrue(settings.enabled());
+        assertEquals(3, settings.maxInFlightPerRegion());
+        assertEquals(2, settings.reservedCores());
+        assertEquals(2, settings.effectiveReservedCores());
+        assertEquals(ConsumerPolicy.ConcurrencyLimit.relative(0.5d), settings.consumerPolicy().concurrencyLimit());
+        assertEquals(2.0d, settings.consumerPolicy().fairShareWeight(), 0.0d);
+        assertEquals(32, settings.consumerPolicy().maxQueuedTasks());
+        assertEquals(Duration.ofSeconds(4L), settings.consumerPolicy().maxQueueWait());
+    }
+
+    @Test
+    void aDisabledReliefPathHoldsNoCoreBackFromPressure() {
+        final RegionReliefSettings settings = new RegionReliefSettings(
+            false, 8, 3, RegionReliefSettings.defaultConsumerPolicy()
+        );
+        assertEquals(0, settings.effectiveReservedCores(), "a path that is off must not take a core from the pool");
+    }
+
+    @Test
+    void brokenReliefValuesFallBackPerKey() {
+        final ParsedRelief parsed = parseRelief("""
+            async-compute:
+              relief:
+                enabled: "sometimes"
+                max-in-flight-per-region: 0
+                reserved-cores: -2
+                consumer:
+                  max-concurrent: 0
+                  turbo: true
+            """);
+
+        final RegionReliefSettings settings = parsed.settings();
+        assertEquals(RegionReliefSettings.defaults().enabled(), settings.enabled());
+        assertEquals(RegionReliefSettings.defaults().maxInFlightPerRegion(), settings.maxInFlightPerRegion());
+        assertEquals(RegionReliefSettings.defaults().reservedCores(), settings.reservedCores());
+        assertProblem(parsed.problems(), "async-compute.relief.enabled", "true or false");
+        assertProblem(parsed.problems(), "async-compute.relief.max-in-flight-per-region", "at least 1");
+        assertProblem(parsed.problems(), "async-compute.relief.reserved-cores", "must not be negative");
+        assertProblem(parsed.problems(), "async-compute.relief.consumer.max-concurrent", "must be -1");
+        assertProblem(parsed.problems(), "async-compute.relief.consumer.turbo", "unknown key");
+    }
+
+    @Test
+    void everyReliefKeyAppearsInTheFlattenedViewAndIsRestartOnly() {
+        final RegionReliefSettings settings = new RegionReliefSettings(
+            true, 5, 1, RegionReliefSettings.defaultConsumerPolicy()
+        );
+        final Map<String, String> flat = ComputeConfigParser.flattenRelief(settings);
+
+        assertEquals("true", flat.get("async-compute.relief.enabled"));
+        assertEquals("5", flat.get("async-compute.relief.max-in-flight-per-region"));
+        assertEquals("1", flat.get("async-compute.relief.reserved-cores"));
+        assertTrue(flat.containsKey("async-compute.relief.consumer.max-concurrent"), flat.toString());
+        assertTrue(flat.containsKey("async-compute.relief.consumer.max-queue-wait-seconds"), flat.toString());
+    }
+
+    private static ParsedRelief parseRelief(final String yaml) {
+        final List<ConfigProblem> problems = new ArrayList<>();
+        final YamlConfiguration configuration = new YamlConfiguration();
+        try {
+            configuration.loadFromString(yaml);
+        } catch (final InvalidConfigurationException ex) {
+            throw new AssertionError("test yaml is broken", ex);
+        }
+        final ComputeSettings parsed = ComputeConfigParser.parse(configuration, problems);
+        final RegionReliefSettings relief = ComputeConfigParser.parseRelief(configuration, problems);
+        return new ParsedRelief(parsed, relief, List.copyOf(problems));
+    }
+
+    private record ParsedRelief(ComputeSettings compute, RegionReliefSettings settings, List<ConfigProblem> problems) {
     }
 
     private static void assertRelative(final double fraction, final ComputeSettings settings, final String consumerId) {

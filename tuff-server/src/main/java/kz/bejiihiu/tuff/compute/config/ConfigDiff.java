@@ -44,6 +44,8 @@ public record ConfigDiff(List<String> changedPaths, List<String> restartRequired
         "async-compute.metrics.",
         "async-compute.adaptive.",
         "async-compute.lanes.",
+        // relief is wired into the engine and the budget sink at start; a running pool cannot adopt it
+        "async-compute.relief.",
         // the thread layer reads its whole section once, when it starts: no key of it is live
         "thread-management."
     );

@@ -116,6 +116,12 @@ public final class DynamicWorkerPool implements WorkerPool {
     private volatile boolean explicitLimit;
 
     /**
+     * Whether the first worker spawn waits for the first systematic resize. See
+     * {@link #startDeferred()}.
+     */
+    private volatile boolean deferred;
+
+    /**
      * Creates a pool from the full scheduler configuration.
      *
      * @param settings full scheduler settings, worker and scheduling sections are used
@@ -215,6 +221,33 @@ public final class DynamicWorkerPool implements WorkerPool {
             this.wakeAll();
             this.checkTerminated();
             throw failure;
+        }
+        this.checkTerminated();
+    }
+
+    /**
+     * Starts the pool without creating any worker.
+     *
+     * <p>Used when the owner only learns its real processor budget after the pool exists. The pool is
+     * running and takes submissions, but every worker wait is skipped until {@link #resize(int)} is
+     * called for the first time; that call creates the first workers at their real size. This is what
+     * keeps {@link #peakWorkers()} from reporting a temporary size the pool was resized away from a
+     * moment later.
+     *
+     * <p>Like {@link #start()}, calling it a second time has no effect. It is only meaningful before
+     * the first spawn, so an explicit {@link #resize(int)} afterwards is the only way out of the
+     * deferred state.
+     */
+    public void startDeferred() {
+        if (!this.state.compareAndSet(State.NEW, State.RUNNING)) {
+            return;
+        }
+        if (this.isShutdown()) {
+            return;
+        }
+        this.deferred = true;
+        if (!this.explicitLimit) {
+            this.gate.setLimit(this.desiredWorkers.get());
         }
         this.checkTerminated();
     }
@@ -415,6 +448,9 @@ public final class DynamicWorkerPool implements WorkerPool {
     public void resize(final int targetWorkers) {
         Preconditions.checkAtLeast(targetWorkers, 1, "targetWorkers");
         final int clamped = Math.clamp(targetWorkers, this.minWorkers, this.maxWorkers);
+        // the first resize after startDeferred is the real one: it spawns at exactly this size and the
+        // pool stops being deferred, so the transient count is never recorded
+        this.deferred = false;
         final int previous = this.desiredWorkers.getAndSet(clamped);
         this.retirementFloor.set(this.automatic ? this.minWorkers : clamped);
         if (!this.explicitLimit) {
@@ -471,6 +507,10 @@ public final class DynamicWorkerPool implements WorkerPool {
     }
 
     private void spawnUpTo(final int target) {
+        if (this.deferred) {
+            // the owner asked for a pool without workers; the first resize releases it
+            return;
+        }
         while (!this.isShutdown() && this.liveWorkers.get() < target) {
             synchronized (this.lifecycleLock) {
                 if (!this.spawnWorkerLocked()) {

@@ -42,6 +42,17 @@ public interface AsyncComputeScheduler {
     String DEFAULT_CONSUMER_ID = "default";
 
     /**
+     * Id of the consumer that receives work offloaded by overloaded regions.
+     *
+     * <p>The consumer is registered by the scheduler itself, always at
+     * {@link ComputePriority#NORMAL} and only for {@link ComputeTaskType#GENERAL} and
+     * {@link ComputeTaskType#CUSTOM} work. Its policy comes from {@link RegionReliefSettings} unless
+     * the configuration has an explicit {@code consumers.region-relief} override. The relief path is
+     * exposed through {@link #regionRelief()}.
+     */
+    String REGION_RELIEF_CONSUMER_ID = RegionRelief.CONSUMER_ID;
+
+    /**
      * Submits a task under the default consumer, {@link ComputeTaskType#GENERAL} and
      * {@link ComputePriority#NORMAL}.
      *
@@ -186,6 +197,19 @@ public interface AsyncComputeScheduler {
      * @throws NullPointerException     if an argument is {@code null}
      */
     void updateConsumerPolicy(String consumerId, ConsumerPolicy policy);
+
+    /**
+     * Returns the region relief service of this scheduler.
+     *
+     * <p>The service is always present, even when relief is switched off or the whole scheduler is
+     * disabled by configuration: in both cases a submission simply runs its work inline. The empty
+     * default keeps third party implementations source compatible.
+     *
+     * @return the relief service, or an empty optional when the implementation does not support relief
+     */
+    default Optional<RegionRelief> regionRelief() {
+        return Optional.empty();
+    }
 
     /**
      * Returns a snapshot of the scheduler metrics.

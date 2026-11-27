@@ -10,6 +10,7 @@ import kz.bejiihiu.tuff.compute.ComputeCancelledException;
 import kz.bejiihiu.tuff.compute.ComputePriority;
 import kz.bejiihiu.tuff.compute.ComputeRejectedException;
 import kz.bejiihiu.tuff.compute.ConsumerMetrics;
+import kz.bejiihiu.tuff.compute.RegionReliefMetrics;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics.LaneMetrics;
 
@@ -53,6 +54,7 @@ import kz.bejiihiu.tuff.compute.SchedulerMetrics.LaneMetrics;
  * @param lanes                     execution lane snapshot
  * @param runningTasks              tasks executing at the capture moment
  * @param recentTasks               recently finished tasks, slowest first
+ * @param regionRelief              region relief snapshot, empty when the scheduler has no relief path
  */
 public record SchedulerMetricsSnapshot(
     Instant capturedAt,
@@ -86,7 +88,8 @@ public record SchedulerMetricsSnapshot(
     LatencyStats executionStats,
     LaneMetrics lanes,
     List<RunningTaskInfo> runningTasks,
-    List<CompletedTaskInfo> recentTasks
+    List<CompletedTaskInfo> recentTasks,
+    Optional<RegionReliefMetrics> regionRelief
 ) implements SchedulerMetrics {
 
     /**
@@ -103,6 +106,7 @@ public record SchedulerMetricsSnapshot(
         Objects.requireNonNull(lanes, "lanes");
         Objects.requireNonNull(runningTasks, "runningTasks");
         Objects.requireNonNull(recentTasks, "recentTasks");
+        Objects.requireNonNull(regionRelief, "regionRelief");
         consumers = Map.copyOf(consumers);
         rejectedByReason = Map.copyOf(rejectedByReason);
         cancelledByReason = Map.copyOf(cancelledByReason);

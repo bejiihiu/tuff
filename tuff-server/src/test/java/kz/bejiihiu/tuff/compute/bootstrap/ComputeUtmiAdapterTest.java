@@ -18,6 +18,7 @@ import kz.bejiihiu.tuff.compute.ComputeTask;
 import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
 import kz.bejiihiu.tuff.compute.ComputeTaskType;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
+import kz.bejiihiu.tuff.compute.RegionReliefSettings;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.config.ComputeThreadBudget;
 import kz.bejiihiu.tuff.compute.internal.engine.impl.ComputeSchedulers;
@@ -316,6 +317,61 @@ class ComputeUtmiAdapterTest {
         assertTrue(adapter.processors() >= ComputeSettings.defaults().workers().minThreads(),
             "the pool never falls below its own min-threads");
         assertTrue(monitor.snapshot().poolBudget() >= adapter.processors());
+    }
+
+    @Test
+    void theReliefReserveSurvivesTickPressure() {
+        final ThreadManagerRuntime started = this.start(true, 16);
+        this.registerService(started);
+        // a policy that would happily take every core the pool has: max reserve 16, two cores per step
+        final ThreadManagementSettings.AsyncCompute.TickPressure policy =
+            new ThreadManagementSettings.AsyncCompute.TickPressure(true, 0.25d, 19.0d, 19.5d, 3, 2, 16, 2);
+        final TickPressureMonitor monitor = new TickPressureMonitor(policy, started.manager().resources()::usableCores);
+        final RegionReliefSettings relief = new RegionReliefSettings(
+            true, 8, 1, RegionReliefSettings.defaultConsumerPolicy()
+        );
+        final ComputeUtmiAdapter adapter = ComputeUtmiAdapter.attach(
+            started, ComputeSettings.defaults(), monitor, relief
+        );
+        monitor.bind(adapter.pressureSink());
+
+        final int poolBudget = started.manager().resources().budget(PoolId.COMPUTE).orElseThrow().cores();
+        assertEquals(1, adapter.reliefReserveCores());
+        for (int second = 1; second <= 30; second++) {
+            monitor.onSample(pass(lagging()), TimeUnit.SECONDS.toNanos(second));
+        }
+
+        final int minThreads = ComputeSettings.defaults().workers().minThreads();
+        assertEquals(poolBudget - minThreads - 1, monitor.snapshot().reserve(),
+            "pressure may take everything except the relief core");
+        assertEquals(minThreads + 1, monitor.snapshot().appliedBudget(),
+            "the pool keeps one core for relief even at the pressure ceiling");
+        assertEquals(minThreads + 1, adapter.processors(),
+            "the budget the engine reads carries the same reservation");
+    }
+
+    @Test
+    void aDisabledReliefPathLeavesThePressureCeilingAlone() {
+        final ThreadManagerRuntime started = this.start(true, 16);
+        this.registerService(started);
+        final ThreadManagementSettings.AsyncCompute.TickPressure policy =
+            new ThreadManagementSettings.AsyncCompute.TickPressure(true, 0.25d, 19.0d, 19.5d, 3, 2, 16, 2);
+        final TickPressureMonitor monitor = new TickPressureMonitor(policy, started.manager().resources()::usableCores);
+        final ComputeUtmiAdapter adapter = ComputeUtmiAdapter.attach(
+            started, ComputeSettings.defaults(), monitor, new RegionReliefSettings(
+                false, 8, 5, RegionReliefSettings.defaultConsumerPolicy()
+            )
+        );
+        monitor.bind(adapter.pressureSink());
+
+        final int poolBudget = started.manager().resources().budget(PoolId.COMPUTE).orElseThrow().cores();
+        for (int second = 1; second <= 30; second++) {
+            monitor.onSample(pass(lagging()), TimeUnit.SECONDS.toNanos(second));
+        }
+
+        assertEquals(poolBudget - ComputeSettings.defaults().workers().minThreads(), monitor.snapshot().reserve(),
+            "a relief path that is off must not withhold a core from the regions");
+        assertEquals(0, adapter.reliefReserveCores());
     }
 
     @Test

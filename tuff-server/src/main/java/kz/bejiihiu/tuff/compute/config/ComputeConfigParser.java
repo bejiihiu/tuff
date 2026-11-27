@@ -10,11 +10,13 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.OverflowPolicy;
+import kz.bejiihiu.tuff.compute.RegionReliefSettings;
 import org.bukkit.configuration.Configuration;
 import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.InvalidConfigurationException;
@@ -48,13 +50,16 @@ final class ComputeConfigParser {
     private static final String ADAPTIVE_PATH = SECTION + ".adaptive";
     private static final String LANES_PATH = SECTION + ".lanes";
     private static final String LANE_VIRTUAL_PATH = LANES_PATH + ".virtual";
+    private static final String RELIEF_PATH = SECTION + ".relief";
+    private static final String RELIEF_CONSUMER_PATH = RELIEF_PATH + ".consumer";
 
     private static final String DEFAULT_CONSUMER = "default";
     private static final String ALLOW_DYNAMIC_REGISTRATION = "allow-dynamic-registration";
 
     private static final Set<String> ROOT_KEYS = Set.of(SECTION, THREAD_MANAGEMENT);
     private static final Set<String> SETTINGS_KEYS = Set.of(
-        "enabled", "workers", "queue", "scheduling", "consumers", "metrics", "adaptive", "lanes", "shutdown-grace-seconds"
+        "enabled", "workers", "queue", "scheduling", "consumers", "metrics", "adaptive", "lanes", "relief",
+        "shutdown-grace-seconds"
     );
     private static final Set<String> WORKER_KEYS = Set.of(
         "threads", "min-threads", "max-threads", "keep-alive-seconds", "thread-name-prefix"
@@ -77,6 +82,9 @@ final class ComputeConfigParser {
     private static final Set<String> LANES_KEYS = Set.of("virtual");
     private static final Set<String> LANE_VIRTUAL_KEYS = Set.of(
         "enabled", "low-priority", "normal-spill", "max-concurrent", "spill-wait-millis", "spill-queue-depth"
+    );
+    private static final Set<String> RELIEF_KEYS = Set.of(
+        "enabled", "max-in-flight-per-region", "reserved-cores", "consumer"
     );
 
     private ComputeConfigParser() {
@@ -415,6 +423,80 @@ final class ComputeConfigParser {
             problems.add(new ConfigProblem(LANES_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
             return fallback;
         }
+    }
+
+    /**
+     * Parses the {@code async-compute.relief} section.
+     *
+     * <p>Split from {@link #parse(Configuration, List)} because relief settings are not part of
+     * {@link ComputeSettings}: the compute model stays free of an optional subsystem, and the parser
+     * still reports every relief key in the same problem list.
+     *
+     * @param configuration loaded YAML
+     * @param problems      problem sink, appended to in place
+     * @return the parsed relief settings, never {@code null}
+     */
+    static RegionReliefSettings parseRelief(final Configuration configuration, final List<ConfigProblem> problems) {
+        final RegionReliefSettings fallback = RegionReliefSettings.defaults();
+        final ConfigurationSection root = configuration.getConfigurationSection(SECTION);
+        if (root == null) {
+            return fallback;
+        }
+        final ConfigurationSection section = root.getConfigurationSection("relief");
+        if (section == null) {
+            return fallback;
+        }
+        final boolean enabled = readBoolean(section, "enabled", fallback.enabled(), RELIEF_PATH + ".enabled", problems);
+        int maxInFlight = readInt(
+            section, "max-in-flight-per-region", fallback.maxInFlightPerRegion(),
+            RELIEF_PATH + ".max-in-flight-per-region", problems
+        );
+        int reserved = readInt(
+            section, "reserved-cores", fallback.reservedCores(), RELIEF_PATH + ".reserved-cores", problems
+        );
+        final ConsumerPolicy policy = parsePolicy(
+            readSection(section, "consumer", RELIEF_CONSUMER_PATH, problems),
+            fallback.consumerPolicy(),
+            RELIEF_CONSUMER_PATH,
+            problems
+        );
+        if (maxInFlight < 1) {
+            problems.add(new ConfigProblem(
+                RELIEF_PATH + ".max-in-flight-per-region",
+                "must be at least 1, got " + maxInFlight + "; using " + fallback.maxInFlightPerRegion()
+            ));
+            maxInFlight = fallback.maxInFlightPerRegion();
+        }
+        if (reserved < 0) {
+            problems.add(new ConfigProblem(
+                RELIEF_PATH + ".reserved-cores",
+                "must not be negative, got " + reserved + "; using " + fallback.reservedCores()
+            ));
+            reserved = fallback.reservedCores();
+        }
+        try {
+            return new RegionReliefSettings(enabled, maxInFlight, reserved, policy);
+        } catch (final IllegalArgumentException | NullPointerException ex) {
+            problems.add(new ConfigProblem(RELIEF_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
+            return fallback;
+        }
+    }
+
+    /**
+     * Renders the relief settings as dotted keys, so a reload can see them change.
+     *
+     * @param relief relief settings to render
+     * @return ordered map of dotted key to display value
+     * @throws NullPointerException if {@code relief} is {@code null}
+     */
+    static Map<String, String> flattenRelief(final RegionReliefSettings relief) {
+        Objects.requireNonNull(relief, "relief");
+        final Map<String, String> flat = new LinkedHashMap<>();
+        flat.put(RELIEF_PATH + ".enabled", Boolean.toString(relief.enabled()));
+        flat.put(RELIEF_PATH + ".max-in-flight-per-region", Integer.toString(relief.maxInFlightPerRegion()));
+        flat.put(RELIEF_PATH + ".reserved-cores", Integer.toString(relief.reservedCores()));
+        flattenPolicy(flat, RELIEF_CONSUMER_PATH, relief.consumerPolicy());
+        return flat;
     }
 
     private static ComputeSettings.Lanes.Virtual parseVirtualLane(
@@ -878,6 +960,15 @@ final class ComputeConfigParser {
             lanes == null ? null : lanes.getConfigurationSection("virtual"),
             LANE_VIRTUAL_PATH,
             LANE_VIRTUAL_KEYS,
+            problems
+        );
+
+        final ConfigurationSection relief = root.getConfigurationSection("relief");
+        reportUnknownIn(relief, RELIEF_PATH, RELIEF_KEYS, problems);
+        reportUnknownIn(
+            relief == null ? null : relief.getConfigurationSection("consumer"),
+            RELIEF_CONSUMER_PATH,
+            CONSUMER_KEYS,
             problems
         );
 

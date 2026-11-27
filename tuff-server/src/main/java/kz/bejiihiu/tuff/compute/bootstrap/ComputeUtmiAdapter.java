@@ -5,6 +5,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
+import kz.bejiihiu.tuff.compute.RegionReliefSettings;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeBudgetPort;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
@@ -68,6 +69,7 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
     private final ThreadFactoryProvider provider;
     private final ThreadResourceController controller;
     private final ComputeSettings settings;
+    private final RegionReliefSettings relief;
     private final ComputeThreadFactoryPort legacy = ComputeThreadFactoryPort.legacy();
     private final ComputePoolProbe platformProbe;
     private final ComputePoolProbe virtualProbe;
@@ -82,11 +84,13 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
         final ThreadManagerRuntime runtime,
         final UnifiedThreadManager manager,
         final ComputeSettings settings,
+        final RegionReliefSettings relief,
         final @Nullable TickPressureMonitor pressure
     ) {
         this.runtime = runtime;
         this.manager = manager;
         this.settings = settings;
+        this.relief = relief;
         this.pressure = pressure;
         this.provider = manager.threadFactory();
         this.controller = manager.resources();
@@ -116,7 +120,7 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
         final ThreadManagerRuntime runtime,
         final ComputeSettings settings
     ) {
-        return attach(runtime, settings, null);
+        return attach(runtime, settings, null, RegionReliefSettings.defaults());
     }
 
     /**
@@ -135,13 +139,34 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
         final ComputeSettings settings,
         final @Nullable TickPressureMonitor pressure
     ) {
+        return attach(runtime, settings, pressure, RegionReliefSettings.defaults());
+    }
+
+    /**
+     * Binds the adapter with the region relief settings that own the protected core reserve.
+     *
+     * @param runtime  running thread manager runtime
+     * @param settings compute configuration the engine will run with
+     * @param pressure tick pressure monitor, or {@code null} when the policy is off
+     * @param relief   region relief configuration
+     * @return the adapter, never {@code null}
+     * @throws NullPointerException  if a required argument is {@code null}
+     * @throws IllegalStateException if the thread manager is not running
+     */
+    public static ComputeUtmiAdapter attach(
+        final ThreadManagerRuntime runtime,
+        final ComputeSettings settings,
+        final @Nullable TickPressureMonitor pressure,
+        final RegionReliefSettings relief
+    ) {
         Objects.requireNonNull(runtime, "runtime");
         Objects.requireNonNull(settings, "settings");
+        Objects.requireNonNull(relief, "relief");
         final UnifiedThreadManager manager = runtime.manager();
         if (!manager.isRunning()) {
             throw new IllegalStateException("the thread manager is " + manager.state() + ", not running");
         }
-        final ComputeUtmiAdapter adapter = new ComputeUtmiAdapter(runtime, manager, settings, pressure);
+        final ComputeUtmiAdapter adapter = new ComputeUtmiAdapter(runtime, manager, settings, relief, pressure);
         adapter.register();
         return adapter;
     }
@@ -213,7 +238,8 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
     }
 
     /**
-     * Applies the tick pressure reserve to a pool budget, never below {@code min-threads}.
+     * Applies the tick pressure reserve to a pool budget, never below {@code min-threads} and never
+     * below the core the relief path keeps for itself.
      *
      * @param poolBudget cores the pool owns right now
      * @param reserve    cores it is yielding to the regions
@@ -221,7 +247,19 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
      */
     private int applyReserve(final int poolBudget, final int reserve) {
         final int floor = Math.max(1, this.settings.workers().minThreads());
-        return Math.max(floor, TickPressureMonitor.budgetFor(poolBudget, reserve));
+        // the floor is absolute, exactly like min-threads itself: a budget smaller than the floor still
+        // runs the floor, because the engine refuses to go below it anyway
+        final int reliefFloor = floor + this.relief.effectiveReservedCores();
+        return Math.max(reliefFloor, TickPressureMonitor.budgetFor(poolBudget, reserve));
+    }
+
+    /**
+     * Returns the cores the pool must keep for relief no matter what pressure decides.
+     *
+     * @return the effective relief reserve, never negative
+     */
+    int reliefReserveCores() {
+        return this.relief.effectiveReservedCores();
     }
 
     /**
@@ -464,11 +502,13 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
                 return 0;
             }
             final int configured = Math.max(0, monitor.maxReserveCores());
-            // the floor is the pool's own min-threads, and it applies to the pool budget - the same
-            // number the engine is sized from - not to the ledger's usable
+            // the floor is the pool's own min-threads plus the relief reserve, and it applies to the
+            // pool budget - the same number the engine is sized from - not to the ledger's usable.
+            // without the relief part, pressure would be allowed to take the last core relief has
             final int floor = Math.max(0,
                 ComputeUtmiAdapter.this.poolBudget(Math.max(1, usableCores))
-                    - Math.max(1, ComputeUtmiAdapter.this.settings.workers().minThreads()));
+                    - Math.max(1, ComputeUtmiAdapter.this.settings.workers().minThreads())
+                    - ComputeUtmiAdapter.this.reliefReserveCores());
             return Math.min(configured, floor);
         }
 

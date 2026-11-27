@@ -7,6 +7,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -21,6 +22,7 @@ import kz.bejiihiu.tuff.compute.ComputeRejectedException;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ConsumerMetrics;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
+import kz.bejiihiu.tuff.compute.RegionReliefMetrics;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.internal.metrics.JfrRecorder;
 import kz.bejiihiu.tuff.compute.internal.metrics.MetricsCollector;
@@ -100,6 +102,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
     private final Supplier<List<SchedulerMetrics.RunningTaskInfo>> runningTasks;
     private final Supplier<List<SchedulerMetrics.CompletedTaskInfo>> recentTasks;
     private final IntSupplier executionCapacity;
+    private final Supplier<Optional<RegionReliefMetrics>> reliefMetrics;
     private final ComputeThreadFactoryPort threads;
     private final ConcurrentHashMap<String, ConsumerState> consumers = new ConcurrentHashMap<>();
     private final ThreadLocal<StartedMark> startedMark = ThreadLocal.withInitial(StartedMark::new);
@@ -227,6 +230,37 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         final IntSupplier executionCapacity,
         final ComputeThreadFactoryPort threads
     ) {
+        this(settings, clock, recorder, lanes, runningTasks, recentTasks, executionCapacity, threads, Optional::empty);
+    }
+
+    /**
+     * Creates a collector that also reports the region relief counters.
+     *
+     * <p>The supplier is read once per snapshot and only while a snapshot is built, never on the hot
+     * path. A scheduler without relief support passes {@link Optional#empty()}.
+     *
+     * @param settings          scheduler settings, the metrics section drives what is collected
+     * @param clock             clock used for snapshot timestamps and throughput sampling
+     * @param recorder          flight recorder bridge, never {@code null}
+     * @param lanes             supplier of the lane snapshot, called once per snapshot
+     * @param runningTasks      supplier of the currently running tasks, called once per snapshot
+     * @param recentTasks       supplier of recently finished tasks, slowest first, called once per snapshot
+     * @param executionCapacity supplier of the capacity relative limits resolve against, {@code 0} when unknown
+     * @param threads           source of the sampler thread, never {@code null}
+     * @param reliefMetrics     supplier of the relief snapshot, never {@code null}
+     * @throws NullPointerException if an argument is {@code null}
+     */
+    public ComputeMetricsCollector(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final JfrRecorder recorder,
+        final Supplier<SchedulerMetrics.LaneMetrics> lanes,
+        final Supplier<List<SchedulerMetrics.RunningTaskInfo>> runningTasks,
+        final Supplier<List<SchedulerMetrics.CompletedTaskInfo>> recentTasks,
+        final IntSupplier executionCapacity,
+        final ComputeThreadFactoryPort threads,
+        final Supplier<Optional<RegionReliefMetrics>> reliefMetrics
+    ) {
         Objects.requireNonNull(settings, "settings");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.recorder = Objects.requireNonNull(recorder, "recorder");
@@ -234,6 +268,7 @@ public final class ComputeMetricsCollector implements MetricsCollector {
         this.runningTasks = Objects.requireNonNull(runningTasks, "runningTasks");
         this.recentTasks = Objects.requireNonNull(recentTasks, "recentTasks");
         this.executionCapacity = Objects.requireNonNull(executionCapacity, "executionCapacity");
+        this.reliefMetrics = Objects.requireNonNull(reliefMetrics, "reliefMetrics");
         this.threads = Objects.requireNonNull(threads, "threads");
         final ComputeSettings.Metrics metrics = settings.metrics();
         this.metricsEnabled = metrics.enabled();
@@ -538,7 +573,8 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             executionStats,
             this.lanes.get(),
             this.runningTasks.get(),
-            this.recentTasks.get()
+            this.recentTasks.get(),
+            this.reliefMetrics.get()
         );
     }
 
@@ -838,7 +874,8 @@ public final class ComputeMetricsCollector implements MetricsCollector {
             LatencyStats.empty(),
             this.lanes.get(),
             this.runningTasks.get(),
-            this.recentTasks.get()
+            this.recentTasks.get(),
+            this.reliefMetrics.get()
         );
     }
 

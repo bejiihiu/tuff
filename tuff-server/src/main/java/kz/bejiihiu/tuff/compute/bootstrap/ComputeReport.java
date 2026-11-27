@@ -12,6 +12,7 @@ import kz.bejiihiu.tuff.compute.ComputeConsumer;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ConsumerMetrics;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
+import kz.bejiihiu.tuff.compute.RegionReliefMetrics;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.config.ConfigLoadResult;
 import kz.bejiihiu.tuff.compute.config.ConfigProblem;
@@ -143,7 +144,31 @@ public final class ComputeReport {
                 + ", execution avg " + formatDuration(consumerMetrics.averageExecutionTime())
                 + " / longest " + formatDuration(consumerMetrics.longestExecutionTime()));
         }
+        metrics.regionRelief().ifPresent(relief -> lines.addAll(describeRelief(relief)));
         return List.copyOf(lines);
+    }
+
+    /**
+     * Builds the region relief lines shown below the consumer table.
+     *
+     * <p>Relief has counters the generic consumer snapshot cannot carry (stale results, inline
+     * fallbacks, estimated saved time), so they are printed as one block. A disabled relief path is
+     * still printed: an operator has to be able to see that the path exists and is switched off.
+     *
+     * @param relief relief snapshot
+     * @return the lines of the relief block
+     */
+    static List<String> describeRelief(final RegionReliefMetrics relief) {
+        return List.of(
+            INDENT + "region relief: " + (relief.enabled() ? "enabled" : "off, every request runs inline")
+                + ", " + relief.inFlight() + " in flight / " + relief.maxInFlightPerRegion() + " per region"
+                + ", reserve " + relief.reservedCores() + " core(s)",
+            INDENT + INDENT + relief.requests() + " requests, " + relief.accepted() + " accepted, "
+                + relief.completed() + " completed, " + relief.stale() + " stale, "
+                + relief.inlineFallbacks() + " inline fallbacks (" + relief.expired() + " expired), "
+                + relief.failed() + " failed, " + relief.dropped() + " dropped, "
+                + formatDuration(Duration.ofNanos(relief.estimatedSavedNanos())) + " estimated saved"
+        );
     }
 
     /**

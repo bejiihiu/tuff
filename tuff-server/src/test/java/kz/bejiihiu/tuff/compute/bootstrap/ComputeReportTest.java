@@ -125,6 +125,20 @@ class ComputeReportTest {
     }
 
     @Test
+    void theConsumerBreakdownShowsTheReliefPathEvenWhenItIsOff() throws Exception {
+        final AsyncComputeScheduler scheduler = startScheduler();
+        try {
+            final String report = String.join("\n", ComputeReport.consumers(ComputeStatus.running(scheduler)));
+
+            assertTrue(report.contains("region-relief"), report);
+            assertTrue(report.contains("region relief: off, every request runs inline"), report);
+            assertTrue(report.contains("0 requests, 0 accepted, 0 completed, 0 stale, 0 inline fallbacks"), report);
+        } finally {
+            stopScheduler(scheduler);
+        }
+    }
+
+    @Test
     void tasksOfAnIdleEngineSayNothingIsRunning() throws Exception {
         final AsyncComputeScheduler scheduler = startScheduler();
         try {

@@ -33,6 +33,22 @@ class ConfigDiffTest {
     }
 
     @Test
+    void reliefKeysAreRestartOnly() {
+        final ConfigDiff diff = ConfigDiff.between(
+            Map.of("async-compute.relief.enabled", "false"),
+            Map.of(
+                "async-compute.relief.enabled", "true",
+                "async-compute.relief.reserved-cores", "2",
+                "async-compute.relief.consumer.max-concurrent", "0.5"
+            )
+        );
+
+        assertEquals(3, diff.changedPaths().size(), diff.changedPaths().toString());
+        assertEquals(diff.changedPaths(), diff.restartRequiredPaths());
+        assertTrue(diff.livePaths().isEmpty(), "relief is wired into the pool at start, so no key is live");
+    }
+
+    @Test
     void computeConsumersStayTheOnlyLiveKeys() {
         final ConfigDiff diff = ConfigDiff.between(
             Map.of("async-compute.consumers.default.max-queued-tasks", "-1"),

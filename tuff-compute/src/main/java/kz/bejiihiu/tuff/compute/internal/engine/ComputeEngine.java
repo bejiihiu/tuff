@@ -9,6 +9,7 @@ import kz.bejiihiu.tuff.compute.ComputeRequest;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
+import kz.bejiihiu.tuff.compute.RegionRelief;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
 
@@ -151,4 +152,14 @@ public interface ComputeEngine {
      * @return the clock
      */
     ComputeClock clock();
+
+    /**
+     * Returns the region relief path of this engine.
+     *
+     * <p>The service exists before the engine starts and keeps working while the engine is disabled;
+     * submissions then run inline.
+     *
+     * @return the relief service, never {@code null}
+     */
+    RegionRelief regionRelief();
 }

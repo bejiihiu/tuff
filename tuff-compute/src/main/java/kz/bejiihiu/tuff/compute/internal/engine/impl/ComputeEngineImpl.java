@@ -28,8 +28,12 @@ import kz.bejiihiu.tuff.compute.ComputeRequest;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.ComputeShutdownException;
 import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
+import kz.bejiihiu.tuff.compute.ComputeTaskType;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.OverflowPolicy;
+import kz.bejiihiu.tuff.compute.RegionRelief;
+import kz.bejiihiu.tuff.compute.RegionReliefMetrics;
+import kz.bejiihiu.tuff.compute.RegionReliefSettings;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.internal.adaptive.AdaptiveConcurrencyController;
 import kz.bejiihiu.tuff.compute.internal.adaptive.impl.AimdAdaptiveConcurrencyController;
@@ -48,6 +52,7 @@ import kz.bejiihiu.tuff.compute.internal.queue.QueueEntry;
 import kz.bejiihiu.tuff.compute.internal.queue.QuotaController;
 import kz.bejiihiu.tuff.compute.internal.queue.impl.AtomicQuotaController;
 import kz.bejiihiu.tuff.compute.internal.queue.impl.BoundedComputeQueue;
+import kz.bejiihiu.tuff.compute.internal.relief.impl.RegionReliefImpl;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeBudgetPort;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
@@ -108,6 +113,28 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
 
     private final ComputeSettings settings;
     private final ComputeClock clock;
+
+    /**
+     * Relief configuration. Kept outside {@link ComputeSettings} on purpose: it is an optional path
+     * with its own switch, and a plain compute embedder must not have to know about it.
+     */
+    private final RegionReliefSettings reliefSettings;
+
+    /**
+     * {@code true} while the first worker spawn is deferred until the first processor budget arrives.
+     *
+     * <p>The server starts the engine before the region scheduler exists and can only compute the real
+     * budget afterwards. Spawning from the provisional budget would create a pool that is immediately
+     * shrunk, and the peak gauge would report a size the server never needed. Every sizing path reads
+     * this flag, so a submission or the janitor cannot create workers before the budget is known.
+     */
+    private volatile boolean workersDeferred;
+
+    /**
+     * Region relief path of this engine. Created eagerly because it owns no thread; it only submits
+     * through {@link #enqueue(ComputeRequest)}.
+     */
+    private final RegionReliefImpl relief;
 
     /**
      * Where every thread of the engine comes from. The legacy port delegates to the same factories
@@ -236,17 +263,47 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         final int processorBudget,
         final ComputeThreadFactoryPort threads
     ) {
+        this(settings, clock, processorBudget, threads, RegionReliefSettings.defaults(), false);
+    }
+
+    /**
+     * Creates an engine with relief settings and an optional deferred worker start.
+     *
+     * <p>A deferred start leaves the pool without workers until the first
+     * {@link #applyProcessorBudget(int)} call. It exists for a server that starts the engine before it
+     * knows how many cores it owns; an embedder that knows the budget at construction must not use it.
+     *
+     * @param settings         scheduler configuration
+     * @param clock            clock used by every component
+     * @param processorBudget  processors available to the engine, at least {@code 1}
+     * @param threads          source of every engine thread
+     * @param reliefSettings   region relief configuration
+     * @param deferWorkerSpawn whether the first worker spawn waits for the first processor budget
+     * @throws NullPointerException     if an argument is {@code null}
+     * @throws IllegalArgumentException if {@code processorBudget} is not positive
+     */
+    ComputeEngineImpl(
+        final ComputeSettings settings,
+        final ComputeClock clock,
+        final int processorBudget,
+        final ComputeThreadFactoryPort threads,
+        final RegionReliefSettings reliefSettings,
+        final boolean deferWorkerSpawn
+    ) {
         this.settings = Preconditions.requireNonNull(settings, "settings");
         this.clock = Preconditions.requireNonNull(clock, "clock");
         this.threads = Preconditions.requireNonNull(threads, "threads");
+        this.reliefSettings = Preconditions.requireNonNull(reliefSettings, "reliefSettings");
         Preconditions.checkAtLeast(processorBudget, 1, "processorBudget");
         this.processorBudget = processorBudget;
         this.workerCeiling = this.ceilingFor(processorBudget);
+        this.workersDeferred = deferWorkerSpawn;
         final int initialConcurrency = Math.max(1, settings.workers().resolveThreadCount(processorBudget));
         this.platformLevelMask = settings.lanes().virtual().servesLow() ? 0b1110 : 0b1111;
         this.queue = new BoundedComputeQueue(settings, clock);
         this.quota = new AtomicQuotaController(initialConcurrency);
         this.queue.setEvictionListener(this::onEvicted);
+        this.relief = new RegionReliefImpl(this, reliefSettings, clock);
     }
 
     /**
@@ -439,6 +496,20 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     }
 
     @Override
+    public RegionRelief regionRelief() {
+        return this.relief;
+    }
+
+    /**
+     * Returns the relief counters in the shape the metrics snapshot carries.
+     *
+     * @return the relief snapshot, never {@code null}
+     */
+    RegionReliefMetrics reliefMetrics() {
+        return this.relief.metrics();
+    }
+
+    @Override
     public boolean requestCancel(final TaskHandle<?> handle) {
         final QueueEntry entry = handle.entry();
         if (entry == null) {
@@ -550,7 +621,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     void evaluateAdaptiveNow() {
         final AdaptiveConcurrencyController controller = this.adaptive;
         final DynamicWorkerPool currentPool = this.pool;
-        if (controller == null || currentPool == null) {
+        if (controller == null || currentPool == null || this.workersDeferred) {
             return;
         }
         final int requested = controller.evaluate();
@@ -585,6 +656,15 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             // the dispatcher already made room for
             currentPool.setCeiling(ceiling);
         }
+        if (this.workersDeferred) {
+            // the first real budget is what the pool was waiting for: spawn it once, at this size, so
+            // no transient worker count is ever recorded
+            this.releaseDeferredWorkers(target);
+            LOG.log(System.Logger.Level.INFO,
+                "compute pool created with " + target + " worker(s) for the processor budget of "
+                    + processors + " (ceiling " + previousCeiling + " -> " + ceiling + ')');
+            return;
+        }
         final AdaptiveConcurrencyController controller = this.adaptive;
         if (controller != null && controller.enabled()) {
             // the controller keeps its short-term throttle, but it must not outlive the budget
@@ -596,6 +676,22 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         LOG.log(System.Logger.Level.INFO,
             "compute processor budget changed from " + previousBudget + " to " + processors
                 + " (target workers " + target + ", ceiling " + previousCeiling + " -> " + ceiling + ')');
+    }
+
+    /**
+     * Starts the deferred pool at its first real size.
+     *
+     * <p>Called once, under {@link #sizingLock}, by the first budget application. Clearing the flag
+     * before the resize is what lets the resize spawn: every other sizing path refuses to run while
+     * the flag is set.
+     *
+     * @param target workers the first budget resolves to, at least {@code 1}
+     */
+    private void releaseDeferredWorkers(final int target) {
+        synchronized (this.sizingLock) {
+            this.workersDeferred = false;
+            this.applyPoolSize(target);
+        }
     }
 
     /**
@@ -679,7 +775,8 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this::runningTaskSnapshot,
             this.recentTasks::snapshot,
             this.quota::totalLimit,
-            this.threads
+            this.threads,
+            () -> Optional.of(this.reliefMetrics())
         );
         this.metricsCollector = collector;
         final DispatcherImpl newDispatcher = new DispatcherImpl(
@@ -797,7 +894,13 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (newPool == null || newDispatcher == null || collector == null || controller == null) {
             throw new IllegalStateException("compute runtime was not wired");
         }
-        newPool.start();
+        if (this.workersDeferred) {
+            // the server knows the budget only after its region scheduler started, so the pool is
+            // created empty and spawned by the first applyProcessorBudget call
+            newPool.startDeferred();
+        } else {
+            newPool.start();
+        }
         final VirtualLane lane = this.virtualLane;
         if (lane != null) {
             lane.start();
@@ -864,6 +967,23 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
                 this.registerIfAbsent(override.getKey(), this.inheritedPolicy(override.getKey()));
             }
         }
+        // relief always exists: with the trigger off it reports inline fallbacks instead of vanishing,
+        // so an operator can see that the path is wired but idle
+        this.registerIfAbsent(RegionRelief.CONSUMER_ID, this.reliefPolicy());
+    }
+
+    /**
+     * Returns the policy of the relief consumer.
+     *
+     * <p>An explicit {@code consumers.region-relief} section wins, because that is where an
+     * administrator tunes every other consumer. Without it the dedicated relief policy applies, which
+     * is bounded and expires quickly instead of inheriting the generic default.
+     *
+     * @return the policy the relief consumer is registered with
+     */
+    private ConsumerPolicy reliefPolicy() {
+        final ConsumerPolicy explicit = this.settings.consumers().overrides().get(RegionRelief.CONSUMER_ID);
+        return explicit != null ? explicit : this.reliefSettings.consumerPolicy();
     }
 
     /**
@@ -901,7 +1021,16 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         if (this.registry.find(consumerId).isPresent()) {
             return;
         }
-        final ComputeConsumer consumer = ComputeConsumer.of(consumerId, policy);
+        final ComputeConsumer consumer = RegionRelief.CONSUMER_ID.equals(consumerId)
+            // relief is a deferrable NORMAL path by contract: no HIGH, no CRITICAL, and only the
+            // task types it actually uses
+            ? ComputeConsumer.of(
+                consumerId,
+                Set.of(ComputeTaskType.GENERAL, ComputeTaskType.CUSTOM),
+                ComputePriority.NORMAL,
+                policy
+            )
+            : ComputeConsumer.of(consumerId, policy);
         this.registry.register(consumer);
         this.queue.registerConsumer(consumerId, policy);
         this.quota.updateConsumerPolicy(consumerId, policy);
@@ -1036,7 +1165,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     }
 
     private void maybeGrow() {
-        if (!this.settings.workers().automaticThreadCount()) {
+        if (!this.settings.workers().automaticThreadCount() || this.workersDeferred) {
             return;
         }
         final AdaptiveConcurrencyController controller = this.adaptive;
@@ -1049,7 +1178,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         }
         final int ceiling = this.workerCeiling;
         final int desired = currentPool.desiredWorkers();
-        if (desired >= ceiling || currentPool.idleWorkers() > 0 || this.platformBacklog() <= 0) {
+        if (desired >= ceiling || currentPool.idleWorkers() > 0 || this.growthBacklog() <= 0) {
             return;
         }
         if (!this.growInFlight.compareAndSet(false, true)) {
@@ -1058,7 +1187,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         try {
             if (currentPool.desiredWorkers() < ceiling
                 && currentPool.idleWorkers() == 0
-                && this.platformBacklog() > 0) {
+                && this.growthBacklog() > 0) {
                 this.applyPoolSize(currentPool.desiredWorkers() + 1);
             }
         } finally {
@@ -1067,7 +1196,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
     }
 
     private void autoscale() {
-        if (!this.settings.workers().automaticThreadCount() || !this.isClaiming()) {
+        if (!this.settings.workers().automaticThreadCount() || !this.isClaiming() || this.workersDeferred) {
             return;
         }
         final AdaptiveConcurrencyController controller = this.adaptive;
@@ -1082,7 +1211,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         }
         final int ceiling = this.workerCeiling;
         final int minimum = Math.min(this.settings.workers().minThreads(), ceiling);
-        final int backlog = this.platformBacklog()
+        final int backlog = this.growthBacklog()
             + (currentDispatcher == null ? 0 : currentDispatcher.platformCarriedEntries());
         final int target;
         if (backlog <= 0) {
@@ -1108,7 +1237,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
      */
     private void applyPoolSize(final int target) {
         final DynamicWorkerPool currentPool = this.pool;
-        if (currentPool == null) {
+        if (currentPool == null || this.workersDeferred) {
             return;
         }
         synchronized (this.sizingLock) {
@@ -1143,6 +1272,20 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             return aware.queuedInLane(LaneAwareQueue.Lane.PLATFORM, this.platformLevelMask);
         }
         return this.queue.size();
+    }
+
+    /**
+     * Returns the platform backlog that may grow the pool.
+     *
+     * <p>Region relief work is excluded on purpose: relief exists to make an overloaded region
+     * cheaper, not to justify a bigger compute pool. Counting it here would let a lagging region grow
+     * the pool with work it is only trying to shed, which is the opposite of the intent. The work is
+     * still queued, still admitted and still visible in the queue gauges.
+     *
+     * @return queued platform entries except region relief work
+     */
+    int growthBacklog() {
+        return Math.max(0, this.platformBacklog() - this.queue.size(RegionRelief.CONSUMER_ID));
     }
 
     private boolean isClaiming() {
@@ -1431,7 +1574,8 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             LatencyStats.empty(),
             this.laneSnapshot(),
             List.of(),
-            List.of()
+            List.of(),
+            Optional.of(this.reliefMetrics())
         );
     }
 }

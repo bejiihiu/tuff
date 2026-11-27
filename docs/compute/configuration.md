@@ -37,14 +37,14 @@ publishes an immutable snapshot and logs every problem. The command prints the s
 A live pool adopts very little. The bootstrap compares the previous and the updated effective policy of
 every consumer that is **already registered on the engine** and calls
 `AsyncComputeScheduler#updateConsumerPolicy` for the ones that differ. Everything else — `enabled`,
-`workers.*`, `queue.capacity`, `scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*`,
+`workers.*`, `queue.capacity`, `scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*`, `relief.*`,
 `shutdown-grace-seconds` — is
 reported as `takes effect after a restart`. Consumer overrides for ids that are not registered yet are not
 applied either: dynamic registration reads the policy from the engine's startup snapshot, so a new consumer
 gets its new limits only after a restart. Such an override is not added to the deferred list either.
 
 The loader's `ConfigDiff` marks the same startup-only set (`enabled`, `workers.*`, `queue.capacity`,
-`scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*`, `shutdown-grace-seconds`,
+`scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*`, `relief.*`, `shutdown-grace-seconds`,
 `allow-dynamic-registration`), so the log line and the command agree. `queue.overflow-policy` and the
 policies of already registered consumers are the only keys a reload applies to the running engine.
 
@@ -115,6 +115,12 @@ When workers are automatic and adaptive concurrency is off, the pool grows on de
 submission that finds a backlog and no idle worker, plus a janitor reconciliation every tick) and shrinks
 back to `min-threads` after `keep-alive-seconds`. An explicit `threads` pins both the count and the
 adaptive controller.
+
+The server starts the engine before the region scheduler exists, so the first budget is provisional. With an
+automatic worker count the pool is created **empty** and spawned once, when the real budget arrives right after
+region startup; until then submissions queue. This keeps `peakWorkers` honest: it reports the size the pool was
+actually created with, never a provisional number that was resized away a moment later. A fixed `threads`
+count is spawned at start, as before.
 
 ## `async-compute.queue`
 
@@ -205,6 +211,27 @@ section nobody uses costs nothing but can be deleted.
 
 No built-in consumer exists in this build for any server subsystem. Treat these three ids as placeholders
 to copy, rename or remove.
+
+One consumer is registered by the engine itself: **`region-relief`**, the path an overloaded region uses to
+shed pure computation. It is always at `NORMAL` priority, only for `GENERAL` and `CUSTOM` tasks, and its
+policy comes from `async-compute.relief.consumer` unless a `consumers.region-relief` section overrides it.
+See [Region relief](region-relief.md).
+
+## `async-compute.relief`
+
+The relief path is fully documented on [its own page](region-relief.md); this table is the key reference.
+
+| Key | Type | Default | Allowed | Effect | Restart |
+| --- | --- | --- | --- | --- | --- |
+| `enabled` | boolean | `false` | `true`/`false` | Offload relief work. `false` runs every submission inline and holds no core back from pressure | yes |
+| `max-in-flight-per-region` | integer | `8` | `>= 1` | Accepted relief requests one region may have outstanding; the next one runs inline | yes |
+| `reserved-cores` | integer | `1` | `>= 0` | Cores tick pressure may not take away from the pool; only applied while `enabled` | yes |
+| `consumer.enabled` | boolean | `true` | `true`/`false` | Whether the `region-relief` consumer accepts work | yes |
+| `consumer.max-concurrent` | integer or fraction | `0.25` | `-1`, `>= 1`, or `(0.0, 1.0]` | Relief share of the execution capacity | yes |
+| `consumer.fair-share-weight` | number | `0.5` | finite `> 0` | Dispatch weight against other consumers | yes |
+| `consumer.max-queued-tasks` | integer | `64` | `-1` or `>= 0` | Relief queue bound | yes |
+| `consumer.overflow-policy` | enum | `reject` | `reject`, `drop-oldest` | Overflow behaviour. `reject` is the only sensible value: a stale relief result is worthless | yes |
+| `consumer.max-queue-wait-seconds` | number | `2` | `>= 0` | Accepted relief work that waits longer is cancelled and rerun inline | yes |
 
 ## `async-compute.metrics`
 

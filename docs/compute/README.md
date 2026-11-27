@@ -50,9 +50,13 @@ following are not:
 | Not included | What it means for you |
 | --- | --- |
 | Built-in consumers | No server subsystem submits to the pool. The `consumers.chunk-generation`, `consumers.pathfinding` and `consumers.ai-computation` sections are **examples** of policies for ids that a plugin or a future subsystem may use; nothing runs under those ids by default |
+| Automatic relief trigger | The `region-relief` consumer and the offload API are wired and fully usable, but nothing decides on its own that a region should shed work. Offloading stays off until `async-compute.relief.enabled` is set and a region subsystem submits, see [Region relief](region-relief.md) |
 
 The server bootstrap creates, starts and installs the engine before plugins are enabled; plugins only read
 it. `/tuff` reports it and controls JFR.
+
+Related pages: [Region relief](region-relief.md) for the offload path an overloaded region can use, and
+[Plugin API](plugin-api.md) for the general submission and handoff contract.
 
 ## Enable it
 

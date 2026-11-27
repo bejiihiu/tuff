@@ -61,7 +61,9 @@ percentiles, so the command shows averages and longest values only.
 
 `consumers` prints, for every registered consumer, its policy (enabled, concurrency limit, weight, queue
 bound, overflow policy, max wait), active/limit and queued/bound, the same counters, and wait/execution
-averages.
+averages. Below the table it prints the region relief block (state, in-flight/limit, reserve, requests,
+accepted, completed, stale, inline fallbacks, failures, drops and the estimated saved time), or
+`region relief: off, every request runs inline` when the path exists but is not enabled.
 
 `reload` sends `Reloading the compute configuration...` and then runs on the global tick thread. It reports
 the number of changes, the consumer policies applied now, the keys that take effect after a restart and
@@ -86,6 +88,7 @@ immutable snapshot. If the engine is not running, neither is available.
 | `rejectedTasks` | Refused submissions, never queued | Any sustained increase means backpressure is real |
 | `cancelledTasks` | Cancelled after acceptance (any reason) | Spikes after deployment restarts are expected |
 | `expiredTasks` | Cancelled because `max-queue-wait` elapsed | Non-zero means the consumer cannot keep up with its own production |
+| `regionRelief` | Relief requests/accepted/completed/stale/inline fallbacks/drops and estimated saved time | High `inlineFallbacks` means the relief share, cap or wait is too tight; high `stale` means results arrive too late to be useful |
 | `queuedTasks` / `queueCapacity` | Current depth / bound | Depth pinned at capacity is the clearest overload signal |
 | `totalWorkers` | Live workers | Should follow load when sizing is automatic |
 | `activeWorkers` | Workers inside a task | Compare with `concurrencyLimit`, not with `totalWorkers` |
@@ -309,7 +312,7 @@ These are deliberate, with the technical reason:
 - **Queue capacity needs a restart.** The queue allocates its bound at construction; growing it live would
   require a different structure with the same ordering guarantees.
 - **Live reload is narrow.** Only the policies of consumers that are already registered change on a running
-  engine. `workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*` and
+  engine. `workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*`, `lanes.*`, `relief.*` and
   `shutdown-grace-seconds` need a restart, and an override for a consumer that has not registered yet is
   only read at startup.
 - **`queue.overflow-policy` is a default, not an override.** It applies to the `default` consumer and to

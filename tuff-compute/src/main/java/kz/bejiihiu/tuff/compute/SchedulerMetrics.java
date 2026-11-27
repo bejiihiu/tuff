@@ -217,6 +217,19 @@ public interface SchedulerMetrics {
     Map<String, ConsumerMetrics> consumers();
 
     /**
+     * Returns the region relief snapshot.
+     *
+     * <p>Implementations without a relief path return an empty optional, which is also what a
+     * scheduler without one would report. The snapshot is a point in time view; its counters are
+     * monotonic like the rest of this interface.
+     *
+     * @return the relief snapshot, or an empty optional when relief is not part of this scheduler
+     */
+    default Optional<RegionReliefMetrics> regionRelief() {
+        return Optional.empty();
+    }
+
+    /**
      * Returns the snapshot of one consumer.
      *
      * @param consumerId consumer to look up
