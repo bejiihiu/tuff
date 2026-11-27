@@ -92,11 +92,14 @@ server presets in [`tuning.md`](docs/compute/tuning.md).
 
 Tuff also has a unified thread layer: one registry of every execution pool, one CPU budget ledger, a
 central thread factory and one metrics view over the threads the server already runs. It is observe-only
-by default and does not change how Folia ticks regions or how the compute engine orders tasks. The
-`/tuff threads` command lists the registered pools with their coverage level and the reason a pool is not
-managed yet; the configuration is the `thread-management` section of `config/tuff.yml`. Start with
+by default and does not change how Folia ticks regions or how the compute engine orders tasks.
+`region-execution.managed: true` raises the region pool to L2, where each tick body is accounted by the
+factory while the thread itself stays Folia's. The `/tuff threads` command lists the registered pools
+with their coverage level and the reason a pool is not managed yet; the configuration is the
+`thread-management` section of `config/tuff.yml`. Start with
 [`docs/utmi/`](docs/utmi/README.md): [architecture](docs/utmi/architecture.md),
-[configuration](docs/utmi/configuration.md), [observability](docs/utmi/observability.md).
+[configuration](docs/utmi/configuration.md), [coverage](docs/utmi/coverage.md),
+[observability](docs/utmi/observability.md).
 
 ## Region threading (the Folia part)
 

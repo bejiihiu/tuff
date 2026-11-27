@@ -40,7 +40,9 @@ not execution.
   `/tuff threads` (unless per-pool publication is switched off), a coverage level and a budget.
 - `region-execution` is observed through a probe: live thread count from Folia's region scheduler, the
   thread list from its thread group, active and idle derived from `Thread.getState()`, CPU time per
-  thread from `ThreadMXBean`.
+  thread from `ThreadMXBean`. With `region-execution.managed: true` the same pool is raised to L2 and
+  the `RegionThreads` bridge wraps each tick body, so Folia's threads are accounted while they run
+  without changing their class, name, group, daemon flag or handler.
 - The CPU ledger is computed once from the processor topology, the configured reserve and the
   deductions, and re-derived whenever the registered pool set changes. It reports itself degraded when
   the arithmetic cannot cover what the pools declared.
@@ -59,14 +61,14 @@ but do not execute yet, and why.
 
 | Not included | Effect today | Why |
 | --- | --- | --- |
-| Region threads created through the provider (L2) | With `region-execution.managed: true` the pool is registered at L2 and each tick body goes through `ThreadFactoryProvider.wrap`, so region threads are accounted while they run. Folia still creates its own `TickThreadRunner` objects: the class, name, group, daemon flag and uncaught handler stay Folia's | L2 is the deepest honest level here. Creating the threads elsewhere needs a replacement scheduler, not a wrapper: ownership checks, `AsyncCatcher` and the shutdown contract all key off the concrete tick thread class |
-| Compute at L4 | `compute` and `compute-virtual` are registered at L1; the engine keeps its own threads, queue and sizing | The SPI ports exist in `tuff-compute`, but the server-side adapter that registers the pool, asks the controller for a budget and reports through a probe is not wired |
+| Region threads at L2 (bodies wrapped) | With `region-execution.managed: true` the pool is registered at L2 and each tick body goes through `ThreadFactoryProvider.wrap`, so region threads are accounted while they run. Folia still creates its own `TickThreadRunner` objects: the class, name, group, daemon flag and uncaught handler stay Folia's | L2 is the deepest honest level here. Creating the threads elsewhere needs a replacement scheduler, not a wrapper: ownership checks, `AsyncCatcher` and the shutdown contract all key off the concrete tick thread class |
+| Compute at L4 | Only with `execution-pools.compute.managed: true` (or its older spelling). Off, `compute` and `compute-virtual` are registered at L1 and the engine keeps its own threads, queue and sizing | The adapter exists, but management is a separate reviewed step; the safe default is observation. With the flag on, the engine takes its workers and processor budget from the thread layer and keeps its queue |
 | Probes for chunk, netty, IO and service pools | These pools appear with `alive 0` and unknown queue depth; nothing is measured for them | Their owners expose no read-only observation yet. Moonrise has thread counts, but queue depth and busy state have no getters |
 | Region queue depth and tick-start latency | Snapshots report `queued = -1` for the region pool | `RegionTaskQueueData.hasTasks()` is a boolean and the prioritised queues have no public size; `startOvershoot` is not exposed by the tick report |
-| Region tick metrics inside the snapshot | `/tuff threads` shows threads, not TPS or MSPT | Region tick data belongs to the region handle and is updated per tick; `/tps` remains the region view, see [observability](observability.md) |
+| Per-region tick breakdown | The region lines are one aggregate over all regions; there is no per-region row, and only the 5 s and 15 s windows are read | Per-region windows belong to the region handle and are updated per tick; `/tps` remains the region view, see [observability](observability.md) |
 | Live reload of `thread-management` | Every key is restart-only and `/tuff reload` says so | The runtime bakes its pool set and sampling policy in at start; a live change would be a promise the manager cannot keep |
 | Kairos scheduler | `scheduler: kairos` is validated (it needs `kairos-unstable: true`) and stored, but regions keep ticking on leafpile EDF | The experimental elastic tick fund is not implemented. The value exists so the configuration model and validation are final before the scheduler arrives |
-| One authoritative budget | The ledger is computed and reported, but no pool's capacity is derived from it yet; compute still sizes itself from `ComputeThreadBudget` | Handing capacity over is the point at which a wrong number changes thread counts. It goes with the compute adapter, not before it |
+| One authoritative budget | The ledger is computed and reported; it sizes `compute` only when `execution-pools.compute.managed: true`. Unmanaged compute still sizes itself from `ComputeThreadBudget` | Handing capacity over is the point at which a wrong number changes thread counts, so it stays behind the compute switch instead of being always on |
 
 `thread-management.enabled: false` is a real kill switch: no runtime is created, no pool is
 registered, no metrics are sampled and no thread is started. `/tuff threads` still answers and says
@@ -79,11 +81,15 @@ The compute engine is one of the pools, not a second centre:
 - `compute` (platform workers) and `compute-virtual` (virtual lane) are registered as pools with
   `PoolKind.COMPUTE` and `PoolKind.VIRTUAL`. UTMI never owns their queue, their priorities or their
   worker loop.
-- Both are registered at L1 in this build. The engine's own `SchedulerMetrics` remains the source of
-  truth for task counters, queue depth and throughput.
-- Compute's sizing is still `ComputeThreadBudget` (80% of the processors minus the live region, chunk
-  and IO thread counts and a fixed network reserve). UTMI computes its own ledger with configured
-  deductions; the two numbers are not connected yet, and neither is silently substituted for the
+- By default both are registered at L1 and observed through the engine probe; the engine's own
+  `SchedulerMetrics` remains the source of truth for task counters, queue depth and throughput. With
+  `execution-pools.compute.managed: true` the adapter registers `compute` at L4 and `compute-virtual`
+  at L2, and the engine takes its platform workers from the provider and its processor budget from
+  the resource controller.
+- Sizing follows the same switch, one source at a time: managed compute reads
+  `ThreadResourceController`; unmanaged compute still uses `ComputeThreadBudget` (80% of the
+  processors minus the live region, chunk and IO thread counts and a fixed network reserve). UTMI
+  computes its own ledger with configured deductions, and no value is silently substituted for the
   other.
 - The rule for the future integration is one source per number: UTMI owns capacity, compute owns
   domain metrics, and no value is summed across the two layers.
@@ -94,9 +100,11 @@ given.
 ## Pages
 
 - [Architecture](architecture.md) — components, coverage levels L0–L4, the current pool matrix, the
-  budget model, thread safety, lifecycle and the invariants that must not be broken.
+  region bridge, the budget model, thread safety, lifecycle and the invariants that must not be broken.
 - [Configuration](configuration.md) — every key under `thread-management:`, its default, whether it is
   restart-only, and the platform limits that make some keys do less than they look.
+- [Coverage](coverage.md) — the L0–L4 matrix per pool: what each level buys, where each pool stops and
+  what stays outside UTMI by design.
 - [Observability](observability.md) — `/tuff threads`, what a snapshot contains, `tuff.threads.*` JFR
   events, unknown threads and why server-wide tick metrics do not exist on Folia.
 

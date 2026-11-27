@@ -21,11 +21,13 @@ players. It is a subcommand of `/tuff`, not a separate command, and it takes no 
 | Running, no sample yet (`warming up (no sample yet)`) | That the refresher has not published a pass; retry in a second |
 | Running | The summary below |
 
-A running server with default settings prints something like this:
+A running server with `region-execution.managed: true` prints something like this. The shape is fixed;
+the region, degraded and settings lines below are the ones the managed smoke run produced, while
+counts such as threads and unknown threads vary with the JVM and the load:
 
 ```
-Tuff thread layer: running, all pools observed only
-  cores: 11 usable after the reserve, 1 reserved; 3 registered thread(s) (peak 3)
+Tuff thread layer: running, some pools managed
+  cores: 11 usable after the reserve, 1 reserved; 8 registered thread(s) (peak 8)
   sample: taken 412 ms ago
   pools: 7 registered
     chunk-io          L1  alive 0  active 0  idle 0  cpu 0%
@@ -33,19 +35,23 @@ Tuff thread layer: running, all pools observed only
     compute           L1  alive 4  active 0  idle 3  cpu 0%
     compute-virtual   L1  alive 1  active 0  idle 0  cpu 0%
     network           L1  alive 0  active 0  idle 0  cpu 0%
-    region-execution  L1  alive 2  active 1  idle 1  cpu 0%
-      regions 1 / avg MSPT 4.2 ms / min TPS 20.0 / lag 0% (0 of 1)
-      ticks: 5s max 9.5 ms, 15s avg 4.4 ms max 12.0 ms; entities 8123 / players 0 / chunks 441
+    region-execution  L2  alive 2  active 0  idle 2  cpu 0%
+      regions 1 / avg MSPT 0.5 ms / min TPS 20.0 / lag 0% (0 of 1)
+      ticks: 5s max 1.1 ms, 15s avg 0.8 ms max 32.5 ms; entities 0 / players 0 / chunks 25
     service           L2  alive 1  active 0  idle 0  cpu 0%
-  degraded: FEATURE_DISABLED, OBSERVE_ONLY
-  unknown threads: 37
+  degraded: FEATURE_DISABLED, OBSERVE_ONLY, SCHEDULER_LIMITATION
+  unknown threads: 32
   settings: reserve 1 core(s), region scheduler edf, region threads unknown; changes take effect after a restart
 ```
 
+With the default `region-execution.managed: false` the header says `running, all pools observed only`,
+the region line says `L1`, and `SCHEDULER_LIMITATION` is absent from `degraded:`; everything else has
+the same shape.
+
 How to read it:
 
-- **`running, all pools observed only`** comes from the configuration (`anyManagementEnabled()`
-  derived from the `managed` flags), not from the measured coverage.
+- **`running, all pools observed only` / `running, some pools managed`** comes from the configuration
+  (`anyManagementEnabled()` derived from the `managed` flags), not from the measured coverage.
 - **`cores: N usable after the reserve, R reserved`** is the snapshot's `usableCores`, which is the
   budget ledger's `usable`: `floor(processors × 0.8)` minus the deducted lanes and the effective reserve,
   floored at one. `R` is the configured reserve before that floor. The raw subtraction and every term are
@@ -61,20 +67,33 @@ How to read it:
   could not be measured. Queue depth is deliberately not printed: without a probe it is `-1`, and a
   printed `0` would look like an empty queue rather than an unmeasured one.
 - **`service L2 alive 1`** is the refresher thread (`Tuff Threads Sampler`), accounted like any other
-  Tuff thread. It is the only thread the layer creates; `L2` here means "created through the factory",
-  not "managed region ticks".
+  Tuff thread. It is the only thread the layer creates at startup; with managed compute the engine's
+  workers are created through the provider too. `L2` here means "created through the factory", not
+  "managed region ticks".
+- **`region-execution L2`** means the spec is at L2 and the bridge wraps each tick body, so the
+  registry accounts the thread while the body runs. The thread is still Folia's `TickThreadRunner`,
+  with Folia's name and group; `L2` is accounting, not ownership. The `alive` number is
+  `max(registry, probe)`, so it looks the same with `managed: false`: the printed level and the
+  startup log are the visible difference, the registration itself is proven by the unit test.
 - **Region lines** appear under the pool that ticks regions, and only when the probe reported something:
   `regions N / avg MSPT X / min TPS Y / lag Z% (K of N)` on the first line, then the 15-second figure,
   the worst single tick and the entity, player and chunk totals. `unknown` replaces a value that could
   not be measured. The region count is the number of regions the pool ticks, not the number of worlds.
+  On an empty server no region has loaded chunks yet, so the walk returns nothing and both lines are
+  absent; that is zero regions, not a failed read. Force a region with `forceload add 0 0` (or join a
+  player) to see them. A region that exists but has not ticked yet still counts, with `unknown`
+  measurements.
 - **`degraded:`** is the union of reasons from every pool and the manager. In the default observe-only
   configuration it always contains `OBSERVE_ONLY` and `FEATURE_DISABLED` while the manager state is
-  still `RUNNING`. Observe-only is a statement of coverage, not a failure, and only reasons such as
-  `BUDGET_EXHAUSTED`, `SCHEDULER_LIMITATION`, `CONFIG_CONFLICT` or `THREAD_CREATION_FAILED` move the
-  manager state to `DEGRADED`.
+  still `RUNNING`. With `region-execution.managed: true` that pool contributes
+  `SCHEDULER_LIMITATION` under EDF instead of `OBSERVE_ONLY`, while the pools still at L1 keep
+  `OBSERVE_ONLY` in the union. Observe-only is a statement of coverage, not a failure, and only
+  reasons such as `BUDGET_EXHAUSTED`, `SCHEDULER_LIMITATION`, `CONFIG_CONFLICT` or
+  `THREAD_CREATION_FAILED` move the manager state to `DEGRADED`.
 - **`unknown threads:`** is a count, `n/a (no sample yet)` before the first pass, or
   `n/a (metrics collection is disabled)` when metrics are off. The report does not list their names;
-  the snapshot does.
+  the snapshot does. Every thread a probe lists — region and compute — is already accounted, so it
+  never lands in this count.
 - **`settings:`** repeats the three values that most often explain a surprise: the reserve, the region
   scheduler and the configured region thread count (`unknown` when the config says "auto"). Every key of
   the section needs a restart.
@@ -184,11 +203,16 @@ regioniser lock or enumerate the thread table itself. One daemon thread does tha
 The expensive operations stay away from the tick threads:
 
 - `Thread.getAllStackTraces()` is not used at all: the unaccounted-thread scan walks thread groups and
-  takes no stacks. The refresher asks for it once per second, and the scan itself is throttled to once
-  per 30 seconds.
+  takes no stacks. The refresher forces that scan once per pass, on the same one-second clock as the
+  pools, and publishes the count with the rest of the sample; there is no separate 30-second throttle.
 - Region tick reports (`5m`, `15m`) are never read by this layer: they allocate and sort one record per
-  tick over the window. Region reads take the 5 s and 15 s reports only.
+  tick over the window. Region reads take the 5 s and 15 s reports only, and those reads are throttled
+  to one walk per second.
 - No probe runs from a tick thread. A probe call only ever happens inside the refresher's pass.
+
+The cost is one thread walk, one probe pass and one CPU read per thread per second. On the Windows
+smoke stand that measured about 33 ms of CPU per second in total for the layer; that is the price of
+the one-second sample, and the reason the work belongs to a daemon thread rather than a tick.
 
 ## Unknown threads
 
@@ -202,9 +226,9 @@ Two honest caveats:
   netty's threads are not in the registry. A high count is the normal state, not a leak. The number
   becomes meaningful as pools move to L2.
 - It is a count in the command and one `tuff.threads.UnknownThreads` event per finding during the
-  scan, not a per-thread live metric. The scan runs on the refresher and is throttled, so the console
-  never pays for it. A thread the refresher itself owns is registered under `service` and is not
-  counted as unknown.
+  scan, not a per-thread live metric. The scan runs once per refresher pass (one second) on the
+  refresher's own thread, so the console never pays for it. A thread the refresher itself owns is
+  registered under `service` and is not counted as unknown.
 
 ## JFR
 
@@ -284,13 +308,14 @@ writing an integration that reads this data, obey the same rule.
 
 | Symptom | Likely cause | Where to look |
 | --- | --- | --- |
-| Every pool except `service` shows `alive 0` | The layer is observe-only and only the region and compute probes report threads | Expected in this build; see [architecture](architecture.md#current-matrix) |
+| Most pools show `alive 0` | Only the region and compute pools have probes; the rest are registered but unmeasured | Expected; see [architecture](architecture.md#current-matrix) |
 | `region-execution alive 0` on a running server | The region scheduler does not exist yet (very early startup) or already halted (shutdown) | Lifecycle, not a leak |
 | `warming up (no sample yet)` for longer than a second | The refresher thread did not start; the log has the reason under the `Tuff/Threads` logger | Look for `Tuff Threads Sampler` in a thread dump |
 | `unknown threads` in the hundreds | Normal for observe-only: Folia, netty and plugin threads are not registered | The number drops as pools reach L2 |
 | `degraded:` lists reasons while the layer says running | `OBSERVE_ONLY` and `FEATURE_DISABLED` are coverage statements | Only `BUDGET_EXHAUSTED`, `CONFIG_CONFLICT`, `SCHEDULER_LIMITATION` and creation failures mean degraded |
 | `queued` unknown on every pool | No probe is attached | Expected; queue depth needs an owner getter |
-| No region lines under `region-execution` | The pool ticks no regions yet, no level is loaded, or the read failed this pass | Nothing is printed rather than a fake zero |
+| No region lines under `region-execution` | No region is loaded (empty server, no chunks, no players), the read failed this pass, or the scheduler is gone | Force one with `forceload add 0 0`; nothing is printed rather than a fake zero |
+| `region-execution` prints `L2` but `unknown threads` is unchanged | Expected: `alive` is `max(registry, probe)` and the count of unaccounted threads is dominated by Folia, netty and plugins | Prove the wrap with the bridge unit test, not with the console |
 | Region TPS disagrees with `/tps` | `/tuff threads` shows the slowest region and a mean over regions; `/tps` shows per-region windows, including 1 m and beyond | Different aggregates, both honest |
 | No `tuff.threads.*` events in a recording | The recording does not have those events enabled, or it is the compute recording (category `tuff.compute` only) | Start a recording with the events enabled |
 | TPS looks wrong in a profiler | The profiler uses server-wide tick hooks, which Folia does not feed | Use `/tps` or a region-aware profiler |
@@ -299,5 +324,6 @@ writing an integration that reads this data, obey the same rule.
 ## Related pages
 
 - [Architecture](architecture.md) — what the numbers mean and which invariants produce them.
+- [Coverage](coverage.md) — what each printed level means and which levels a pool cannot reach.
 - [Configuration](configuration.md) — the keys behind `settings:`, `per-pool` and `per-thread`.
 - [Compute operations](../compute/operations.md) — the command, JFR and limits of the compute engine.

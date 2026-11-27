@@ -9,6 +9,7 @@ flowchart TB
         TB["ThreadsBootstrap"]
         CFG["ThreadsConfig + ThreadsConfigParser<br/>thread-management section"]
         RP["RegionPoolProbe + RegionThreadScan"]
+        BR["RegionThreads bridge<br/>process wide holder"]
         CMD["/tuff threads"]
     end
 
@@ -45,6 +46,8 @@ flowchart TB
     CMD --> TB
     TB -->|"attach after start"| RP
     RP --> SAMPLE
+    TB -->|"install before the scheduler"| BR
+    BR -. "wrapBody for every tick body (L2 only)" .-> TICK
     RP -. "thread count and ThreadGroup only" .-> TICK
 ```
 
@@ -62,11 +65,12 @@ flowchart TB
 | `ThreadRegistry` | Live threads by pool, monotonic creation and termination counters, per-thread snapshots | [`ThreadRegistryImpl.java`](../../tuff-threads/src/main/java/kz/bejiihiu/tuff/threads/internal/impl/registry/ThreadRegistryImpl.java) |
 | `ResourceSampler` | One sampling pass over registry, probes and JVM counters; driven by the bootstrap's refresher thread | [`ResourceSampler.java`](../../tuff-threads/src/main/java/kz/bejiihiu/tuff/threads/internal/impl/metrics/ResourceSampler.java) |
 | `JfrThreadSink` | `tuff.threads.*` events, gated on `EventType.isEnabled()` | [`JfrThreadSink.java`](../../tuff-threads/src/main/java/kz/bejiihiu/tuff/threads/internal/impl/events/JfrThreadSink.java) |
-| `ThreadsBootstrap` | Server seam: reads the config, starts and stops the runtime, takes the snapshot the command prints | [`ThreadsBootstrap.java`](../../tuff-server/src/main/java/kz/bejiihiu/tuff/threads/bootstrap/ThreadsBootstrap.java) |
+| `ThreadsBootstrap` | Server seam: reads the config, starts and stops the runtime, installs the region bridge, takes the snapshot the command prints | [`ThreadsBootstrap.java`](../../tuff-server/src/main/java/kz/bejiihiu/tuff/threads/bootstrap/ThreadsBootstrap.java) |
+| `RegionThreads` | The only Folia call site: wraps a region tick body for accounting, or returns it unchanged; never creates a thread | [`RegionThreads.java`](../../tuff-server/src/main/java/kz/bejiihiu/tuff/threads/bridge/RegionThreads.java) |
 | `RegionPoolProbe` | Observe-only reading of Folia's region tick pool | [`RegionPoolProbe.java`](../../tuff-server/src/main/java/kz/bejiihiu/tuff/threads/probe/RegionPoolProbe.java) |
 
 `tuff-threads` imports no Minecraft, Bukkit, Paper or Folia type. Everything that needs Folia lives in
-`tuff-server`: the probe, the thread-group scan and the bootstrap.
+`tuff-server`: the probe, the thread-group scan, the bridge and the bootstrap.
 
 ## Modules and ownership
 
@@ -74,7 +78,8 @@ flowchart TB
 | --- | --- | --- |
 | `tuff-threads` | `kz.bejiihiu.tuff.threads` | Public contracts: `UnifiedThreadManager`, `ExecutionPoolRegistry`, `ThreadResourceController`, `ThreadFactoryProvider`, `ResourceMetrics`, the data records and the settings model |
 | `tuff-threads` | `kz.bejiihiu.tuff.threads.internal.*` | Implementation and internal SPI. No compatibility promise outside the module |
-| `tuff-server` | `kz.bejiihiu.tuff.threads.bootstrap` | Server seam, config loading, `/tuff threads` text |
+| `tuff-server` | `kz.bejiihiu.tuff.threads.bootstrap` | Server seam, config loading, `/tuff threads` text, the sampler |
+| `tuff-server` | `kz.bejiihiu.tuff.threads.bridge` | The single call site Folia uses: body wrapping for the region pool |
 | `tuff-server` | `kz.bejiihiu.tuff.threads.probe` | Region pool probe and thread-group scan |
 
 ## Coverage levels
@@ -86,12 +91,18 @@ without anything about its execution changing, and that is the default.
 | --- | --- | --- |
 | **L0** | Outside the centre, documented exception | Nothing; the pool is invisible to UTMI |
 | **L1** | Registered and observed (metrics only) | Pool identity, thread counts, active and idle, saturation where measurable, ownership answers |
-| **L2** | Threads are created through `ThreadFactoryProvider` | Names, daemon flag, handler, accounting, lifecycle visibility |
+| **L2** | Threads are created through `ThreadFactoryProvider`, or their bodies are wrapped by it when the owner must keep the thread class | Names, daemon flag, handler, accounting, lifecycle visibility |
 | **L3** | Capacity is set by the resource controller | Dynamic limits, protection of critical pools |
 | **L4** | Execution runs through a managed lane of UTMI | Full control plus a single queue |
 
 Registration is not merging. A pool at L4 of the compute engine is still the compute engine's pool:
 UTMI decides how much capacity it gets and accounts its threads, not how its tasks are ordered.
+
+L2 has two shapes in this build. The manager either **creates** the thread (`service`, and the compute
+workers once the adapter is on), or the owner creates it and the manager only **wraps the body**
+(`region-execution`, and the compute virtual lane). `CoverageLevel.managesThreads()` is true for both,
+because in both cases every live thread is registered while its body runs; the difference is that a
+wrapped thread's class, name, group, daemon flag and exception handler stay the owner's.
 
 ### The five pool kinds
 
@@ -112,16 +123,16 @@ What the running layer actually registers and measures in this build:
 | Pool id | Kind | Registered coverage | Live numbers | Threads created by UTMI | Capacity from the ledger |
 | --- | --- | --- | --- | --- | --- |
 | `region-execution` | `REGION_EXECUTION` | L1; L2 when `region-execution.managed: true` | Yes, through the probe | No; at L2 their bodies are wrapped for accounting | No |
-| `compute` | `COMPUTE` | L1 | No: `alive 0`, queue unknown | No | No |
-| `compute-virtual` | `VIRTUAL` | L1 | No | No | No |
-| `chunk-worker` | `CHUNK` | L1; L2 when `execution-pools.chunk-system.managed: true` | No | No | No |
+| `compute` | `COMPUTE` | L1; L4 when `execution-pools.compute.managed: true` (or the older `async-compute.managed`) | Yes, through the engine probe | Yes at L4, through the compute adapter | Yes at L4; the controller's budget is the engine's single source |
+| `compute-virtual` | `VIRTUAL` | L1; L2 with the same compute flag | Yes, through the engine probe | The lane creates its virtual threads; their bodies are wrapped | No |
+| `chunk-worker` | `CHUNK` | L1; L2 claim when `execution-pools.chunk-system.managed: true` | No: `alive 0` | No | No |
 | `chunk-io` | `IO` | Same flag as `chunk-worker` | No | No | No |
-| `network` | `NETWORK` | L1; L2 when `execution-pools.network.managed: true` | No | No | No |
-| `service` | `SERVICE` | L1 | No | No | No |
+| `network` | `NETWORK` | L1; L2 claim when `execution-pools.network.managed: true` | No | No | No |
+| `service` | `SERVICE` | L2 for the registered pool; only the sampler is in it | Yes, the sampler thread | Yes, one daemon | No |
 
-`region-execution` is the only pool with a probe. Unprobed pools are still registered, so they appear
-in `/tuff threads` with their spec and `alive 0`; that is a measured zero (the registry holds no
-threads for them), not an unknown value.
+`region-execution` is the only pool with tick-health data. Every other specialised pool is registered
+but unmeasured, so a printed `alive 0` is a real statement about the registry, not a failed read. Queue
+depths are still `-1` where the owner does not expose one, so a printed `unknown` is a real statement too.
 
 `region-execution` at L2 is the one place where "threads created through the provider" is read as
 "bodies wrapped by the provider": Folia constructs and owns the `TickThreadRunner` because the tick
@@ -129,20 +140,63 @@ class is checked on every tick, and only the runnable it runs is passed through
 `ThreadFactoryProvider.wrap`. Accounting and lifecycle visibility are what L2 buys here; the thread
 itself never leaves Folia.
 
-The subsystem picture behind those seven entries, and how far each is planned to go:
+The `chunk-worker`, `chunk-io` and `network` flags only raise the registered level. No owner hands a
+factory or a body to the manager yet, so nothing is created or wrapped; treat those entries as a
+registration claim, not as proof of accounting. [`coverage.md`](coverage.md) keeps the per-pool map
+with the reason each pool stops where it does.
+
+## Region bridge and installation order
+
+`RegionThreads` is a process-wide holder, because Folia's scheduler has no instance to hand over. Its
+lifecycle is one `install` and one `clear`, both driven by `ThreadsBootstrap`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unbound
+    Unbound --> Bound: install(manager), managed on and pool L2+
+    Unbound --> Unbound: managed off / pool at L1 / layer failed
+    Bound --> Bound: wrapBody(body) per tick thread
+    Bound --> Unbound: clear() before the runtime stops
+```
+
+Rules the bridge is built around:
+
+- **Install before the scheduler exists.** `ThreadsBootstrap.start()` runs inside the `CraftServer`
+  constructor, calls `RegionThreads.install(manager)` right after the runtime starts, and only later
+  does `GlobalConfiguration`'s post-process construct `TickRegionScheduler`. This order is required,
+  not cosmetic: `ThreadFactoryProvider.wrap` asks the registry for a pool at L2 or deeper and throws
+  when the pool is missing, and the scheduler's factory calls the bridge while it is being constructed.
+- **One line in Folia.** Patch `0016` changes exactly one expression in the thread factory: the
+  `Runnable` handed to `new TickThreadRunner(group, run, name)` becomes
+  `RegionThreads.wrapBody(run)`. Class, name, group, daemon flag and uncaught handler stay as they
+  were, and `setUncaughtExceptionHandler` is still called on Folia's thread.
+- **Never throw.** A missing binding, a pool below L2 or a provider that refuses makes `wrapBody`
+  return the original `Runnable`. A failed wrap costs accounting, never tick threads; the failure is
+  logged once per process.
+- **Register on start, unregister in `finally`.** The wrapper calls the registry when the body begins
+  and removes the thread when it ends. A `Throwable` from the body is not caught, so it still reaches
+  Folia's handler that halts the scheduler and stops the server.
+- **Clear before the manager stops.** `ThreadsBootstrap.shutdown()` clears the binding before
+  `runtime.shutdown()`, so no body created during teardown is wrapped. A body wrapped earlier keeps
+  its wrapper and unregisters on exit; the registry allows removal after stop.
+
+## Subsystems and targets
 
 | Subsystem | Now | Target | Why not higher |
 | --- | --- | --- | --- |
-| Region tick threads | L1 (probe) | L2, L3 under a flag | Tick order, region ownership and the thread class stay Folia's; EDF cannot be resized |
+| Region tick threads | L1; L2 with `region-execution.managed: true` | L3 requires work-stealing | Tick order, region ownership and the thread class stay Folia's; the EDF pool cannot be resized |
 | Global region tick | Runs on the region pool | L2 | It is a scheduled handle, not a separate thread |
-| Compute platform workers | L4 by construction, L1 in the registry | L4 | The engine already owns execution; the registry entry waits for the adapter |
-| Compute virtual lane | L4 by construction, L1 in the registry | L4 | Virtual threads are created by their owner and only accounted |
-| Chunk workers and chunk IO | L0 (invisible) | L2, L3 carefully | Ordered streams and sub-order sequencing: a different queue deadlocks generation |
-| Netty event loops | L0 (invisible) | L2 | An event loop owns its channels; it cannot be parked or shared |
-| Service and IO pools (`Util`, `MCUtil`, command builder, profiles) | L0 | L2, L3 for the background pool | Each pool has its own blocking contract and shutdown position |
+| Compute platform workers | L4 with `execution-pools.compute.managed: true`, L1 otherwise | L4 (done) | The engine already owns execution; the adapter decides threads and budget only |
+| Compute virtual lane | L2 with the same flag, L1 otherwise | L2 | The lane owns its virtual threads and permits; the manager refuses to create a virtual thread |
+| Chunk workers and chunk IO | L1; L2 claim with `execution-pools.chunk-system.managed: true` | L2, L3 carefully | Ordered streams and sub-order sequencing: a different queue deadlocks generation |
+| Netty event loops | L1; L2 claim with `execution-pools.network.managed: true` | L2 | An event loop owns its channels; it cannot be parked or shared |
+| Service and IO pools (`Util`, `MCUtil`, command builder, profiles) | L2 for the sampler only, L0 for the rest | L2, L3 for the background pool | Each pool has its own blocking contract and shutdown position |
 | Plugin async schedulers | L0 | L2 | The contract is "start immediately" (`SynchronousQueue`), not "queue and wait" |
-| Watchdogs, shutdown threads, console | L0 | L2 | Lifecycle matters; scheduling must not change |
+| Watchdogs, shutdown threads, console | L0 | L0, permanently | Lifecycle matters; scheduling must not change |
 | JDK carrier threads, spark, log4j, JLine | L0 | L0 / L1 (visible only) | Not ours; the only lever is a system property or observation |
+
+[`coverage.md`](coverage.md) expands this into a per-pool matrix with the exact ceiling and the proof
+for each stop.
 
 ## Budget model
 
@@ -184,9 +238,12 @@ Two limits of the current build are worth stating plainly:
    passed as zero because this module cannot read `paper-global.yml`. The ledger is therefore
    optimistic on any server that runs chunk threads, and it models the configured region size, not
    the live one.
-2. **The ledger does not size anything yet.** No pool's capacity is derived from it in this build;
-   compute still sizes itself from `ComputeThreadBudget`, which subtracts the **live** region, chunk
-   and IO counts and a fixed network reserve. The two formulas share the 80% rule and nothing else.
+2. **The ledger sizes exactly one pool.** Compute is the only pool whose capacity is derived from it:
+   with `execution-pools.compute.managed: true` the engine takes its worker count from
+   `ThreadResourceController` through the adapter and `ComputeThreadBudget` is not called at all.
+   Without that flag the engine still sizes itself from `ComputeThreadBudget`, which subtracts the
+   **live** region, chunk and IO counts and a fixed network reserve. The two formulas share the 80%
+   rule and nothing else, and the one that runs is printed at startup.
 
 There is exactly one `usable` number. `ThreadResourceController.usableCores()` returns the plan's
 `usable`, the snapshot publishes that same value, and `/tuff threads` prints it on its `cores:`
@@ -220,9 +277,10 @@ The module is designed so that a command, a probe or a shutdown can never block 
 - **One refresher thread owns the expensive reads.** Folia runs console commands on a global region
   tick thread, so the command cannot walk regions or enumerate threads. The `Tuff Threads Sampler`
   daemon takes one pass per second (one walk over registered threads, one `observe()` per attached
-  probe, one CPU read per thread) and publishes an immutable sample; the command only copies it and
-  prints its age. The unaccounted-thread scan runs on the same thread and is throttled by its own
-  interval.
+  probe, one CPU read per thread, one forced unaccounted-thread scan) and publishes an immutable
+  sample; the command only copies it and prints its age. The scan is forced on the same one-second
+  clock as the pools, not throttled separately, so the unknown count moves with the rest of the
+  sample.
 - **Lifecycle under one monitor.** Start, shutdown and `awaitTermination` share a single monitor.
   Shutdown never joins, sleeps or interrupts; `awaitTermination` is the only call allowed to block
   and the bootstrap caps it at one second.
@@ -240,6 +298,7 @@ sequenceDiagram
     participant CB as ComputeBootstrap
     participant TB as ThreadsBootstrap
     participant RT as ThreadManagerRuntimeImpl
+    participant BR as RegionThreads bridge
     participant F as Folia
     participant MS as MinecraftServer.stopServer
 
@@ -248,14 +307,16 @@ sequenceDiagram
     TB->>TB: read thread-management from config/tuff.yml
     TB->>RT: create(settings) + start()
     RT->>RT: register 7 pool specs, refresh the ledger
+    TB->>BR: install(manager) — only when managed is on and the pool is L2
     TB->>RT: attach RegionPoolProbe
     CB->>CB: start the compute engine
-    Note over F: GlobalConfiguration post-process creates the region scheduler,<br/>RegionizedServer.init() starts it later
+    Note over F: GlobalConfiguration post-process constructs the region scheduler,<br/>whose factory calls wrapBody for every tick thread
     F-->>TB: probe reads the pool on demand
 
     MS->>CB: stop() — after plugins and async tasks
     CB->>CB: JFR shutdown, uninstall API, stop the compute engine
     CB->>TB: stop() — last
+    TB->>BR: clear() — no new body is wrapped
     TB->>RT: shutdown(Duration.ZERO)
     RT->>RT: pools, factory, registry, probes, sampler, controller
     TB->>RT: awaitTermination(1 s cap)
@@ -265,8 +326,9 @@ Order rules that the integration depends on:
 
 - **Start before the compute engine.** The thread layer only registers pools and attaches probes, so
   the engine starts into a world where its pool already exists. This is also before Folia creates the
-  region scheduler, which is why the region pool is registered at L1 without a size: the probe reads
-  the live count later.
+  region scheduler, which is why the region pool is registered without a live size: the probe reads
+  the live count later, and the bridge must already be bound when the scheduler's factory asks for
+  the first tick body.
 - **Stop after the compute engine.** Compute workers get their grace period and the accounting layer
   goes away last. The reverse order would make factory calls fail while workers still respawn.
 - **Nothing in the watchdog window.** Between Folia's `running = false` and `hasStopped = true`, the
@@ -285,6 +347,7 @@ not UTMI's.
 | Invariant | Why | Where it is enforced |
 | --- | --- | --- |
 | Region threads stay Folia's `TickThreadRunner` subclass, in Folia's thread group, non-daemon, with Folia's uncaught-exception handler | The scheduler rejects any other class in the tick path and `AsyncCatcher` refuses world access outside a tick thread; the handler is what stops the server after an `Error` in a tick | `TickRegionScheduler.setTickingRegion`, `setTickTask`; `TickThread` |
+| Only the tick body is wrapped; the bridge never creates, renames or replaces a region thread | L2 here is accounting, not ownership: a new thread object would fail the class checks above, and a renamed thread breaks operators and profilers | `RegionThreads.wrapBody`; `ThreadFactoryProvider.wrap` |
 | Region ownership and tick order are never bypassed | Ticks are serialised per region by a state machine under the regioniser's lock; a second execution path breaks exactly-once tasks and merge/split | `ThreadedRegion.tryMarkTicking` / `markNotTicking` |
 | EDF is not resized | The EDF scheduler fixes its thread arrays and idle bitset at construction and has no resize API; `setThreads` is a silent no-op for EDF. A thread-count change needs a restart | `TickRegionScheduler.setThreads`, leafpile `EDFSchedulerThreadPool` |
 | The `Scheduler` is never decorated | `start()` and `setThreads()` test the concrete class, so a wrapper compiles but never starts the threads | `TickRegionScheduler.start` |
@@ -297,7 +360,9 @@ not UTMI's.
 
 ## Related pages
 
+- [Coverage](coverage.md) — the L0–L4 matrix per pool, the ceiling of each and what stays outside UTMI.
 - [Configuration](configuration.md) — the section, defaults and restart behaviour.
 - [Observability](observability.md) — the command, the snapshot, JFR and the honest limits of tick
   metrics on a regionised server.
-- [Compute architecture](../compute/architecture.md) — the pool that is already L4 by construction.
+- [Compute architecture](../compute/architecture.md) — the pool that reaches L4 when its management
+  switch is on.

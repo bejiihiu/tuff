@@ -31,6 +31,9 @@ thread-management:
     chunk-system:
       managed: false
       preserve-specialization: true
+    compute:
+      managed: false
+      preserve-specialization: true
   metrics:
     enabled: true
     per-pool: true
@@ -60,25 +63,27 @@ thread-management:
 | `resources.max-concurrent-tasks` | integer, `-1` or ≥ 1 | `-1` | restart | Global cap on concurrently leased tasks across pools. critical pools (`region-execution`, `network`) bypass it by policy; `-1` disables the cap and leaves only per-pool permits |
 | `lifecycle.centralized-thread-factory` | boolean | `true` | restart | Policy statement: new server-owned threads should come from `ThreadFactoryProvider`. It does not move existing threads and is enforced by code review and the static guard, not by the flag alone |
 | `lifecycle.monitor-threads` | boolean | `true` | restart | Sample thread states, CPU time and creation/termination rates. Combined with `metrics.enabled` with AND: either switch off leaves the layer running with a structural snapshot (registered pools and registry-known thread counts, no measured values) |
-| `region-execution.managed` | boolean | `false` | restart | Raises the registered coverage of the region pool from L1 to L2 and lets Folia's thread factory hand each tick body to the thread layer for accounting. Folia still creates, names, groups and schedules its own `TickThreadRunner`; only the body is wrapped, so class, group, daemon flag and uncaught handler are unchanged; see [architecture](architecture.md#current-matrix) |
+| `region-execution.managed` | boolean | `false` | restart | Registers the region pool at L2 instead of L1 and binds the `RegionThreads` bridge, so every region tick body goes through `ThreadFactoryProvider.wrap`. What changes: the pool spec (`min 1`, elastic budget), per-thread registration for the duration of each body, the printed level, and `SCHEDULER_LIMITATION` under EDF (L2 is the deepest an unresizable scheduler can promise). What stays Folia's: thread creation, class (`TickThreadRunner`), name, group, daemon flag, uncaught handler, tick order and region ownership. Restart only: the bridge is installed before the region scheduler is constructed; see [architecture](architecture.md#region-bridge-and-installation-order) |
 | `region-execution.preserve-folia-scheduling` | boolean | `true` | n/a | Must stay `true`. Folia owns tick order, catch-up and region ownership. `false` is rejected at startup instead of being silently ignored |
 | `region-execution.scheduler` | `edf` \| `work-stealing` \| `kairos` | `edf` | restart | Region scheduler variant the configuration describes. `kairos` additionally requires `kairos-unstable: true` |
 | `region-execution.threads` | integer, `-1` or ≥ 1 | `-1` | restart | Tick thread count used by the pool spec and the budget deduction. It is **not** the number Folia runs: Folia reads `threaded-regions.threads` from `paper-global.yml` (or its own auto formula). `-1` leaves the deduction at zero |
 | `region-execution.grid-exponent` | integer, 0–31 | `4` | restart | Region grid exponent, clamped to `[0, 31]` like the platform key. Modelled and validated; it does not reshape the live regioniser |
 | `region-execution.kairos-unstable` | boolean | `false` | restart | Explicit opt-in for the experimental Kairos scheduler. Never enabled implicitly. Selecting `kairos` without it rejects the whole region section |
-| `async-compute.managed` | boolean | `false` | restart | Lets the thread layer own the compute platform pool's capacity. Without the compute adapter this configuration cannot be honoured and is reported as a conflict |
-| `async-compute.max-threads` | integer, `-1` or ≥ 1 | `-1` | restart | Ceiling for the registered compute pool only. `-1` keeps the engine's own `max-threads`. The engine's queue and sizing are untouched either way |
+| `async-compute.managed` | boolean | `false` | restart | Older spelling of `execution-pools.compute.managed`; either key turns compute management on. With it on, the compute adapter registers the platform pool at L4 and the virtual lane at L2, and the engine takes its threads and processor budget from the thread layer. Off keeps the engine's own factory and `ComputeThreadBudget`; the pool is observed through its probe either way |
+| `async-compute.max-threads` | integer, `-1` or ≥ 1 | `-1` | restart | Ceiling for the registered compute pool only. `-1` keeps the engine's own `max-threads`. The engine's queue and priorities are untouched either way |
+| `execution-pools.compute.managed` | boolean | `false` | restart | The preferred spelling of the compute switch. Same effect as `async-compute.managed`, and the one `ThreadManagementSettings.computeManaged()` reads first |
 | `execution-pools.network.managed` | boolean | `false` | restart | Raises the network pool's registered coverage. Netty keeps its event loops, sizing and affinity |
 | `execution-pools.network.preserve-specialization` | boolean | `true` | n/a | Must stay `true`: network loops cannot be merged or reshaped without changing their semantics |
-| `execution-pools.chunk-system.managed` | boolean | `false` | restart | Raises the registered coverage of `chunk-worker` and `chunk-io`. The chunk system keeps its ordered streams and its queues |
+| `execution-pools.chunk-system.managed` | boolean | `false` | restart | Raises the registered coverage of `chunk-worker` and `chunk-io` from L1 to L2. The chunk system keeps its ordered streams, its queues and its threads; no factory is handed over yet, so this is a registration claim rather than accounting |
 | `execution-pools.chunk-system.preserve-specialization` | boolean | `true` | n/a | Must stay `true`, for the same reason |
+| `execution-pools.compute.preserve-specialization` | boolean | `true` | n/a | Must stay `true`. Compute workers are never merged with region, chunk or network threads |
 | `metrics.enabled` | boolean | `true` | restart | Collect pool and thread state at all. With collection off the snapshot is structural: it lists the registered pools and the threads the registry accounts for, but queue depth, task counters, CPU, saturation and the per-thread list are unmeasured, the rates are zero and `degraded: METRICS_UNAVAILABLE` says so; `unknown threads: n/a (metrics collection is disabled)` |
 | `metrics.per-pool` | boolean | `true` | restart | Publish per-pool entries, saturation and their JFR events |
 | `metrics.per-thread` | boolean | `true` | restart | Publish the per-thread list. Disabling keeps pool totals but removes individual threads from the snapshot |
 
 ## What changing a key does not do
 
-This list matters more than the table above, because most of these keys are forward-looking model
+This list matters more than the table above, because several of these keys are forward-looking model
 fields rather than levers that move threads today.
 
 | You change | What actually happens |
@@ -86,8 +91,8 @@ fields rather than levers that move threads today.
 | `region-execution.threads` | The registered pool spec and the budget deduction change. Folia's tick thread count does not: it comes from `paper-global.yml: threaded-regions.threads`, and under EDF it cannot change without a restart anyway |
 | `region-execution.scheduler` | The configured and reported scheduler variant changes. It does not switch Folia's live scheduler; that happens only through the platform key and a restart, and `kairos` has no implementation yet |
 | `region-execution.grid-exponent` | The model value changes. The regioniser's shift is fixed at the first initialisation |
-| `execution-pools.chunk-system.managed` or `network.managed` | The pool is registered with coverage L2 instead of L1, and `/tuff threads` prints the deeper level. No thread is created through the factory, because no owner hands its factory over yet. The manager does not flag this as a conflict for these kinds — treat the printed level as a registration claim, not proof of management. `region-execution.managed` is different: that pool's bodies are really wrapped |
-| `async-compute.managed` | The compute pool is still registered at L1 and the snapshot reports `CONFIG_CONFLICT`, because the adapter that would deliver the promised management is not wired |
+| `execution-pools.chunk-system.managed` or `network.managed` | The pool is registered with coverage L2 instead of L1, and `/tuff threads` prints the deeper level. No thread is created or wrapped, because no owner hands its factory or its bodies over yet. The manager does not flag this as a conflict for these kinds — treat the printed level as a registration claim, not proof of accounting. `region-execution.managed` is different: that pool's bodies are really wrapped |
+| `execution-pools.compute.managed` (or `async-compute.managed`) | The compute adapter registers `compute` at L4 and `compute-virtual` at L2, and the engine creates its platform workers through the provider and reads its budget from the resource controller. The engine's queue, priorities and fairness are unchanged |
 | `metrics.per-pool: false` | Pool entries disappear from the snapshot and `/tuff threads`. Degradation reasons are still collected at the top level; measurement continues |
 | `lifecycle.centralized-thread-factory: false` | Nothing. The flag is a policy statement; the guard and review remain the enforcement |
 
@@ -130,13 +135,15 @@ thread-management:
     threads: 4        # keep equal to paper-global.yml threaded-regions.threads
 ```
 
-The ledger now subtracts four tick threads instead of zero. It still does not size any pool.
+The ledger now subtracts four tick threads instead of zero. That is the only effect in this
+configuration: the ledger itself sizes nothing, and with compute unmanaged the engine keeps its own
+budget.
 
-**Managed region (L2).** `managed: true` registers the pool at L2 and wraps each tick body through
-`ThreadFactoryProvider.wrap`, so Folia's region threads are accounted while they run. Folia still
-creates the threads, names them and schedules them; the class, group, daemon flag and uncaught handler
-are untouched. With a custom build that lacks the factory hook the flag only changes the printed
-coverage:
+**Managed region (L2).** `managed: true` registers the pool at L2 (`min 1`, elastic budget) and binds
+the `RegionThreads` bridge, so each tick body goes through `ThreadFactoryProvider.wrap` while it runs:
+the registry sees the thread for the duration of the body and `/tuff threads` prints `L2`. Folia
+still creates the threads, names them, groups them and schedules them; the class, group, daemon flag
+and uncaught handler are untouched, and the tick body's exceptions still reach Folia's handler.
 
 ```yaml
 thread-management:
@@ -145,8 +152,15 @@ thread-management:
     scheduler: edf
 ```
 
-Under EDF the snapshot then reports `SCHEDULER_LIMITATION` next to the region pool: L2 is the deepest
-integration an unresizable scheduler can promise.
+This is restart-only, and the order is part of the contract: the bridge is installed before Folia's
+region scheduler is constructed (see
+[architecture](architecture.md#region-bridge-and-installation-order)). Under EDF the snapshot then
+reports `SCHEDULER_LIMITATION` next to the region pool: L2 is the deepest integration an unresizable
+scheduler can promise.
+
+The flag is only honest on a build that carries the region factory hook (`Tuff - account region tick
+bodies`). A jar without it prints L2 from the spec while no body is wrapped; the flag itself cannot
+detect that, because no factory calls the bridge.
 
 ## Validation errors you can hit
 
@@ -165,6 +179,7 @@ integration an unresizable scheduler can promise.
 ## Related pages
 
 - [Architecture](architecture.md) — how the values turn into pool specs and the budget ledger.
+- [Coverage](coverage.md) — what each `managed` flag actually raises, and what it cannot.
 - [Observability](observability.md) — what `/tuff threads` prints for each of these values.
 - [Compute configuration](../compute/configuration.md) — the `async-compute` section, which owns the
   compute engine's own sizing.
