@@ -39,10 +39,11 @@ The startup log is the source of truth for the value your machine actually got:
 Initialised EDF Folia scheduler with initial 4 target thread(s)
 ```
 
-`thread-management.region-execution.threads` does **not** create or resize those threads. It is the
-number the thread layer subtracts from its ledger and, under Kairos, the modelled floor; Folia still
-reads the platform key. Keep the two equal so the ledger describes the server you run. Under EDF a
-change to either key needs a restart: `TickRegionScheduler#setThreads` is a silent no-op for EDF.
+`thread-management.region-execution.threads` does **not** create or resize those threads, and it does
+not set the Kairos fund's floor either. It is the number the thread layer subtracts from its ledger and
+adds back when it answers the fund's ceiling; the fund's floor is the started count above. Keep the two
+equal so the ledger describes the server you run. Under EDF a change to either key needs a restart:
+`TickRegionScheduler#setThreads` is a silent no-op for EDF.
 
 ### The compute processor budget
 
@@ -62,14 +63,16 @@ With `execution-pools.compute.managed: true` (or `async-compute.managed: true`) 
 not evaluated at all. The adapter answers with the compute pool's budget from the ledger:
 
 ```
-poolBudget = min(max-threads when set, max(1, usable))
-budget     = max(max(min-threads, 1) + relief reserve, poolBudget - tick-pressure reserve)
+poolBudget = max(1, usable - tick-pressure reserve)          # the ledger's usable, after load shedding
+budget     = max(relief floor, poolBudget)                   # relief floor = min-threads + reserved-cores
+                                                             # (+1 while threads: -1)
 ```
 
 That difference matters. The ledger does **not** subtract chunk worker, chunk IO or netty threads
 (it cannot read the platform configuration), so `usable` is optimistic on a server that runs chunk
 threads. Managed compute can therefore hand the engine a larger budget than the legacy formula would.
-Set `async-compute.max-threads` to the number you actually want whenever you turn management on.
+Set `async-compute.workers.max-threads` to the number you actually want whenever you turn management
+on; `async-compute.max-threads` is only recorded on the observed pool spec and sizes nothing.
 
 ### The worker count
 
@@ -363,7 +366,7 @@ switches, the reserve, the Kairos block and the sampling policy.
 | `async-compute.consumers.<id>.*` for an id that has not registered yet | Restart (the policy is read from the startup snapshot) |
 | `async-compute.queue.overflow-policy` | Reaches the default consumer and dynamically registered consumers on a reload; an explicit per-consumer policy wins |
 | `paper-global.yml: threaded-regions.scheduler` | Restart only |
-| `paper-global.yml: threaded-regions.threads` | Restart under EDF; a live floor move under an elastic Kairos fund (see [Kairos](../scheduler/kairos.md#configuration)) |
+| `paper-global.yml: threaded-regions.threads` | Restart under EDF; live for work stealing and for an elastic Kairos fund (see [Kairos](../scheduler/kairos.md#configuration)) |
 
 ## Verifying a change
 

@@ -63,8 +63,10 @@ thread-management:
     #   work-stealing - Folia's alternative, supports live resize
     #   kairos        - Tuff's experimental elastic scheduler, also needs kairos-unstable: true
     scheduler: edf
-    # Region tick threads, or -1 for Folia's own formula. A fixed count needs a restart; EDF cannot
-    # change it while the server runs.
+    # Tick thread count the layer models for this pool: the deduction from its ledger and, when it
+    # answers a Kairos fund, the number added back to the fund's ceiling. It does not create or resize
+    # Folia's threads: those come from paper-global.yml threaded-regions.threads, and that started
+    # count is also the fund's floor. -1 leaves the deduction at zero. Restart only.
     threads: -1
     # Region grid exponent, between 0 and 31. Smaller regions split the world more finely. Restart
     # only.
@@ -145,7 +147,11 @@ thread-management:
     # either one turns compute management on. Prefer the execution-pools key. Off keeps the engine's
     # own sizing and its own queue; the engine is observed either way. Needs a restart.
     managed: false
-    # Ceiling for that pool, or -1 to keep the engine's configured maximum.
+    # Ceiling recorded on the observed compute pool spec, or -1 to declare none there. This value does
+    # not bound the running engine: the worker count comes from async-compute.workers.threads and the
+    # ceiling from async-compute.workers.max-threads, and with compute management on the adapter
+    # registers the pool from those worker keys. It stays part of the registered spec and the reload
+    # diff. Needs a restart.
     max-threads: -1
 
     # Cores the compute pool gives back while the regions fall behind. Off by default: it changes the
@@ -166,8 +172,9 @@ thread-management:
       # second.
       cooldown-seconds: 5
       # Most cores the pool may give up, and how many move per decision. The pool never falls below
-      # its own min-threads, and the budget it yields is the pool's own cap after its max-threads and
-      # load shedding, not the ledger's usable number.
+      # its own min-threads plus the relief reserve, and the budget it yields is the compute pool's
+      # share of the ledger after load shedding, not the ledger's usable number; the worker ceiling
+      # above caps what the engine does with it.
       max-reserve-cores: 2
       step-cores: 1
 
@@ -364,6 +371,30 @@ async-compute:
       # NORMAL queue depth at which a task may spill regardless of its wait. 0 turns the depth
       # trigger off, so spill-wait-millis stays the only condition.
       spill-queue-depth: 64
+
+  # Region relief: a region that is behind may hand one pure computation to this pool and apply the
+  # result back on its own thread. The path is off by default; every submission then runs inline on the
+  # region thread. Needs a restart.
+  relief:
+    # Offload relief work at all. Off keeps the consumer registered but every submission runs inline and
+    # the reserve below is zero.
+    enabled: false
+    # Accepted relief requests one region may have outstanding. The next submission runs inline.
+    max-in-flight-per-region: 8
+    # Workers the pool keeps for relief under tick pressure. Only applied while enabled; it also raises
+    # the pool's idle floor by the same amount, so neither keep-alive nor the idle autoscaler can shrink
+    # the reserve away.
+    reserved-cores: 1
+    # Policy of the region-relief consumer. An explicit async-compute.consumers.region-relief section
+    # overrides the whole policy. A stale relief result is worthless, so the queue wait is short and
+    # overflow refuses instead of evicting.
+    consumer:
+      enabled: true
+      max-concurrent: 0.25
+      fair-share-weight: 0.5
+      max-queued-tasks: 64
+      overflow-policy: reject
+      max-queue-wait-seconds: 2
 
   # Seconds a graceful shutdown lets running tasks finish. Queued tasks that did not start are
   # cancelled. Kept short on purpose: the world save runs right after the pool stops and /restart

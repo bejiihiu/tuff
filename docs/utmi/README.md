@@ -56,26 +56,44 @@ not execution.
   count and the settings that need a restart.
 - Eight `tuff.threads.*` JFR events describe pool state, thread creation and termination, saturation,
   budget changes, lease timeouts, unaccounted threads and the compute pool's tick pressure decisions.
+- `/tuff scheduler` reports the region scheduler. Under the experimental Kairos fund it prints the fund,
+  the tick queues, the supervisor, the permit waits, the tick policies and the idle path; under EDF or
+  work stealing it names the configured thread count and says that there is no fund telemetry.
 
-## What is not included yet
+## Limits in this build
 
-Saying "observe only" is not enough; this is the exact list of things that are configured or modelled
-but do not execute yet, and why.
+Saying "observe only" is not enough; this is the exact list of limits in this build, and why each one
+exists.
 
-| Not included | Effect today | Why |
+| Limit | Effect today | Why |
 | --- | --- | --- |
-| Region threads at L2 (bodies wrapped) | With `region-execution.managed: true` the pool is registered at L2 and each tick body goes through `ThreadFactoryProvider.wrap`, so region threads are accounted while they run. Folia still creates its own `TickThreadRunner` objects: the class, name, group, daemon flag and uncaught handler stay Folia's | L2 is the deepest honest level here. Creating the threads elsewhere needs a replacement scheduler, not a wrapper: ownership checks, `AsyncCatcher` and the shutdown contract all key off the concrete tick thread class |
-| Compute at L4 | Only with `execution-pools.compute.managed: true` (or its older spelling). Off, `compute` and `compute-virtual` are registered at L1 and the engine keeps its own threads, queue and sizing | The adapter exists, but management is a separate reviewed step; the safe default is observation. With the flag on, the engine takes its workers and processor budget from the thread layer and keeps its queue |
+| Region threads created or owned by UTMI | With `region-execution.managed: true` the pool is registered at L2 and each tick body goes through `ThreadFactoryProvider.wrap`, so region threads are accounted while they run. Folia still creates its own `TickThreadRunner` objects: the class, name, group, daemon flag and uncaught handler stay Folia's | L2 is the deepest honest level here. Creating the threads elsewhere needs a replacement scheduler, not a wrapper: ownership checks, `AsyncCatcher` and the shutdown contract all key off the concrete tick thread class |
+| Compute at L4 by default | Only with `execution-pools.compute.managed: true` (or its older spelling). Off, `compute` and `compute-virtual` are registered at L1 and the engine keeps its own threads, queue and sizing | The adapter exists, but management is a separate reviewed step; the safe default is observation. With the flag on, the engine takes its workers and processor budget from the thread layer and keeps its queue |
 | Queue depth for the chunk, netty, chat and background pools | Chunk worker, chunk IO and netty report `queued = -1`; the chat executor reports its own queue size (always zero for its cached handoff queue) and the background pool reports the `ForkJoinPool` queued task count. `active` can be a state approximation | Moonrise has no queue-depth getter and netty keeps its internal queues private; the chat and background executors do expose counters, and they are reported as they are |
 | Region queue depth and tick-start latency | Snapshots report `queued = -1` for the region pool | `RegionTaskQueueData.hasTasks()` is a boolean and the prioritised queues have no public size; `startOvershoot` is not exposed by the tick report |
 | Per-region tick breakdown | The region lines are one aggregate over all regions; there is no per-region row, and only the 5 s and 15 s windows are read | Per-region windows belong to the region handle and are updated per tick; `/tps` remains the region view, see [observability](observability.md) |
 | Live reload of `thread-management` | Every key is restart-only and `/tuff reload` says so | The runtime bakes its pool set and sampling policy in at start; a live change would be a promise the manager cannot keep |
-| Kairos scheduler | `scheduler: kairos` selects the elastic fund; it needs `kairos-unstable: true`, the config is `region-execution.kairos.*`, and `/tuff scheduler` reports it | Implemented and opt-in. The fund's ceiling comes from the resource controller when the layer runs, the supervisor is a `service` thread at L2, and a stale tick is warned about once per ten seconds. Under EDF or work stealing the command says honestly that it has no fund telemetry |
 | One authoritative budget | The ledger is computed and reported; it sizes `compute` only when `execution-pools.compute.managed: true`. Unmanaged compute still sizes itself from `ComputeThreadBudget` | Handing capacity over is the point at which a wrong number changes thread counts, so it stays behind the compute switch instead of being always on |
 
 `thread-management.enabled: false` is a real kill switch: no runtime is created, no pool is
 registered, no metrics are sampled and no thread is started. `/tuff threads` still answers and says
 where the switch is.
+
+## Kairos and the tick policies
+
+`thread-management.region-execution.scheduler: kairos`, with the mandatory `kairos-unstable: true`,
+selects the experimental tick fund. The live scheduler is still selected in
+`paper-global.yml: threaded-regions.scheduler`, and the elastic fund needs `kairos.elastic: true` on
+top of both switches; with elasticity off the fund is the fixed prototype. This build adds five
+optional tick policies around the region pool, each off or neutral by default: soft affinity with
+stealing, bounded catch-up, permit-wait reporting, per-tick and per-pass JFR recording, and idle-safe
+work.
+
+None of them raises the region pool's coverage. The threads are still created by Folia's factory and
+only their bodies are wrapped, so `region-execution` stays at L2 at most whatever the scheduler does
+with a tick. The fund, its ceiling, the policies, the log lines and the rollback are on
+[the Kairos page](../scheduler/kairos.md); the contract for work a parked tick thread may run is on
+[idle-safe work](idle-work.md).
 
 ## Relation to the compute scheduler
 
@@ -94,6 +112,11 @@ The compute engine is one of the pools, not a second centre:
   processors minus the live region, chunk and IO thread counts and a fixed network reserve). UTMI
   computes its own ledger with configured deductions, and no value is silently substituted for the
   other.
+- Region relief is a compute consumer, not a tenth pool. When `async-compute.relief.enabled` is on,
+  the budget the layer hands the engine never falls below `min-threads + reserved-cores`, so the
+  relief reserve survives both tick pressure and load shedding. While the trigger is off, the
+  reserve is zero and the budget is exactly what the pressure policy decided. See
+  [region relief](../compute/region-relief.md).
 - The rule for the future integration is one source per number: UTMI owns capacity, compute owns
   domain metrics, and no value is summed across the two layers.
 
@@ -113,6 +136,9 @@ given.
 - [Tuning](tuning.md) — presets for real server types, the arithmetic behind thread counts and
   budgets, what is restart-only, how to verify a change, and
   [running the server behind a proxy](tuning.md#running-behind-a-proxy).
+- [Idle-safe work](idle-work.md) — the only contract for work a tick thread may run while it has
+  nothing to tick: what qualifies, the guards, the one producer shipped in this build, the counters
+  and the rollback.
 
 ## Quick start
 

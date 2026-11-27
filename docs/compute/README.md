@@ -62,9 +62,9 @@ Related pages: [Region relief](region-relief.md) for the offload path an overloa
 
 1. `config/tuff.yml` is written from the bundled template the first time the configuration is loaded.
 2. Keep `async-compute.enabled: true` (the default) and adjust the sections you care about. A live reload
-   applies consumer policies only; `workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*` and
-   `shutdown-grace-seconds` need a restart. `/tuff compute reload` prints which changes were applied and
-   which were deferred.
+   applies consumer policies only; `workers.*`, `queue.capacity`, `scheduling.*`, `metrics.*`,
+   `adaptive.*`, `lanes.*`, `relief.*` and `shutdown-grace-seconds` need a restart.
+   `/tuff compute reload` prints which changes were applied and which were deferred.
 3. From a plugin, take the scheduler in `onEnable` and submit work:
 
 ```java
@@ -109,6 +109,8 @@ See [Operations § Command](operations.md#command) for output details and JFR li
 - [Plugin API](plugin-api.md) — submit, cancel, register consumers, hand results back correctly, common
   mistakes.
 - [Configuration](configuration.md) — every key in `config/tuff.yml`, defaults, validation errors, presets.
+- [Region relief](region-relief.md) — the offload path an overloaded region can use, its completion
+  contract, the `region-relief` consumer and the core reserve that tick pressure cannot take away.
 - [Tuning](tuning.md) — server-type presets, lane and spill choices, symptom → knob, anti-patterns.
 - [Operations](operations.md) — command, logs, metrics, JFR recordings, benchmarks, tuning, known limitations.
 - [Benchmarks](benchmarks.md) — JMH numbers for the submission path, dispatch, strategies, cancellation,

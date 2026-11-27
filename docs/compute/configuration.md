@@ -11,8 +11,10 @@ async-compute:
   queue: { ... }
   scheduling: { ... }
   consumers: { ... }
+  relief: { ... }
   metrics: { ... }
   adaptive: { ... }
+  lanes: { ... }
   shutdown-grace-seconds: 5
 ```
 

@@ -77,10 +77,10 @@ thread-management:
 | `region-execution.managed` | boolean | `false` | restart | Registers the region pool at L2 instead of L1 and binds the `RegionThreads` bridge, so every region tick body goes through `ThreadFactoryProvider.wrap`. What changes: the pool spec (`min 1`, elastic budget), per-thread registration for the duration of each body, the printed level, and `SCHEDULER_LIMITATION` under EDF (L2 is the deepest an unresizable scheduler can promise). What stays Folia's: thread creation, class (`TickThreadRunner`), name, group, daemon flag, uncaught handler, tick order and region ownership. Restart only: the bridge is installed before the region scheduler is constructed; see [architecture](architecture.md#region-bridge-and-installation-order) |
 | `region-execution.preserve-folia-scheduling` | boolean | `true` | n/a | Must stay `true`. Folia owns tick order, catch-up and region ownership. `false` is rejected at startup instead of being silently ignored |
 | `region-execution.scheduler` | `edf` \| `work-stealing` \| `kairos` | `edf` | restart | Region scheduler variant the layer reports and models. This key does not select the live scheduler: that is `paper-global.yml: threaded-regions.scheduler` and a restart. `kairos` additionally requires `kairos-unstable: true` |
-| `region-execution.threads` | integer, `-1` or ≥ 1 | `-1` | restart | Tick thread count used by the pool spec, the budget deduction and the floor of an elastic Kairos fund. It is **not** the number Folia runs: Folia reads `threaded-regions.threads` from `paper-global.yml` (or its own auto formula). `-1` leaves the deduction at zero |
+| `region-execution.threads` | integer, `-1` or ≥ 1 | `-1` | restart | Tick thread count used by the pool spec and the budget deduction. It is **not** the number Folia runs and not the fund's floor: Folia reads `threaded-regions.threads` from `paper-global.yml` (or its own auto formula), and the Kairos fund takes its floor from that same started count. `-1` leaves the deduction at zero |
 | `region-execution.grid-exponent` | integer, 0–31 | `4` | restart | Region grid exponent, clamped to `[0, 31]` like the platform key. Recorded and validated; no runtime path reads it, and the live regioniser uses `paper-global.yml: threaded-regions.grid-exponent`, fixed at first initialisation |
 | `region-execution.kairos-unstable` | boolean | `false` | restart | Explicit opt-in for the experimental Kairos scheduler. Never enabled implicitly. Selecting `kairos` without it rejects the whole region section |
-| `region-execution.kairos.elastic` | boolean | `false` | restart | Let the fund grow above `threads` and retire idle runners. Off keeps a fixed fund: no supervisor thread, no growth, no retire. Only read while the scheduler is Kairos |
+| `region-execution.kairos.elastic` | boolean | `false` | restart | Let the fund grow above the started tick count and retire idle runners. Off keeps a fixed fund: no supervisor thread, no growth, no retire. Only read while the scheduler is Kairos |
 | `region-execution.kairos.max-threads` | integer, `-1` or ≥ 1 | `-1` | restart | Ceiling of the fund. `-1` uses the thread layer's budget while it runs, otherwise Folia's `floor(cores × 0.8)` rule. An explicit value always wins |
 | `region-execution.kairos.keep-alive-seconds` | integer, ≥ 1 | `30` | restart | How long a runner must sit idle above the floor before it may be retired |
 | `region-execution.kairos.spawn-rate-per-second` | integer, ≥ 1 | `10` | restart | How many new tick threads the supervisor may start per second |
@@ -105,10 +105,12 @@ thread-management:
 | `metrics.per-thread` | boolean | `true` | restart | Publish the per-thread list. Disabling keeps pool totals but removes individual threads from the snapshot |
 
 The `region-execution.kairos` block in the shipped template also carries the tick-level knobs -
-`catch-up.cap-ticks`, `catch-up.budget-millis`, `steal.threshold-millis`, `affinity.local-queue-size`
-and `lease.timeout-seconds`. They are read through the scheduler's opt-in gate instead of the settings
-record; each default and range is documented on [Kairos](../scheduler/kairos.md#configuration). The
-fund's floor is `region-execution.threads`, but the platform key is still what Folia starts.
+`catch-up.cap-ticks`, `catch-up.budget-millis`, `steal.threshold-millis`, `affinity.local-queue-size`,
+`lease.timeout-seconds`, `metrics.jfr` and the `idle-work` block. They are read through the scheduler's
+opt-in gate instead of the settings record; each default and range is documented on
+[Kairos](../scheduler/kairos.md#configuration) and [idle-safe work](idle-work.md#configuration). The
+fund's floor is the count Folia starts, from `paper-global.yml: threaded-regions.threads`;
+`region-execution.threads` only feeds the ledger deduction and the pool spec.
 
 ## What changing a key does not do
 
