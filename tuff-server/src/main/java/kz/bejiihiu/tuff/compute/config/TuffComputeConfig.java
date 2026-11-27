@@ -61,6 +61,7 @@ public final class TuffComputeConfig {
 
     private volatile ConfigLoadResult state;
     private volatile RegionReliefSettings reliefSettings = RegionReliefSettings.defaults();
+    private volatile RegionReliefSettings.Trigger triggerSettings = RegionReliefSettings.Trigger.defaults();
     private volatile @Nullable ComputeConfigApplyTarget applyTarget;
     private volatile Map<String, String> flattened = Map.of();
     private boolean loaded;
@@ -180,6 +181,19 @@ public final class TuffComputeConfig {
     }
 
     /**
+     * Returns the overrun trigger policy currently in effect.
+     *
+     * <p>The trigger lives next to relief for the same reason: it is an optional subsystem and the
+     * compute model must keep compiling without it. Like the relief settings, the value is replaced as
+     * a whole on reload and is visible to any thread.
+     *
+     * @return the current trigger policy, never {@code null}
+     */
+    public RegionReliefSettings.Trigger triggerSettings() {
+        return this.triggerSettings;
+    }
+
+    /**
      * Returns the problems of the last read.
      *
      * @return an immutable list, possibly empty
@@ -234,6 +248,7 @@ public final class TuffComputeConfig {
             boolean created = false;
             ComputeSettings parsed = null;
             RegionReliefSettings parsedRelief = null;
+            RegionReliefSettings.Trigger parsedTrigger = null;
             Configuration configuration = null;
 
             try {
@@ -244,6 +259,7 @@ public final class TuffComputeConfig {
                 configuration = ComputeConfigParser.load(this.file);
                 parsed = ComputeConfigParser.parse(configuration, problems);
                 parsedRelief = ComputeConfigParser.parseRelief(configuration, problems);
+                parsedTrigger = ComputeConfigParser.parseTrigger(configuration, problems);
             } catch (final IOException ex) {
                 problems.add(new ConfigProblem(this.file.toString(), "could not be read (" + ex + "), keeping the previous settings"));
             } catch (final InvalidConfigurationException ex) {
@@ -259,6 +275,9 @@ public final class TuffComputeConfig {
             final RegionReliefSettings relief = keptPrevious
                 ? this.reliefSettings
                 : (parsedRelief == null ? RegionReliefSettings.defaults() : parsedRelief);
+            final RegionReliefSettings.Trigger trigger = keptPrevious
+                ? this.triggerSettings
+                : (parsedTrigger == null ? RegionReliefSettings.Trigger.defaults() : parsedTrigger);
             // the thread section lives outside ComputeSettings, so it is flattened from the same loaded
             // tree; a failed read must keep the old leaves too, otherwise a broken file would look like
             // "every thread key changed". relief settings are outside it for the same reason and are
@@ -269,6 +288,7 @@ public final class TuffComputeConfig {
             } else {
                 flattening = new LinkedHashMap<>(ComputeConfigParser.flatten(settings, configuration));
                 flattening.putAll(ComputeConfigParser.flattenRelief(relief));
+                flattening.putAll(ComputeConfigParser.flattenTrigger(trigger));
             }
             final boolean firstRead = !this.loaded;
             final ConfigDiff diff = firstRead
@@ -279,6 +299,7 @@ public final class TuffComputeConfig {
             this.loaded = true;
             this.flattened = Map.copyOf(flattening);
             this.reliefSettings = relief;
+            this.triggerSettings = trigger;
             this.state = result;
             this.log(result, initial);
             this.apply(previous.settings(), result);

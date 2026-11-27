@@ -50,7 +50,7 @@ following are not:
 | Not included | What it means for you |
 | --- | --- |
 | Built-in consumers | No server subsystem submits to the pool. The `consumers.chunk-generation`, `consumers.pathfinding` and `consumers.ai-computation` sections are **examples** of policies for ids that a plugin or a future subsystem may use; nothing runs under those ids by default |
-| Automatic relief trigger | The `region-relief` consumer and the offload API are wired and fully usable, but nothing decides on its own that a region should shed work. Offloading stays off until `async-compute.relief.enabled` is set and a region subsystem submits, see [Region relief](region-relief.md) |
+| Automatic relief trigger | The trigger that opens a relief window for an overrunning region exists, but **no work unit ships with the server**: nothing is registered by default, so an enabled trigger only moves counters. Offloading stays off until `async-compute.relief.enabled` and `relief.trigger.enabled` are set and a subsystem registers a unit, see [Region relief](region-relief.md) |
 
 The server bootstrap creates, starts and installs the engine before plugins are enabled; plugins only read
 it. `/tuff` reports it and controls JFR.
@@ -110,7 +110,8 @@ See [Operations § Command](operations.md#command) for output details and JFR li
   mistakes.
 - [Configuration](configuration.md) — every key in `config/tuff.yml`, defaults, validation errors, presets.
 - [Region relief](region-relief.md) — the offload path an overloaded region can use, its completion
-  contract, the `region-relief` consumer and the core reserve that tick pressure cannot take away.
+  contract, the per-region overrun trigger and unit API, the `region-relief` consumer and the core reserve
+  that tick pressure cannot take away.
 - [Tuning](tuning.md) — server-type presets, lane and spill choices, symptom → knob, anti-patterns.
 - [Operations](operations.md) — command, logs, metrics, JFR recordings, benchmarks, tuning, known limitations.
 - [Benchmarks](benchmarks.md) — JMH numbers for the submission path, dispatch, strategies, cancellation,

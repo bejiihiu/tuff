@@ -403,6 +403,27 @@ async-compute:
       max-queued-tasks: 64
       overflow-policy: reject
       max-queue-wait-seconds: 2
+    # Overrun trigger: watches the per-region tick feed and opens a relief window when one region keeps
+    # running long. Off by default, and it only acts while the relief switch above is on: a window is a
+    # permission for a registered work unit, not a task. Needs a restart.
+    trigger:
+      # Open windows at all. Off means the tick feed costs one flag check and nothing else.
+      enabled: false
+      # Body duration, or start lag past the deadline, that counts as an overrun.
+      overrun-millis: 40
+      # Consecutive overrun bodies that open a window.
+      enter-overruns: 3
+      # Consecutive calm bodies that close an open window.
+      exit-calm-ticks: 6
+      # Seconds a region must stay calm after a window closed before the next one may open.
+      cooldown-seconds: 30
+      # Windows one region may open inside one rate window.
+      max-windows: 4
+      # Length of the per-region rate window in seconds.
+      rate-window-seconds: 300
+      # Seconds without a tick after which a region's trigger state is forgotten. An open window of a
+      # region that stopped ticking is counted as abandoned instead of staying open forever.
+      stale-after-seconds: 10
 
   # Seconds a graceful shutdown lets running tasks finish. Queued tasks that did not start are
   # cancelled. Kept short on purpose: the world save runs right after the pool stops and /restart

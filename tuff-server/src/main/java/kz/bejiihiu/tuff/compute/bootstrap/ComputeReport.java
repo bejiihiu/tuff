@@ -16,6 +16,7 @@ import kz.bejiihiu.tuff.compute.RegionReliefMetrics;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.config.ConfigLoadResult;
 import kz.bejiihiu.tuff.compute.config.ConfigProblem;
+import kz.bejiihiu.tuff.threads.relief.ReliefTriggerSnapshot;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -108,6 +109,20 @@ public final class ComputeReport {
      * @return the report lines, or the reason there is nothing to report
      */
     public static List<String> consumers(final ComputeStatus status) {
+        return consumers(status, ComputeBootstrap.reliefTriggerSnapshot());
+    }
+
+    /**
+     * Builds the per consumer breakdown with an explicit trigger snapshot.
+     *
+     * <p>The overload exists so the trigger block can be tested without a running server; the command
+     * uses the snapshot of the live trigger.
+     *
+     * @param status  current bootstrap status
+     * @param trigger trigger snapshot to print, or empty when no trigger exists
+     * @return the report lines, or the reason there is nothing to report
+     */
+    static List<String> consumers(final ComputeStatus status, final Optional<ReliefTriggerSnapshot> trigger) {
         final @Nullable AsyncComputeScheduler scheduler = status.engine().orElse(null);
         if (scheduler == null) {
             return unavailable(status);
@@ -145,7 +160,61 @@ public final class ComputeReport {
                 + " / longest " + formatDuration(consumerMetrics.longestExecutionTime()));
         }
         metrics.regionRelief().ifPresent(relief -> lines.addAll(describeRelief(relief)));
+        trigger.ifPresent(snapshot -> lines.addAll(describeTrigger(snapshot)));
         return List.copyOf(lines);
+    }
+
+    /**
+     * Builds the region relief trigger lines shown below the relief block.
+     *
+     * <p>A trigger that is switched off is still printed: an operator has to be able to see that the
+     * path exists and is off, instead of wondering whether the line is missing.
+     *
+     * @param trigger trigger snapshot
+     * @return the lines of the trigger block
+     */
+    static List<String> describeTrigger(final ReliefTriggerSnapshot trigger) {
+        if (!trigger.enabled()) {
+            return List.of(INDENT + "region relief trigger: off");
+        }
+        final List<String> lines = new ArrayList<>();
+        lines.add(INDENT + "region relief trigger: on, " + describeUnits(trigger.registeredUnits(), trigger.unitIds())
+            + ", " + trigger.regions() + " region(s), " + trigger.openWindows() + " window(s) open");
+        lines.add(INDENT + INDENT + trigger.windowsEntered() + " windows entered, " + trigger.windowsExited()
+            + " exited, " + trigger.windowsAbandoned() + " abandoned; "
+            + trigger.overrunBodies() + " overrun / " + trigger.calmBodies() + " calm bodies; "
+            + trigger.unitFailures() + " unit failures; " + describeLastWindow(trigger.lastWindowAgeNanos()));
+        lines.add(INDENT + INDENT + "suppressed " + trigger.suppressedByCooldown() + " by cooldown, "
+            + trigger.suppressedByRate() + " by rate");
+        if (!trigger.topOffenders().isEmpty()) {
+            lines.add(INDENT + INDENT + "top offenders: " + describeOffenders(trigger.topOffenders()));
+        }
+        return List.copyOf(lines);
+    }
+
+    private static String describeUnits(final int registered, final List<String> ids) {
+        if (registered == 0) {
+            return "no work units registered";
+        }
+        return registered + (registered == 1 ? " work unit (" : " work units (")
+            + String.join(", ", ids) + ')';
+    }
+
+    private static String describeLastWindow(final long ageNanos) {
+        if (ageNanos < 0L) {
+            return "no window yet";
+        }
+        return "last window " + formatDuration(Duration.ofNanos(ageNanos)) + " ago";
+    }
+
+    private static String describeOffenders(final List<ReliefTriggerSnapshot.RegionOffence> offenders) {
+        final List<String> parts = new ArrayList<>(offenders.size());
+        for (final ReliefTriggerSnapshot.RegionOffence offence : offenders) {
+            parts.add("region " + offence.regionId() + " (" + offence.overrunBodies() + " overrun, "
+                + offence.windows() + (offence.windows() == 1L ? " window" : " windows")
+                + (offence.open() ? ", open)" : ")"));
+        }
+        return String.join(", ", parts);
     }
 
     /**

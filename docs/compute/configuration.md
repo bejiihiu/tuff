@@ -234,6 +234,14 @@ The relief path is fully documented on [its own page](region-relief.md); this ta
 | `consumer.max-queued-tasks` | integer | `64` | `-1` or `>= 0` | Relief queue bound | yes |
 | `consumer.overflow-policy` | enum | `reject` | `reject`, `drop-oldest` | Overflow behaviour. `reject` is the only sensible value: a stale relief result is worthless | yes |
 | `consumer.max-queue-wait-seconds` | number | `2` | `>= 0` | Accepted relief work that waits longer is cancelled and rerun inline | yes |
+| `trigger.enabled` | boolean | `false` | `true`/`false` | Open relief windows for an overrunning region. Off costs one flag check per tick; also needs `enabled` | yes |
+| `trigger.overrun-millis` | integer | `40` | `>= 1` | Body duration, or start lag past the deadline, that counts as an overrun | yes |
+| `trigger.enter-overruns` | integer | `3` | `>= 1` | Consecutive overrun bodies that open a window | yes |
+| `trigger.exit-calm-ticks` | integer | `6` | `>= 1` | Consecutive calm bodies that close an open window | yes |
+| `trigger.cooldown-seconds` | number | `30` | `>= 0` | Time a region must stay calm after a close before the next window | yes |
+| `trigger.max-windows` | integer | `4` | `>= 1` | Windows one region may open inside one rate window | yes |
+| `trigger.rate-window-seconds` | number | `300` | `> 0` | Length of the per-region rate window | yes |
+| `trigger.stale-after-seconds` | number | `10` | `> 0` | Silence after which a region's trigger state is forgotten; an open window is counted as abandoned | yes |
 
 ## `async-compute.metrics`
 

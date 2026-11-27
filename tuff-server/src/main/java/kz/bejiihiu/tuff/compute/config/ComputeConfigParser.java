@@ -52,6 +52,7 @@ final class ComputeConfigParser {
     private static final String LANE_VIRTUAL_PATH = LANES_PATH + ".virtual";
     private static final String RELIEF_PATH = SECTION + ".relief";
     private static final String RELIEF_CONSUMER_PATH = RELIEF_PATH + ".consumer";
+    private static final String TRIGGER_PATH = RELIEF_PATH + ".trigger";
 
     private static final String DEFAULT_CONSUMER = "default";
     private static final String ALLOW_DYNAMIC_REGISTRATION = "allow-dynamic-registration";
@@ -84,7 +85,11 @@ final class ComputeConfigParser {
         "enabled", "low-priority", "normal-spill", "max-concurrent", "spill-wait-millis", "spill-queue-depth"
     );
     private static final Set<String> RELIEF_KEYS = Set.of(
-        "enabled", "max-in-flight-per-region", "reserved-cores", "consumer"
+        "enabled", "max-in-flight-per-region", "reserved-cores", "consumer", "trigger"
+    );
+    private static final Set<String> TRIGGER_KEYS = Set.of(
+        "enabled", "overrun-millis", "enter-overruns", "exit-calm-ticks", "cooldown-seconds",
+        "max-windows", "rate-window-seconds", "stale-after-seconds"
     );
 
     private ComputeConfigParser() {
@@ -497,6 +502,98 @@ final class ComputeConfigParser {
         flat.put(RELIEF_PATH + ".reserved-cores", Integer.toString(relief.reservedCores()));
         flattenPolicy(flat, RELIEF_CONSUMER_PATH, relief.consumerPolicy());
         return flat;
+    }
+
+    /**
+     * Parses the {@code async-compute.relief.trigger} section.
+     *
+     * <p>The trigger decides when a region is behind; it is not part of the relief service, so it is
+     * parsed on its own. Every key falls back to its own default and is reported, and a combination the
+     * record rejects falls back to the whole default policy with one problem entry.
+     *
+     * @param configuration loaded YAML
+     * @param problems      problem sink, appended to in place
+     * @return the parsed trigger policy, never {@code null}
+     */
+    static RegionReliefSettings.Trigger parseTrigger(
+        final Configuration configuration,
+        final List<ConfigProblem> problems
+    ) {
+        final RegionReliefSettings.Trigger fallback = RegionReliefSettings.Trigger.defaults();
+        final ConfigurationSection root = configuration.getConfigurationSection(SECTION);
+        if (root == null) {
+            return fallback;
+        }
+        final ConfigurationSection relief = root.getConfigurationSection("relief");
+        if (relief == null) {
+            return fallback;
+        }
+        final ConfigurationSection section = readSection(relief, "trigger", TRIGGER_PATH, problems);
+        if (section == null) {
+            return fallback;
+        }
+        final boolean enabled = readBoolean(section, "enabled", fallback.enabled(), TRIGGER_PATH + ".enabled", problems);
+        final Duration overrun = readMillis(
+            section, "overrun-millis", fallback.overrun(), false, TRIGGER_PATH + ".overrun-millis", problems
+        );
+        int enter = readInt(
+            section, "enter-overruns", fallback.enterOverruns(), TRIGGER_PATH + ".enter-overruns", problems
+        );
+        int exit = readInt(
+            section, "exit-calm-ticks", fallback.exitCalm(), TRIGGER_PATH + ".exit-calm-ticks", problems
+        );
+        final Duration cooldown = readSeconds(
+            section, "cooldown-seconds", fallback.cooldown(), true, TRIGGER_PATH + ".cooldown-seconds", problems
+        );
+        int maxWindows = readInt(
+            section, "max-windows", fallback.maxWindows(), TRIGGER_PATH + ".max-windows", problems
+        );
+        final Duration rateWindow = readSeconds(
+            section, "rate-window-seconds", fallback.rateWindow(), false, TRIGGER_PATH + ".rate-window-seconds", problems
+        );
+        final Duration staleAfter = readSeconds(
+            section, "stale-after-seconds", fallback.staleAfter(), false, TRIGGER_PATH + ".stale-after-seconds", problems
+        );
+        enter = atLeastOne(enter, fallback.enterOverruns(), TRIGGER_PATH + ".enter-overruns", problems);
+        exit = atLeastOne(exit, fallback.exitCalm(), TRIGGER_PATH + ".exit-calm-ticks", problems);
+        maxWindows = atLeastOne(maxWindows, fallback.maxWindows(), TRIGGER_PATH + ".max-windows", problems);
+        try {
+            return new RegionReliefSettings.Trigger(
+                enabled, overrun, enter, exit, cooldown, maxWindows, rateWindow, staleAfter
+            );
+        } catch (final IllegalArgumentException | NullPointerException ex) {
+            problems.add(new ConfigProblem(TRIGGER_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
+            return fallback;
+        }
+    }
+
+    /**
+     * Renders the trigger policy as dotted keys, so a reload can see them change.
+     *
+     * @param trigger trigger policy to render
+     * @return ordered map of dotted key to display value
+     * @throws NullPointerException if {@code trigger} is {@code null}
+     */
+    static Map<String, String> flattenTrigger(final RegionReliefSettings.Trigger trigger) {
+        Objects.requireNonNull(trigger, "trigger");
+        final Map<String, String> flat = new LinkedHashMap<>();
+        flat.put(TRIGGER_PATH + ".enabled", Boolean.toString(trigger.enabled()));
+        flat.put(TRIGGER_PATH + ".overrun-millis", Long.toString(trigger.overrun().toMillis()));
+        flat.put(TRIGGER_PATH + ".enter-overruns", Integer.toString(trigger.enterOverruns()));
+        flat.put(TRIGGER_PATH + ".exit-calm-ticks", Integer.toString(trigger.exitCalm()));
+        flat.put(TRIGGER_PATH + ".cooldown-seconds", formatSeconds(trigger.cooldown()));
+        flat.put(TRIGGER_PATH + ".max-windows", Integer.toString(trigger.maxWindows()));
+        flat.put(TRIGGER_PATH + ".rate-window-seconds", formatSeconds(trigger.rateWindow()));
+        flat.put(TRIGGER_PATH + ".stale-after-seconds", formatSeconds(trigger.staleAfter()));
+        return flat;
+    }
+
+    private static int atLeastOne(final int value, final int fallback, final String path, final List<ConfigProblem> problems) {
+        if (value >= 1) {
+            return value;
+        }
+        problems.add(new ConfigProblem(path, "must be at least 1, got " + value + "; using " + fallback));
+        return fallback;
     }
 
     private static ComputeSettings.Lanes.Virtual parseVirtualLane(
@@ -969,6 +1066,12 @@ final class ComputeConfigParser {
             relief == null ? null : relief.getConfigurationSection("consumer"),
             RELIEF_CONSUMER_PATH,
             CONSUMER_KEYS,
+            problems
+        );
+        reportUnknownIn(
+            relief == null ? null : relief.getConfigurationSection("trigger"),
+            TRIGGER_PATH,
+            TRIGGER_KEYS,
             problems
         );
 

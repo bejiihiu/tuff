@@ -22,6 +22,9 @@ import kz.bejiihiu.tuff.compute.internal.spi.ComputeBudgetPort;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
 import kz.bejiihiu.tuff.threads.bootstrap.ThreadsBootstrap;
+import kz.bejiihiu.tuff.threads.observe.TickObservers;
+import kz.bejiihiu.tuff.threads.relief.ReliefTrigger;
+import kz.bejiihiu.tuff.threads.relief.ReliefTriggerSnapshot;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jspecify.annotations.Nullable;
@@ -68,6 +71,7 @@ public final class ComputeBootstrap {
     private static volatile ComputeStatus status = ComputeStatus.notInitialised();
     private static volatile @Nullable TuffComputeConfig config;
     private static volatile @Nullable ComputeUtmiAdapter computeAdapter;
+    private static volatile @Nullable ReliefTrigger reliefTrigger;
     private static volatile List<String> lastAppliedConsumers = List.of();
     private static volatile List<String> lastDeferredConsumers = List.of();
 
@@ -234,6 +238,7 @@ public final class ComputeBootstrap {
     private static void stopEngine() {
         final ComputeStatus previous = status;
         final @Nullable AsyncComputeScheduler scheduler = previous.engine().orElse(null);
+        stopReliefTrigger();
         status = ComputeStatus.notInitialised();
         computeAdapter = null;
         final TuffComputeConfig loaded = config;
@@ -305,6 +310,30 @@ public final class ComputeBootstrap {
      */
     public static Optional<RegionRelief> regionRelief() {
         return status.engine().flatMap(AsyncComputeScheduler::regionRelief);
+    }
+
+    /**
+     * Returns the overrun trigger of the running engine.
+     *
+     * <p>This is the entry point for a subsystem that has work it can shed: it registers one
+     * {@link kz.bejiihiu.tuff.threads.relief.ReliefUnit} and is called on the region thread when that
+     * region needs relief. The empty result means the compute engine is not running, so there is
+     * nothing to offload to and no trigger exists.
+     *
+     * @return the trigger, or an empty optional when no engine is available
+     */
+    public static Optional<ReliefTrigger> reliefTrigger() {
+        return Optional.ofNullable(reliefTrigger);
+    }
+
+    /**
+     * Returns the trigger snapshot for the command report.
+     *
+     * @return the snapshot of the running trigger, or an empty optional when there is none
+     */
+    static Optional<ReliefTriggerSnapshot> reliefTriggerSnapshot() {
+        final @Nullable ReliefTrigger trigger = reliefTrigger;
+        return trigger == null ? Optional.empty() : Optional.of(trigger.snapshot());
     }
 
     /**
@@ -386,6 +415,7 @@ public final class ComputeBootstrap {
                         + "leave room for {}; the pool runs with {} worker(s). /tuff shows the requested and the live count.",
                     workers.threads(), budget, workers.maxThreads() == -1 ? "auto" : workers.maxThreads(), resolved, resolved);
             }
+            startReliefTrigger(relief);
         } catch (final Throwable ex) {
             status = ComputeStatus.failed();
             LOGGER.error("The Tuff compute engine failed to start; the server runs without it", ex);
@@ -443,6 +473,46 @@ public final class ComputeBootstrap {
                 String.join(", ", lastDeferredConsumers));
         }
         LOGGER.debug("Tuff compute reload changed {}", diff.summary());
+    }
+
+    /**
+     * Arms the overrun trigger and registers it on the tick feed.
+     *
+     * <p>The feed itself belongs to the thread layer, which installs the recording observer first.
+     * Registering as a listener instead of replacing the observer is what keeps both working: the
+     * recording still sees every body, and the trigger sees the same bodies after it.
+     *
+     * @param relief relief settings the engine started with
+     */
+    private static void startReliefTrigger(final RegionReliefSettings relief) {
+        final @Nullable TuffComputeConfig loaded = config;
+        final RegionReliefSettings.Trigger settings = loaded == null
+            ? RegionReliefSettings.Trigger.defaults()
+            : loaded.triggerSettings();
+        final ReliefTrigger trigger = new ReliefTrigger(settings, relief.enabled());
+        reliefTrigger = trigger;
+        TickObservers.addListener(trigger);
+        if (settings.enabled() && !relief.enabled()) {
+            LOGGER.warn("Tuff compute: async-compute.relief.trigger.enabled is true, but async-compute.relief.enabled is "
+                + "false; the trigger stays off, because a submission would run inline at the end of a tick");
+        } else if (trigger.enabled()) {
+            LOGGER.info("Tuff compute: region relief trigger armed (overrun {} ms, enter {}, exit {}, cooldown {} s, "
+                    + "{} window(s) per {} s)",
+                settings.overrun().toMillis(), settings.enterOverruns(), settings.exitCalm(),
+                settings.cooldown().toSeconds(), settings.maxWindows(), settings.rateWindow().toSeconds());
+            LOGGER.info("Tuff compute: no built-in work unit exists; a subsystem has to register one before a window "
+                + "does anything");
+        }
+    }
+
+    private static void stopReliefTrigger() {
+        final @Nullable ReliefTrigger trigger = reliefTrigger;
+        reliefTrigger = null;
+        if (trigger == null) {
+            return;
+        }
+        TickObservers.removeListener(trigger);
+        trigger.close();
     }
 
     private static void shutdownQuietly(final AsyncComputeScheduler scheduler) {

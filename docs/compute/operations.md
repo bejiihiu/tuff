@@ -65,6 +65,11 @@ averages. Below the table it prints the region relief block (state, in-flight/li
 accepted, completed, stale, inline fallbacks, failures, drops and the estimated saved time), or
 `region relief: off, every request runs inline` when the path exists but is not enabled.
 
+After the relief block it prints the overrun trigger: whether it is on, the registered work units, the
+regions it tracks, the open windows, the entered/exited/abandoned windows, overrun and calm bodies,
+suppressed openings, unit failures, the age of the last window and the busiest regions. `region relief
+trigger: off` means windows never open, either because the trigger is disabled or because relief itself is.
+
 `reload` sends `Reloading the compute configuration...` and then runs on the global tick thread. It reports
 the number of changes, the consumer policies applied now, the keys that take effect after a restart and
 every validation problem from `problems()`.

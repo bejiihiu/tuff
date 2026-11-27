@@ -109,4 +109,93 @@ public record RegionReliefSettings(
     public RegionReliefSettings withConsumerPolicy(final ConsumerPolicy policy) {
         return new RegionReliefSettings(this.enabled, this.maxInFlightPerRegion, this.reservedCores, policy);
     }
+
+    /**
+     * Policy of the per-region overrun trigger.
+     *
+     * <p>The trigger is the decision "this region is behind, ask the registered work units for help".
+     * It watches the scheduler independent tick feed, so it does not care which scheduler ran the body,
+     * and it keeps independent counters per region.
+     *
+     * <p>Two kinds of limits keep it from thrashing. Hysteresis: a window opens after
+     * {@link #enterOverruns()} consecutive overrun bodies and closes after {@link #exitCalm()}
+     * consecutive calm ones. Rate: a closed window stays closed for {@link #cooldown()}, and one region
+     * may open at most {@link #maxWindows()} windows inside {@link #rateWindow()}.
+     *
+     * <p>The defaults are quiet: the trigger is off, and switching it on does nothing until a subsystem
+     * registers a work unit. See the region relief documentation for the exact predicate.
+     *
+     * @param enabled       whether overrun bodies may open a relief window at all
+     * @param overrun       body duration, or start lag, that counts as an overrun
+     * @param enterOverruns consecutive overrun bodies that open a window
+     * @param exitCalm      consecutive calm bodies that close an open window
+     * @param cooldown      time a region must stay calm after a window closed before the next one
+     * @param maxWindows    windows one region may open inside one rate window
+     * @param rateWindow    length of the sliding rate window of one region
+     * @param staleAfter    silence after which a region's trigger state is forgotten
+     */
+    public record Trigger(
+        boolean enabled,
+        Duration overrun,
+        int enterOverruns,
+        int exitCalm,
+        Duration cooldown,
+        int maxWindows,
+        Duration rateWindow,
+        Duration staleAfter
+    ) {
+
+        /**
+         * Validates the policy.
+         *
+         * @throws NullPointerException     if a duration is {@code null}
+         * @throws IllegalArgumentException if a duration is not usable or a count is below one
+         */
+        public Trigger {
+            Objects.requireNonNull(overrun, "overrun");
+            Objects.requireNonNull(cooldown, "cooldown");
+            Objects.requireNonNull(rateWindow, "rateWindow");
+            Objects.requireNonNull(staleAfter, "staleAfter");
+            if (overrun.isZero() || overrun.isNegative()) {
+                throw new IllegalArgumentException("overrun must be positive, got " + overrun);
+            }
+            if (enterOverruns < 1) {
+                throw new IllegalArgumentException("enterOverruns must be at least 1, got " + enterOverruns);
+            }
+            if (exitCalm < 1) {
+                throw new IllegalArgumentException("exitCalm must be at least 1, got " + exitCalm);
+            }
+            if (cooldown.isNegative()) {
+                throw new IllegalArgumentException("cooldown must not be negative, got " + cooldown);
+            }
+            if (maxWindows < 1) {
+                throw new IllegalArgumentException("maxWindows must be at least 1, got " + maxWindows);
+            }
+            if (rateWindow.isZero() || rateWindow.isNegative()) {
+                throw new IllegalArgumentException("rateWindow must be positive, got " + rateWindow);
+            }
+            if (staleAfter.isZero() || staleAfter.isNegative()) {
+                throw new IllegalArgumentException("staleAfter must be positive, got " + staleAfter);
+            }
+        }
+
+        /**
+         * Returns the defaults: the trigger is off, so a server that never opted in pays one flag check
+         * per tick and nothing else.
+         *
+         * @return the default trigger policy
+         */
+        public static Trigger defaults() {
+            return new Trigger(
+                false,
+                Duration.ofMillis(40L),
+                3,
+                6,
+                Duration.ofSeconds(30L),
+                4,
+                Duration.ofMinutes(5L),
+                Duration.ofSeconds(10L)
+            );
+        }
+    }
 }

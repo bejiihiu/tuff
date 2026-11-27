@@ -127,6 +127,111 @@ exactly the same ceiling as before. The reserve also raises the pool's idle floo
 fixed `workers.threads` count is never resized by pressure, so the reserve only matters for automatic
 sizing.
 
+## The overload trigger
+
+The service and the consumer above are passive: they do what they are asked. The trigger is the part
+that decides *when* to ask. It watches the scheduler independent tick feed and opens a relief window
+for one region when that region keeps running long.
+
+The feed is the per-tick observation the region handle emits at the end of every body, so the trigger
+sees the same numbers the scheduler used: the body's real start and end, and the deadline the body was
+measured against. It never measures a tick on its own, and it does not care whether EDF, work stealing
+or Kairos ran the body.
+
+### The policy
+
+A tick body is an **overrun** when any of these holds:
+
+- it ran for at least `overrun-millis`;
+- it started at least one whole period after its deadline (`periodsAhead > 1`);
+- it started at least `overrun-millis` after its deadline.
+
+The first condition is the real body duration. The last two are the deadline miss: a body that starts a
+period late has already lost the tick, even when the body itself is quick.
+
+Every region has its own counters, so state is independent:
+
+| Event | Effect |
+| --- | --- |
+| Overrun body | The overrun run grows by one, the calm run resets to zero |
+| Calm body | The calm run grows by one, the overrun run resets to zero |
+| Overrun run reaches `enter-overruns` and no window is open | A window opens, with a new epoch |
+| Calm run reaches `exit-calm-ticks` while a window is open | The window closes and the cooldown starts |
+| A window would open before `cooldown-seconds` since the last close | Suppressed, counted as cooldown |
+| A region already opened `max-windows` windows inside `rate-window-seconds` | Suppressed, counted as rate |
+
+The cooldown and the rate are checked only when the run would otherwise open a window, so a region
+that keeps overrunning for a long time still opens at most the allowed number of windows.
+
+### The unit API
+
+The trigger owns no work. A subsystem that has offloadable work registers a
+[`ReliefUnit`](../../tuff-server/src/main/java/kz/bejiihiu/tuff/threads/relief/ReliefUnit.java):
+
+```java
+final ReliefTrigger trigger = ComputeBootstrap.reliefTrigger().orElse(null);
+if (trigger != null) {
+    trigger.register(new PathfindingReliefUnit());
+}
+
+final class PathfindingReliefUnit implements ReliefUnit {
+
+    @Override
+    public String id() {
+        return "pathfinding";
+    }
+
+    @Override
+    public void onWindowOpen(final ReliefWindow window) {
+        // runs on the region thread that produced the tick
+        final RegionReliefOwner owner = new MyRegionOwner(window.owner(), window.regionId());
+        final long epoch = window.epoch();
+        relief.submit(owner, new MyPathWork(snapshot, epoch));
+    }
+}
+```
+
+`ReliefWindow` carries the region id, the owning thread, the window epoch and the moment the window
+opened. The unit builds its own `RegionReliefOwner` because it knows its location and its scheduler; the
+trigger never constructs an owner, never submits and never applies anything.
+
+Both callbacks run on the owning region thread, inside the tick body that just ended, so a callback
+must be short: capture a snapshot, submit, return. A unit that throws is isolated and counted in
+`unitFailures`; the tick and the other units continue. A unit that wants to know whether a region still
+has a window can call `trigger.windowEpoch(regionId)`, which returns zero when the region is calm.
+
+**No built-in work unit ships in vanilla.** Nothing in the server is registered by default, so an
+enabled trigger on a plain server opens windows that nobody listens to and only moves the counters. A
+plugin or a server subsystem has to register a unit before relief does anything.
+
+### Regions that stop ticking
+
+Nothing in the tick feed reports a region removal, so the trigger cannot be told "this region is gone".
+It bounds the state instead: a region whose last body is older than `stale-after-seconds` is forgotten
+on the next sweep (at most once per second of event time), and an open window of that region is counted
+as `windowsAbandoned`.
+
+No unit callback runs for an abandoned window. There is no region thread left to run it on, and calling
+a unit from a different region's thread would break the ownership rule the rest of relief is built on.
+A unit that needs to cancel work when a region dies must do it from its own region or plugin lifecycle,
+not from the trigger. This is the honest gap of the current seam.
+
+### Which keys switch it on
+
+The trigger only acts when **both** switches are on:
+
+```yaml
+async-compute:
+  relief:
+    enabled: true          # offloading is allowed at all
+    trigger:
+      enabled: true        # windows may open
+```
+
+With `relief.enabled: false` a window would only move work to the end of a tick, because every
+submission would fall back to running inline. The trigger therefore stays off in that combination, and
+the server log says so at start.
+
 ## Configuration
 
 ```yaml
@@ -142,6 +247,15 @@ async-compute:
       max-queued-tasks: 64
       overflow-policy: reject
       max-queue-wait-seconds: 2
+    trigger:
+      enabled: false                 # off by default; no built-in unit ships anyway
+      overrun-millis: 40
+      enter-overruns: 3
+      exit-calm-ticks: 6
+      cooldown-seconds: 30
+      max-windows: 4
+      rate-window-seconds: 300
+      stale-after-seconds: 10
 ```
 
 | Key | Type | Default | Allowed | Effect |
@@ -150,6 +264,14 @@ async-compute:
 | `max-in-flight-per-region` | integer | `8` | `>= 1` | Accepted relief requests one region may have outstanding |
 | `reserved-cores` | integer | `1` | `>= 0` | Cores the pool keeps for relief under tick pressure; only applied while `enabled` |
 | `consumer.*` | policy | see above | the consumer policy keys | Policy of the `region-relief` consumer |
+| `trigger.enabled` | boolean | `false` | `true`/`false` | Open relief windows at all. Off costs one flag check per tick |
+| `trigger.overrun-millis` | integer | `40` | `>= 1` | Body duration, or start lag past the deadline, that counts as an overrun |
+| `trigger.enter-overruns` | integer | `3` | `>= 1` | Consecutive overrun bodies that open a window |
+| `trigger.exit-calm-ticks` | integer | `6` | `>= 1` | Consecutive calm bodies that close an open window |
+| `trigger.cooldown-seconds` | number | `30` | `>= 0` | Time a region must stay calm after a close before the next window |
+| `trigger.max-windows` | integer | `4` | `>= 1` | Windows one region may open inside one rate window |
+| `trigger.rate-window-seconds` | number | `300` | `> 0` | Length of the per-region rate window |
+| `trigger.stale-after-seconds` | number | `10` | `> 0` | Silence after which a region's trigger state is forgotten |
 
 All relief keys are restart-only: the service is wired into the engine and the budget sink at start.
 `/tuff compute reload` reports a change under `takes effect after a restart`.
@@ -162,6 +284,10 @@ The relief counters are part of `SchedulerMetrics#regionRelief()` and printed by
 ```
   region relief: enabled, 0 in flight / 8 per region, reserve 1 core(s)
     12 requests, 10 accepted, 9 completed, 1 stale, 2 inline fallbacks (1 expired), 0 failed, 0 dropped, 3.40 ms estimated saved
+  region relief trigger: on, 1 work unit (pathfinding), 3 region(s), 1 window(s) open
+    4 windows entered, 3 exited, 0 abandoned; 27 overrun / 1800 calm bodies; 0 unit failures; last window 1.20 s ago
+    suppressed 2 by cooldown, 0 by rate
+    top offenders: region 5 (11 overrun, 2 windows, open), region 7 (4 overrun, 1 window)
 ```
 
 | Metric | Meaning |
@@ -176,17 +302,51 @@ The relief counters are part of `SchedulerMetrics#regionRelief()` and printed by
 | `dropped` | Requests refused or results discarded because the region was gone or the apply was not on the owner thread |
 | `estimatedSavedNanos` | Sum of the compute time of applied results; an estimate of region time saved |
 
+The trigger block carries its own counters:
+
+| Metric | Meaning |
+| --- | --- |
+| `windowsEntered` | Windows opened since start |
+| `windowsExited` | Windows closed because the region became calm |
+| `windowsAbandoned` | Open windows forgotten because the region stopped ticking |
+| `overrunBodies` / `calmBodies` | Tick bodies that counted as an overrun or as calm |
+| `suppressedByCooldown` / `suppressedByRate` | Window openings the hysteresis allowed but a limit blocked |
+| `unitFailures` | Work unit callbacks that threw and were isolated |
+| `lastWindowAgeNanos` | Age of the most recent window opening, or `-1` when none opened yet |
+| `topOffenders` | Regions with the most overrun bodies, at most five |
+
 The consumer line itself (`region-relief: enabled, 25% of the pool, ...`) carries the usual submitted,
 completed, rejected, expired and timing counters of the pool.
 
 ## Operational notes
 
 - Keep the trigger off unless there is a region subsystem that actually registers offloadable work. The
-  service and the consumer cost nothing when nothing submits.
+  service and the consumer cost nothing when nothing submits, and an enabled trigger with no unit only
+  moves counters.
 - Watch `inlineFallbacks` against `accepted`: a high fallback rate means the pool is too small for the relief
   share, the per-region cap is too low, or the queue wait is too short. All three are configuration, not
   corruption.
 - Watch `stale`: a high stale rate means results arrive after the region moved on. Lower the work size or
   raise the queue wait only if the region can really use the older snapshot.
+- Watch `suppressedByCooldown` and `suppressedByRate`: a high count means the region overruns more often than
+  the policy allows windows. That is the anti-thrash guard doing its job; raise `max-windows` only if the
+  unit can really absorb more work.
+- `windowsAbandoned` above zero is normal after a region unloads while it was behind. It is a state cleanup,
+  not an error.
+
+## Rollback
+
+The trigger is a restart-only feature with a single switch:
+
+1. Set `async-compute.relief.trigger.enabled: false` and restart. Windows stop opening, the tick feed
+   costs one flag check, and the registered units simply stop being called. Registered units stay
+   harmless: nothing else invokes them.
+2. If the offloading itself is the problem, set `async-compute.relief.enabled: false` as well. Every
+   submission then runs inline again and the reserve drops to zero, which is exactly the behaviour of a
+   server that never opted in.
+3. Removing a unit at runtime is `trigger.unregister(unit)`; the trigger keeps counting but no longer
+   calls it.
+
+No state survives the restart: the window epoch, the counters and the cooldown are rebuilt from zero.
 - The metric `peakWorkers` is no longer polluted by the startup budget: with an automatic worker count the pool
   is created empty and spawned once, at the budget the region scheduler reports.
