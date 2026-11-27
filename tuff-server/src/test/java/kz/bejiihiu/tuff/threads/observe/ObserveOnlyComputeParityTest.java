@@ -18,7 +18,6 @@ import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import kz.bejiihiu.tuff.threads.UnifiedThreadManager;
 import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -54,12 +53,12 @@ class ObserveOnlyComputeParityTest {
 
     @Test
     void legacyPortsProduceTheSameEngineAsThePlainFactory() throws Exception {
-        Assumptions.assumeTrue(
-            Runtime.getRuntime().availableProcessors() >= FIXED_WORKERS,
-            "a host with fewer processors than the fixed count cannot run every worker"
-        );
         final ComputeSettings settings = fixedSettings();
-        final int budget = Math.max(FIXED_WORKERS, Runtime.getRuntime().availableProcessors());
+        // sizing is explicit (threads = min = max = 3), so the host's core count must not leak in: the
+        // same budget is handed to both engines, and a four core runner gets the same three workers as
+        // a thirty two core one. Reading Runtime.availableProcessors() here made this test either
+        // skipped or different depending on the machine
+        final int budget = FIXED_WORKERS;
 
         final ThreadManagerRuntime runtime = new DefaultThreadManagerFactory()
             .create(ThreadManagementSettings.defaults());

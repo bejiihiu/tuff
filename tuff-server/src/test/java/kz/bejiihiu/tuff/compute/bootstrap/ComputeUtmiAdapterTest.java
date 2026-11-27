@@ -51,6 +51,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -59,6 +60,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 class ComputeUtmiAdapterTest {
+
+    /**
+     * Processor count every test that does not name its own topology runs with.
+     *
+     * <p>Never read the host here. CI once had four cores while the dev box had sixteen, and the pool
+     * budget arithmetic (and the min-threads floor on top of it) came out differently, so the same test
+     * was green locally and red on the runner. A fixed topology gives identical numbers whether the
+     * machine has 2, 4, 8, 16 or 32 cores.
+     */
+    private static final int FIXED_CORES = 8;
 
     private ThreadManagerRuntime runtime;
     private AsyncComputeScheduler engine;
@@ -175,21 +186,47 @@ class ComputeUtmiAdapterTest {
         join(thread);
     }
 
-    @Test
-    void theBudgetIsTheControllersNumberWithoutASecondSubtraction() {
-        final ThreadManagerRuntime started = this.start(true);
-        final ComputeUtmiAdapter adapter = ComputeUtmiAdapter.attach(started, ComputeSettings.defaults());
+    /**
+     * The engine's budget is the ledger's number, floored only by {@code workers.min-threads}.
+     *
+     * <p>Two numbers that used to be asserted as one: the ledger capacity compute was given and what
+     * the engine actually applies. They coincide above the floor, but on a small machine the ledger can
+     * hand compute a single core while {@code min-threads} is two - the adapter keeps two workers
+     * because the engine will not run fewer. That floor was the CI failure: a four core runner divided
+     * two usable cores into one for the pump and one for compute, the test expected
+     * {@code usable - 1 == 1} from the adapter, and got the floored {@code 2}. Both are correct, the
+     * assertion was not.
+     *
+     * <p>The topology is a parameter, so this test proves the same arithmetic on 2, 4, 8, 16 and 32
+     * cores instead of on whatever the runner happens to have.
+     *
+     * @param cores fixed processor count for this run
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2, 3, 4, 6, 8, 12, 16, 32, 64})
+    void theBudgetIsTheControllersNumberWithoutASecondSubtraction(final int cores) {
+        final ThreadManagerRuntime started = this.start(true, cores);
+        final ComputeSettings settings = ComputeSettings.defaults();
+        final ComputeUtmiAdapter adapter = ComputeUtmiAdapter.attach(started, settings);
 
         final int usable = started.manager().resources().usableCores();
-        final int expected = started.manager().resources().budget(PoolId.COMPUTE).orElseThrow().resolveCores(usable);
+        final int capacity = started.manager().resources().budget(PoolId.COMPUTE).orElseThrow().cores();
+        final int floor = settings.workers().minThreads();
+        final String context = "fixed topology: cores=" + cores + ", usable=" + usable + ", capacity=" + capacity;
 
-        assertEquals(expected, adapter.processors());
+        final int applied = adapter.processors();
         assertEquals("utmi", adapter.source());
         // the compute pool and the virtual lane's pump share the remainder; nothing else is subtracted
-        assertEquals(Math.max(1, usable - 1), expected);
+        assertEquals(Math.max(0, usable - 1), capacity,
+            "compute owns the ledger remainder after the one core pump: " + context);
+        assertEquals(Math.max(floor, capacity), applied,
+            "the applied budget is the ledger capacity, floored at min-threads: " + context);
+        if (capacity >= floor) {
+            assertEquals(capacity, applied, "no second subtraction above the floor: " + context);
+        }
         assertTrue(
-            expected >= ComputeThreadBudget.resolve(Runtime.getRuntime().availableProcessors()),
-            "the managed budget must not be lower than the legacy one it replaces"
+            applied >= ComputeThreadBudget.resolve(cores),
+            "the managed budget must not be lower than the legacy one it replaces: " + context
         );
     }
 
@@ -381,9 +418,7 @@ class ComputeUtmiAdapterTest {
     }
 
     private ThreadManagerRuntime start(final boolean managed) {
-        this.runtime = new DefaultThreadManagerFactory().create(settings(managed));
-        this.runtime.start();
-        return this.runtime;
+        return this.start(managed, FIXED_CORES);
     }
 
     private ThreadManagerRuntime start(final boolean managed, final int cores) {
