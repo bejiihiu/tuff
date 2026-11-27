@@ -406,7 +406,9 @@ class ComputeUtmiAdapterTest {
         adapter.bind(this.engine);
         this.awaitMinimumWorkers();
 
-        final ResourceSnapshot snapshot = started.manager().metrics().snapshot();
+        // the pump is registered when its wrapped body starts running, not when the Thread is created,
+        // so reading the snapshot straight after start() is a race the busy CI runner loses
+        final ResourceSnapshot snapshot = this.awaitSnapshotWith(started, "-virtual-pump");
         final List<ThreadSnapshot> pumps = snapshot.threads().stream()
             .filter(thread -> thread.name().contains("-virtual-pump"))
             .toList();
@@ -533,6 +535,36 @@ class ComputeUtmiAdapterTest {
             }
         }
         fail("the engine did not spawn its minimum workers in time");
+    }
+
+    /**
+     * Waits until the thread registry has published a thread whose name contains a fragment.
+     *
+     * <p>The registry accounts a thread when its wrapped body starts, which is after {@code start()}
+     * returned and after the thread object exists. A busy runner can therefore take the snapshot
+     * before the pump appears; waiting for it keeps the assertion about accounting instead of about
+     * scheduling luck.
+     *
+     * @param started  running thread manager
+     * @param fragment part of the thread name to wait for
+     * @return the snapshot that contained the fragment, or the last one when the wait timed out
+     */
+    private ResourceSnapshot awaitSnapshotWith(final ThreadManagerRuntime started, final String fragment) {
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10L);
+        ResourceSnapshot last = started.manager().metrics().snapshot();
+        while (System.nanoTime() < deadline) {
+            last = started.manager().metrics().snapshot();
+            if (last.threads().stream().anyMatch(thread -> thread.name().contains(fragment))) {
+                return last;
+            }
+            try {
+                Thread.sleep(20L);
+            } catch (InterruptedException _) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        return last;
     }
 
     private static ThreadManagementSettings settings(final boolean computeManaged) {
