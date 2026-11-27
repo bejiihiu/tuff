@@ -10,7 +10,7 @@ inline until `async-compute.relief.enabled` is set to `true`.
 
 ## The contract
 
-Offloadable work is described by three values and one version
+Offloadable work is described by a snapshot, a version, a pure body and its terminal callbacks
 ([`RegionReliefWork`](../../tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/RegionReliefWork.java)):
 
 | Member | Runs on | Rule |
@@ -19,6 +19,11 @@ Offloadable work is described by three values and one version
 | `epoch()` | any | Version of the world state the snapshot belongs to. The region defines what it means |
 | `compute(snapshot)` | compute worker | Pure CPU work. No world access, no Bukkit/Paper API, no blocking IO, no locks owned by a region |
 | `apply(result)` | region thread, at most once | The only place allowed to mutate world state, and only while the epoch is still current |
+| `onFailure(failure)` | region thread, at most once | The computation or the applicator threw. Must not mutate world state |
+| `onDiscard(reason)` | region thread, at most once | Stale, expired, cancelled or dropped. Must not mutate world state |
+
+`onFailure` and `onDiscard` are default methods, so work that only cares about results does not have to
+implement them; when both are left empty the outcome is still counted in the relief metrics.
 
 The region half is a small port
 ([`RegionReliefOwner`](../../tuff-compute/src/main/java/kz/bejiihiu/tuff/compute/RegionReliefOwner.java)):
@@ -28,6 +33,31 @@ applicator through that port and then verifies the thread before running it.
 
 Ownership is absolute: an applicator that would run off the owning thread is dropped and counted, never run.
 That check is what makes a scheduling mistake cost a result instead of world integrity.
+
+## Completion contract
+
+Every submitted request reaches exactly one of three terminal calls, always on the owning region thread,
+always at most once:
+
+| Call | When | Context |
+| --- | --- | --- |
+| `apply(result)` | The result is usable and the epoch is still current | The only terminal that may mutate world state |
+| `onFailure(failure)` | The compute body threw, or `apply` itself threw | Must not mutate world state: a failure does not prove the snapshot was current |
+| `onDiscard(reason)` | The result will not be applied | Must not mutate world state: the snapshot is stale or the region is going away |
+
+The discard reasons are `STALE` (the epoch moved on), `EXPIRED` (the queued request expired and the region
+was already gone, so the inline rerun could not happen), `CANCELLED` (the pool cancelled the request while
+the region still existed) and `DROPPED` (the region stopped, cancelled its requests, or the result could not
+be delivered to the owner thread).
+
+A compute failure is **never** rerun inline: the same pure body would fail again and would only cost region
+time. An applicator that throws is reported through `onFailure` and does not escape into the tick. Inline
+fallbacks reported at submit time follow the same rule: a failure calls `onFailure` and `submit` returns
+`false`.
+
+Two cases cannot call anything: an owner port that runs the scheduled task off the owner thread (the result
+is dropped and counted, because calling region code from the wrong thread is worse than losing the
+notification), and a port that refuses the task outright. The relief metrics count both.
 
 ## Submission
 
@@ -53,17 +83,19 @@ The service falls back to running the work inline, on the calling thread, when:
 - the `region-relief` consumer is disabled or refuses the submission;
 - the queue is full, globally or for the consumer;
 - the region already has `max-in-flight-per-region` requests outstanding;
-- an accepted request expired in the queue (`max-queue-wait-seconds`) before a worker took it.
+- an accepted request expired in the queue (`max-queue-wait-seconds`) before a worker took it, in which
+  case the same work is rerun on the owner thread.
 
-A request that was accepted and then fails to compute is counted as `failed` and dropped; it is not retried
-inline, because the same pure body would fail the same way. A result whose epoch moved on while it was
-computing is counted as `stale` and dropped.
+A region that already stopped, or whose owner was cancelled, is refused before anything is reserved: `submit`
+returns `false`, the request is counted as `dropped` and `onDiscard(DROPPED)` runs. A result whose epoch moved
+on while it was computing is counted as `stale` and reported through `onDiscard(STALE)`.
 
 ## Lifecycle
 
 - Requests of one region are tracked together. `RegionRelief#cancel(owner)` flags every outstanding request,
   cancels the queued ones cooperatively and drops every result that arrives later. A region calls it when it
-  stops; a stopped region never receives a result.
+  stops; a stopped region never receives a result, and a cancelled owner is refused on every later submission
+  instead of starting a fresh in-flight state.
 - Running tasks are never interrupted. Cancellation is cooperative, exactly like the rest of the pool.
 - The in-flight counter and the per-region slot are released by the callback that makes the final decision,
   so a cancelled or dropped request cannot leak either.
@@ -81,14 +113,19 @@ Tick pressure and relief would otherwise fight: a lagging region makes the pool 
 region is asking for help. Two rules resolve it:
 
 1. **The reserve is not yieldable.** While relief is enabled, `reserved-cores` stay in the pool no matter what
-   tick pressure decides. The pressure controller's ceiling is lowered by that amount, and the applied budget
-   never drops below `min-threads + reserved-cores` while the pool budget allows it.
+   tick pressure decides. The pressure controller's ceiling is lowered so that the pool still runs
+   `min-threads + reserved-cores` workers at maximum pressure: automatic sizing keeps one budget unit as
+   headroom, so the adapter reserves that unit too. The applied budget therefore never drops below
+   `min-threads + reserved-cores + 1`, which is exactly what resolves to the promised worker count.
 2. **Relief never grows the pool.** The backlog of `region-relief` is excluded from the growth and autoscaling
    inputs. Relief work is work a region is trying to shed; letting it justify a bigger pool would defeat the
    point. It is still queued, still admitted and still visible in the queue gauges.
 
 With the trigger off, `effectiveReservedCores()` is zero: a server that does not use relief gives pressure
-exactly the same ceiling as before.
+exactly the same ceiling as before. The reserve also raises the pool's idle floor to
+`min-threads + reserved-cores`, so keep-alive retirement and the idle autoscaler cannot shrink it away. A
+fixed `workers.threads` count is never resized by pressure, so the reserve only matters for automatic
+sizing.
 
 ## Configuration
 
@@ -130,13 +167,13 @@ The relief counters are part of `SchedulerMetrics#regionRelief()` and printed by
 | Metric | Meaning |
 | --- | --- |
 | `requests` | Submissions that reached the relief service |
-| `accepted` | Submissions handed to the compute pool |
+| `accepted` | Submissions actually tracked and handed to the compute pool; a request cancelled between the in-flight reservation and the submission is counted as dropped, never as accepted |
 | `completed` | Results applied on the owning region thread |
-| `stale` | Results dropped because their epoch was no longer current |
+| `stale` | Results reported as `onDiscard(STALE)` because their epoch was no longer current |
 | `inlineFallbacks` | Requests executed inline on the region thread |
 | `expired` | Accepted requests that expired in the queue and were rerun inline |
-| `failed` | Compute bodies that threw |
-| `dropped` | Results dropped because the region was gone or the apply was not on the owner thread |
+| `failed` | Computations or applicators that threw and were reported through `onFailure` |
+| `dropped` | Requests refused or results discarded because the region was gone or the apply was not on the owner thread |
 | `estimatedSavedNanos` | Sum of the compute time of applied results; an estimate of region time saved |
 
 The consumer line itself (`region-relief: enabled, 25% of the pool, ...`) carries the usual submitted,

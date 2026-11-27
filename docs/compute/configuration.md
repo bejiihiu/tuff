@@ -225,7 +225,7 @@ The relief path is fully documented on [its own page](region-relief.md); this ta
 | --- | --- | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | `true`/`false` | Offload relief work. `false` runs every submission inline and holds no core back from pressure | yes |
 | `max-in-flight-per-region` | integer | `8` | `>= 1` | Accepted relief requests one region may have outstanding; the next one runs inline | yes |
-| `reserved-cores` | integer | `1` | `>= 0` | Cores tick pressure may not take away from the pool; only applied while `enabled` | yes |
+| `reserved-cores` | integer | `1` | `>= 0` | Worker-equivalents the pool keeps for relief under tick pressure and while idle; only applied while `enabled`, and capped by `max-threads` | yes |
 | `consumer.enabled` | boolean | `true` | `true`/`false` | Whether the `region-relief` consumer accepts work | yes |
 | `consumer.max-concurrent` | integer or fraction | `0.25` | `-1`, `>= 1`, or `(0.0, 1.0]` | Relief share of the execution capacity | yes |
 | `consumer.fair-share-weight` | number | `0.5` | finite `> 0` | Dispatch weight against other consumers | yes |

@@ -324,9 +324,9 @@ class ComputeUtmiAdapterTest {
         final ThreadManagerRuntime started = this.start(true, 16);
         this.registerService(started);
         // a policy that would happily take every core the pool has: max reserve 16, two cores per step
-        final ThreadManagementSettings.AsyncCompute.TickPressure policy =
-            new ThreadManagementSettings.AsyncCompute.TickPressure(true, 0.25d, 19.0d, 19.5d, 3, 2, 16, 2);
-        final TickPressureMonitor monitor = new TickPressureMonitor(policy, started.manager().resources()::usableCores);
+        final TickPressureMonitor monitor = new TickPressureMonitor(
+            pressurePolicyWithReserve(16), started.manager().resources()::usableCores
+        );
         final RegionReliefSettings relief = new RegionReliefSettings(
             true, 8, 1, RegionReliefSettings.defaultConsumerPolicy()
         );
@@ -342,12 +342,63 @@ class ComputeUtmiAdapterTest {
         }
 
         final int minThreads = ComputeSettings.defaults().workers().minThreads();
-        assertEquals(poolBudget - minThreads - 1, monitor.snapshot().reserve(),
-            "pressure may take everything except the relief core");
-        assertEquals(minThreads + 1, monitor.snapshot().appliedBudget(),
-            "the pool keeps one core for relief even at the pressure ceiling");
-        assertEquals(minThreads + 1, adapter.processors(),
+        // the reserve is one worker, and automatic sizing needs one budget unit of headroom on top
+        assertEquals(poolBudget - minThreads - 2, monitor.snapshot().reserve(),
+            "pressure may take everything except the relief worker and its headroom");
+        assertEquals(minThreads + 2, monitor.snapshot().appliedBudget(),
+            "the pool keeps enough budget for min-threads plus the relief worker");
+        assertEquals(minThreads + 2, adapter.processors(),
             "the budget the engine reads carries the same reservation");
+        assertEquals(
+            minThreads + 1,
+            ComputeSettings.defaults().workers().resolveThreadCount(adapter.processors()),
+            "the reserved core is a real worker, not just a budget unit"
+        );
+    }
+
+    @Test
+    void pressureThroughTheRealControllerKeepsTheReserveAtTheWorkerLevel() throws InterruptedException {
+        final ThreadManagerRuntime started = this.start(true, 16);
+        this.registerService(started);
+        final RegionReliefSettings relief = new RegionReliefSettings(
+            true, 8, 1, RegionReliefSettings.defaultConsumerPolicy()
+        );
+        final ComputeSettings settings = this.pressureTestSettings();
+        final TickPressureMonitor monitor = new TickPressureMonitor(
+            pressurePolicyWithReserve(16), started.manager().resources()::usableCores
+        );
+        final ComputeUtmiAdapter adapter = ComputeUtmiAdapter.attach(started, settings, monitor, relief);
+        this.engine = ComputeSchedulers.create(settings, ComputeClock.system(), adapter, adapter, relief);
+        this.engine.start();
+        adapter.bind(this.engine);
+        monitor.bind(adapter.pressureSink());
+
+        final int poolBudget = started.manager().resources().budget(PoolId.COMPUTE).orElseThrow().cores();
+        for (int second = 1; second <= 30; second++) {
+            // the real TickPressureController inside the monitor decides, ramping to its ceiling
+            monitor.onSample(pass(lagging()), TimeUnit.SECONDS.toNanos(second));
+        }
+
+        final int minThreads = settings.workers().minThreads();
+        final int reserved = relief.reservedCores();
+        assertEquals(poolBudget - minThreads - reserved - 1, monitor.snapshot().reserve(),
+            "the controller ramps to the ceiling that excludes the relief reserve");
+        assertEquals(minThreads + reserved + 1, adapter.processors(),
+            "the sink hands the engine the budget that carries the reserve");
+        assertEquals(adapter.processors(), monitor.snapshot().appliedBudget(),
+            "the report and the applied budget are one arithmetic");
+
+        final int expectedWorkers = settings.workers().resolveThreadCount(adapter.processors());
+        assertEquals(minThreads + reserved, expectedWorkers,
+            "the budget resolves to min-threads plus the reserved worker");
+        // the pool was created from the full budget; the reserve has to survive the shrink, not just the
+        // arithmetic, so wait until the surplus workers retired and pin the live count
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15L);
+        while (this.engine.metrics().totalWorkers() > expectedWorkers && System.nanoTime() < deadline) {
+            Thread.sleep(20L);
+        }
+        assertEquals(expectedWorkers, this.engine.metrics().totalWorkers(),
+            "pressure at its maximum must not take the relief worker away");
     }
 
     @Test
@@ -539,6 +590,38 @@ class ComputeUtmiAdapterTest {
     private static ThreadManagementSettings.AsyncCompute.TickPressure pressurePolicy(final boolean enabled) {
         return new ThreadManagementSettings.AsyncCompute.TickPressure(
             enabled, 0.25d, 19.0d, 19.5d, 3, 5, 2, 1
+        );
+    }
+
+    /**
+     * Pressure policy that can take many cores, two per decision.
+     *
+     * @param maxReserveCores configured ceiling for the reserve
+     * @return the policy
+     */
+    private static ThreadManagementSettings.AsyncCompute.TickPressure pressurePolicyWithReserve(final int maxReserveCores) {
+        return new ThreadManagementSettings.AsyncCompute.TickPressure(
+            true, 0.25d, 19.0d, 19.5d, 3, 2, maxReserveCores, 2
+        );
+    }
+
+    /**
+     * Settings whose idle workers retire quickly, so a shrink is observable inside a test.
+     *
+     * @return the settings
+     */
+    private static ComputeSettings pressureTestSettings() {
+        final ComputeSettings defaults = ComputeSettings.defaults();
+        return new ComputeSettings(
+            true,
+            new ComputeSettings.Workers(-1, 2, -1, Duration.ofMillis(150L), "Tuff Compute Pressure Test"),
+            defaults.queue(),
+            defaults.scheduling(),
+            defaults.consumers(),
+            defaults.metrics(),
+            defaults.adaptive(),
+            defaults.lanes(),
+            Duration.ofSeconds(1L)
         );
     }
 

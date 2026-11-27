@@ -17,7 +17,7 @@ public interface PressureBudgetSink {
      * Returns the pool's effective capacity before the tick pressure reserve.
      *
      * <p>This is the base both numbers in a decision are computed from: the reserve ceiling is
-     * {@code poolBudget - min-threads} and the applied budget is {@code poolBudget - reserve}. The
+     * {@code poolBudget - minBudget()} and the applied budget is {@code poolBudget - reserve}. The
      * monitor asks here instead of using the ledger's {@code usable}, because a pool can be capped by
      * its own budget, its {@code max-threads} or load shedding - and a report that printed
      * {@code usable - reserve} would name a budget the engine never sees.

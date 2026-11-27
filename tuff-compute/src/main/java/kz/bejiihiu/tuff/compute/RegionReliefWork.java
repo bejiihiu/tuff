@@ -73,4 +73,66 @@ public interface RegionReliefWork<S, R> {
      * @param result value returned by {@link #compute(Object)}
      */
     void apply(R result);
+
+    /**
+     * Reports that the work did not produce an applicable result.
+     *
+     * <p>Called at most once, only on the owning region thread, instead of {@link #apply(Object)} when
+     * the computation threw or the applicator itself threw. The original computation is never rerun
+     * inline: a body that failed once would fail again and only cost region time.
+     *
+     * <p>The default does nothing, so existing implementations keep compiling and keep their old
+     * behaviour. A handler must be fast, must not block and <b>must not mutate world state</b>: a
+     * failure does not prove that the snapshot epoch was still current when it happened.
+     *
+     * @param failure what went wrong, never {@code null}
+     */
+    default void onFailure(final Throwable failure) {
+        // no-op by default: work that does not care about failures does not have to implement this
+    }
+
+    /**
+     * Reports that the work reached a terminal state without being applied.
+     *
+     * <p>Called at most once, only on the owning region thread, instead of {@link #apply(Object)}.
+     * Exactly one of {@code apply}, {@link #onFailure(Throwable)} and this method runs for one
+     * submitted request.
+     *
+     * <p>The default does nothing. A handler must be fast, must not block and <b>must not mutate world
+     * state</b>: none of these outcomes proves that the snapshot is still usable.
+     *
+     * @param reason why the result was discarded, never {@code null}
+     */
+    default void onDiscard(final Reason reason) {
+        // no-op by default: work that does not care about discards does not have to implement this
+    }
+
+    /**
+     * Why a result was discarded instead of applied.
+     */
+    enum Reason {
+
+        /**
+         * The snapshot epoch was no longer current when the result came back.
+         */
+        STALE,
+
+        /**
+         * The request expired in the queue and the region was already gone, so the inline rerun could
+         * not happen.
+         */
+        EXPIRED,
+
+        /**
+         * The compute pool cancelled the request (shutdown, consumer change) while the region still
+         * existed.
+         */
+        CANCELLED,
+
+        /**
+         * The region stopped, cancelled its requests, or the result could not be delivered to the owner
+         * thread.
+         */
+        DROPPED
+    }
 }

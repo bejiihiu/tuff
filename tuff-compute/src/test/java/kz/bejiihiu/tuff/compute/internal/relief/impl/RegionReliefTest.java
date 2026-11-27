@@ -4,6 +4,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -15,8 +17,13 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
+import kz.bejiihiu.tuff.compute.ComputeCancelledException;
+import kz.bejiihiu.tuff.compute.ComputeConsumer;
 import kz.bejiihiu.tuff.compute.ComputePriority;
+import kz.bejiihiu.tuff.compute.ComputeRequest;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
+import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
+import kz.bejiihiu.tuff.compute.ComputeTaskType;
 import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.OverflowPolicy;
 import kz.bejiihiu.tuff.compute.RegionRelief;
@@ -24,6 +31,9 @@ import kz.bejiihiu.tuff.compute.RegionReliefMetrics;
 import kz.bejiihiu.tuff.compute.RegionReliefOwner;
 import kz.bejiihiu.tuff.compute.RegionReliefSettings;
 import kz.bejiihiu.tuff.compute.RegionReliefWork;
+import kz.bejiihiu.tuff.compute.RegionReliefWork.Reason;
+import kz.bejiihiu.tuff.compute.SchedulerMetrics;
+import kz.bejiihiu.tuff.compute.internal.engine.ComputeEngine;
 import kz.bejiihiu.tuff.compute.internal.engine.impl.ComputeSchedulers;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeBudgetPort;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
@@ -98,21 +108,25 @@ class RegionReliefTest {
     }
 
     @Test
-    void aStaleResultIsDroppedAndCounted() throws Exception {
+    void aStaleResultIsReportedAsDiscardedOnTheOwnerThread() throws Exception {
         this.start(reliefSettings(true, 8), 2);
         final TestOwner owner = new TestOwner();
-        final AtomicInteger applies = new AtomicInteger();
         owner.currentEpoch = 99L;
+        final ProbeWork work = new ProbeWork(7L);
 
-        assertTrue(this.onRegion(() -> this.relief.submit(
-            owner, new TestWork("snapshot", 7L, new CountDownLatch(1), applies, new AtomicReference<>(), null)
-        )));
+        assertTrue(this.onRegion(() -> this.relief.submit(owner, work)));
 
         awaitUntil("the stale result is counted", Duration.ofSeconds(10L),
             () -> this.relief.metrics().stale() == 1L);
-        assertEquals(0, applies.get(), "a stale result must never be applied");
+        assertTrue(work.terminal.await(10L, TimeUnit.SECONDS), "the discard callback must run");
+        assertEquals(0, work.applies.get(), "a stale result must never be applied");
+        assertEquals(1, work.discards.get(), "the work must hear about the discard exactly once");
+        assertEquals(Reason.STALE, work.discardReason.get());
+        assertEquals(0, work.failures.get());
+        assertSame(this.regionThread, work.callbackThread.get(), "the callback runs on the owner thread");
         assertEquals(0L, this.relief.metrics().completed());
         assertEquals(0, this.relief.metrics().inFlight());
+        assertEquals(1, work.computes.get(), "the compute body ran once on the worker");
     }
 
     @Test
@@ -191,22 +205,105 @@ class RegionReliefTest {
     }
 
     @Test
-    void cancellingAnOwnerDropsItsPendingResults() throws Exception {
+    void cancellingAnOwnerReportsTheDiscardAndDropsTheResult() throws Exception {
         this.start(reliefSettings(true, 4), 1);
         final TestOwner owner = new TestOwner();
         final CountDownLatch release = new CountDownLatch(1);
-        final AtomicInteger applies = new AtomicInteger();
+        final ProbeWork work = new ProbeWork(7L, release);
 
-        assertTrue(this.onRegion(() -> this.relief.submit(
-            owner, new TestWork("snapshot", 7L, new CountDownLatch(1), applies, new AtomicReference<>(), release)
-        )));
+        assertTrue(this.onRegion(() -> this.relief.submit(owner, work)));
         assertEquals(1, this.relief.cancel(owner));
         release.countDown();
 
         awaitUntil("the cancelled result is counted as dropped", Duration.ofSeconds(10L),
             () -> this.relief.metrics().dropped() == 1L);
-        assertEquals(0, applies.get(), "a cancelled region must not receive a result");
+        assertTrue(work.terminal.await(10L, TimeUnit.SECONDS), "the discard callback must run");
+        assertEquals(0, work.applies.get(), "a cancelled region must not receive a result");
+        assertEquals(1, work.discards.get());
+        assertEquals(Reason.DROPPED, work.discardReason.get());
+        assertSame(this.regionThread, work.callbackThread.get());
         assertEquals(0, this.relief.metrics().inFlight());
+    }
+
+    @Test
+    void aFailedComputationIsReportedOnceAndNeverRerun() throws Exception {
+        this.start(reliefSettings(true, 8), 2);
+        final TestOwner owner = new TestOwner();
+        final ProbeWork work = new ProbeWork(7L, null, true);
+
+        assertTrue(this.onRegion(() -> this.relief.submit(owner, work)));
+
+        assertTrue(work.terminal.await(10L, TimeUnit.SECONDS), "the failure callback must run");
+        assertEquals(0, work.applies.get(), "a failed computation must not be applied");
+        assertEquals(1, work.failures.get(), "the failure must be reported exactly once");
+        assertEquals(0, work.discards.get(), "a failure is not a discard");
+        assertTrue(work.failure.get() instanceof IllegalStateException, String.valueOf(work.failure.get()));
+        assertSame(this.regionThread, work.callbackThread.get(), "the callback runs on the owner thread");
+        assertEquals(1, work.computes.get(), "the failed body is not rerun inline");
+        assertEquals(1L, this.relief.metrics().failed());
+        assertEquals(0L, this.relief.metrics().inlineFallbacks());
+        assertEquals(0, this.relief.metrics().inFlight());
+    }
+
+    @Test
+    void aStoppedOwnerIsRefusedBeforeAnyReservation() throws Exception {
+        this.start(reliefSettings(true, 8), 2);
+        final TestOwner owner = new TestOwner();
+        owner.stopped = true;
+        final ProbeWork work = new ProbeWork(7L);
+
+        assertFalse(this.onRegion(() -> this.relief.submit(owner, work)), "a stopped region gets nothing");
+
+        assertEquals(0, work.computes.get(), "the work must not run for a stopped region");
+        assertEquals(0, work.applies.get());
+        assertEquals(1, work.discards.get(), "the refusal is reported");
+        assertEquals(Reason.DROPPED, work.discardReason.get());
+        assertSame(this.regionThread, work.callbackThread.get());
+        assertEquals(1L, this.relief.metrics().requests());
+        assertEquals(1L, this.relief.metrics().dropped());
+        assertEquals(0L, this.relief.metrics().accepted());
+        assertEquals(0, this.relief.metrics().inFlight());
+    }
+
+    @Test
+    void aCancelledOwnerIsRefusedWithoutCreatingFreshState() throws Exception {
+        this.start(reliefSettings(true, 8), 2);
+        final TestOwner owner = new TestOwner();
+        this.relief.cancel(owner);
+        final ProbeWork work = new ProbeWork(7L);
+
+        assertFalse(this.onRegion(() -> this.relief.submit(owner, work)),
+            "a cancelled owner must not start a new in-flight state");
+
+        assertEquals(0, work.computes.get());
+        assertEquals(0, work.applies.get());
+        assertEquals(1, work.discards.get());
+        assertEquals(Reason.DROPPED, work.discardReason.get());
+        assertEquals(0L, this.relief.metrics().accepted());
+        assertEquals(1L, this.relief.metrics().dropped());
+        assertEquals(0, this.relief.metrics().inFlight());
+    }
+
+    @Test
+    void anUntrackedSubmissionIsNotCountedAsAccepted() {
+        final ComputeSettings compute = this.compute(true, 2, Map.of());
+        final CancellingEngine engine = new CancellingEngine(compute);
+        final RegionReliefImpl service = new RegionReliefImpl(engine, reliefSettings(true, 8), new FakeClock());
+        final TestOwner owner = new TestOwner(Thread.currentThread());
+        engine.cancelDuringEnqueue(service, owner);
+        final ProbeWork work = new ProbeWork(7L);
+
+        // the fake engine cancels the owner inside enqueue, which is the exact window fix 3 is about
+        assertTrue(service.submit(owner, work));
+
+        assertEquals(0L, service.metrics().accepted(),
+            "a submission cancelled before it was tracked was never accepted");
+        assertEquals(1L, service.metrics().requests());
+        assertEquals(1L, service.metrics().dropped());
+        assertEquals(1, work.discards.get());
+        assertEquals(Reason.DROPPED, work.discardReason.get());
+        assertEquals(0, work.computes.get());
+        assertEquals(0, service.metrics().inFlight());
     }
 
     @Test
@@ -427,12 +524,22 @@ class RegionReliefTest {
 
     private final class TestOwner implements RegionReliefOwner {
 
+        private final Thread ownerThread;
         private volatile long currentEpoch = 7L;
         private volatile boolean runInline;
+        private volatile boolean stopped;
+
+        private TestOwner() {
+            this(RegionReliefTest.this.regionThread);
+        }
+
+        private TestOwner(final Thread ownerThread) {
+            this.ownerThread = ownerThread;
+        }
 
         @Override
         public Thread thread() {
-            return RegionReliefTest.this.regionThread;
+            return this.ownerThread;
         }
 
         @Override
@@ -442,16 +549,287 @@ class RegionReliefTest {
 
         @Override
         public boolean isStopped() {
-            return false;
+            return this.stopped;
         }
 
         @Override
         public void runOnOwner(final Runnable task) {
-            if (this.runInline) {
+            if (this.runInline || Thread.currentThread() == this.ownerThread) {
                 task.run();
                 return;
             }
             RegionReliefTest.this.region.execute(task);
+        }
+    }
+
+    /**
+     * Work that records which terminal callback ran and on which thread.
+     */
+    private final class ProbeWork implements RegionReliefWork<String, String> {
+
+        private final long epoch;
+        private final @Nullable CountDownLatch computeGate;
+        private final boolean fail;
+        private final AtomicInteger computes = new AtomicInteger();
+        private final AtomicInteger applies = new AtomicInteger();
+        private final AtomicInteger failures = new AtomicInteger();
+        private final AtomicInteger discards = new AtomicInteger();
+        private final AtomicReference<Throwable> failure = new AtomicReference<>();
+        private final AtomicReference<Reason> discardReason = new AtomicReference<>();
+        private final AtomicReference<Thread> callbackThread = new AtomicReference<>();
+        private final CountDownLatch terminal = new CountDownLatch(1);
+
+        private ProbeWork(final long epoch) {
+            this(epoch, null, false);
+        }
+
+        private ProbeWork(final long epoch, final @Nullable CountDownLatch computeGate) {
+            this(epoch, computeGate, false);
+        }
+
+        private ProbeWork(final long epoch, final @Nullable CountDownLatch computeGate, final boolean fail) {
+            this.epoch = epoch;
+            this.computeGate = computeGate;
+            this.fail = fail;
+        }
+
+        @Override
+        public String snapshot() {
+            return "snapshot";
+        }
+
+        @Override
+        public long epoch() {
+            return this.epoch;
+        }
+
+        @Override
+        public String compute(final String value) throws Exception {
+            this.computes.incrementAndGet();
+            if (this.computeGate != null && !this.computeGate.await(10L, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("compute gate was never released");
+            }
+            if (this.fail) {
+                throw new IllegalStateException("boom");
+            }
+            RegionReliefTest.this.clock.advance(Duration.ofMillis(5L));
+            return value.toUpperCase(Locale.ROOT);
+        }
+
+        @Override
+        public void apply(final String result) {
+            this.applies.incrementAndGet();
+            this.callbackThread.set(Thread.currentThread());
+            this.terminal.countDown();
+        }
+
+        @Override
+        public void onFailure(final Throwable thrown) {
+            this.failures.incrementAndGet();
+            this.failure.set(thrown);
+            this.callbackThread.set(Thread.currentThread());
+            this.terminal.countDown();
+        }
+
+        @Override
+        public void onDiscard(final Reason reason) {
+            this.discards.incrementAndGet();
+            this.discardReason.set(reason);
+            this.callbackThread.set(Thread.currentThread());
+            this.terminal.countDown();
+        }
+    }
+
+    /**
+     * Engine seam that cancels the owner inside {@code enqueue}, reproducing the exact window between
+     * the in-flight reservation and the request being tracked.
+     */
+    private static final class CancellingEngine implements ComputeEngine {
+
+        private final ComputeSettings settings;
+        private final AtomicReference<RegionReliefOwner> ownerToCancel = new AtomicReference<>();
+        private volatile RegionRelief relief;
+
+        private CancellingEngine(final ComputeSettings settings) {
+            this.settings = settings;
+        }
+
+        private void cancelDuringEnqueue(final RegionRelief service, final RegionReliefOwner owner) {
+            this.relief = service;
+            this.ownerToCancel.set(owner);
+        }
+
+        @Override
+        public <T> ComputeTaskHandle<T> enqueue(final ComputeRequest<T> request) {
+            this.relief.cancel(this.ownerToCancel.get());
+            return new PendingHandle<>(request);
+        }
+
+        @Override
+        public AsyncComputeScheduler.SchedulerState state() {
+            return AsyncComputeScheduler.SchedulerState.RUNNING;
+        }
+
+        @Override
+        public ComputeSettings settings() {
+            return this.settings;
+        }
+
+        @Override
+        public Optional<ComputeConsumer> consumer(final String consumerId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public void start() {
+            throw new AssertionError("the fake engine is started by construction");
+        }
+
+        @Override
+        public void shutdown(final Duration gracePeriod) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public void shutdownNow() {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public void applyProcessorBudget(final int processors) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public boolean awaitTermination(final Duration timeout) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public boolean cancel(final long taskId) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public ComputeConsumer registerConsumer(final ComputeConsumer consumer) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public boolean unregisterConsumer(final String consumerId) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public void updateConsumerPolicy(final String consumerId, final ConsumerPolicy policy) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public Set<String> consumerIds() {
+            return Set.of();
+        }
+
+        @Override
+        public SchedulerMetrics metrics() {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public ComputeClock clock() {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public RegionRelief regionRelief() {
+            return this.relief;
+        }
+    }
+
+    /**
+     * Handle of a task that never starts; cancellation completes it the way the engine would.
+     *
+     * @param <T> type of the produced value
+     */
+    private static final class PendingHandle<T> implements ComputeTaskHandle<T> {
+
+        private final ComputeRequest<T> request;
+        private final CompletableFuture<T> future = new CompletableFuture<>();
+
+        private PendingHandle(final ComputeRequest<T> request) {
+            this.request = request;
+        }
+
+        @Override
+        public long taskId() {
+            return 1L;
+        }
+
+        @Override
+        public String consumerId() {
+            return this.request.consumerId();
+        }
+
+        @Override
+        public ComputeTaskType taskType() {
+            return this.request.taskType();
+        }
+
+        @Override
+        public ComputePriority priority() {
+            return this.request.priority();
+        }
+
+        @Override
+        public Instant submittedAt() {
+            return Instant.EPOCH;
+        }
+
+        @Override
+        public CompletableFuture<T> future() {
+            return this.future;
+        }
+
+        @Override
+        public State state() {
+            return this.future.isDone() ? State.CANCELLED : State.QUEUED;
+        }
+
+        @Override
+        public boolean cancel() {
+            return this.future.completeExceptionally(new ComputeCancelledException(
+                1L, ComputeCancelledException.Reason.CALLER, "cancelled by the test engine"
+            ));
+        }
+
+        @Override
+        public boolean isCancellationRequested() {
+            return this.future.isDone();
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return this.future.isCompletedExceptionally();
+        }
+
+        @Override
+        public boolean isDone() {
+            return this.future.isDone();
+        }
+
+        @Override
+        public long queueWaitNanos() {
+            return -1L;
+        }
+
+        @Override
+        public long executionNanos() {
+            return -1L;
+        }
+
+        @Override
+        public @Nullable Throwable failure() {
+            return null;
         }
     }
 

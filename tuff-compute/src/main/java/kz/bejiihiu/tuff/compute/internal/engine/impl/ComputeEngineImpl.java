@@ -761,6 +761,21 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
         return Math.max(1, Math.max(workers.minThreads(), resolved));
     }
 
+    /**
+     * Returns the worker floor the pool must keep alive.
+     *
+     * <p>{@code min-threads} plus the relief reserve: the relief path holds one worker-equivalent for
+     * itself, and neither keep-alive retirement nor the idle autoscaler may shrink it away. With relief
+     * off - the default - this is exactly {@code min-threads} and nothing changes.
+     *
+     * @return the minimum workers to keep alive, at least {@code 1}
+     */
+    private int minimumWorkers() {
+        final int floor = this.settings.workers().minThreads();
+        final int reserved = this.reliefSettings.effectiveReservedCores();
+        return reserved == 0 ? floor : floor + reserved;
+    }
+
     private void wireRuntime() {
         final JfrRecorder recorder = new FlightJfrRecorder();
         final ComputeSettings.Lanes.Virtual laneConfig = this.settings.lanes().virtual();
@@ -800,6 +815,7 @@ final class ComputeEngineImpl implements ComputeEngine, TaskHandle.Owner {
             this.settings.workers(),
             this.settings.scheduling(),
             this.processorBudget,
+            this.minimumWorkers(),
             newLoop,
             this.clock,
             this.threads.platform(this.settings.workers().threadNamePrefix(), true)

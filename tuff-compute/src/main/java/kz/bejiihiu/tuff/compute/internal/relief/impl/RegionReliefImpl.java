@@ -1,8 +1,10 @@
 package kz.bejiihiu.tuff.compute.internal.relief.impl;
 
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
@@ -24,6 +26,7 @@ import kz.bejiihiu.tuff.compute.RegionReliefMetrics;
 import kz.bejiihiu.tuff.compute.RegionReliefOwner;
 import kz.bejiihiu.tuff.compute.RegionReliefSettings;
 import kz.bejiihiu.tuff.compute.RegionReliefWork;
+import kz.bejiihiu.tuff.compute.RegionReliefWork.Reason;
 import kz.bejiihiu.tuff.compute.internal.engine.ComputeEngine;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
 import org.jspecify.annotations.Nullable;
@@ -33,27 +36,42 @@ import org.jspecify.annotations.Nullable;
  *
  * <p>The service is deliberately thin around the engine. It owns no queue and no thread; the
  * {@code region-relief} consumer, the bounded queue and the pool belong to the scheduler, and the
- * service only enforces the four rules the scheduler cannot know: the submitter must be the owner
- * thread, one owner has a bounded number of requests in flight, a result is applied only while the
- * snapshot epoch is current, and the applicator is refused when it would run off the owner thread.
+ * service only enforces the rules the scheduler cannot know: the submitter must be the owner thread,
+ * one owner has a bounded number of requests in flight, a result is applied only while the snapshot
+ * epoch is current, and nothing is applied from a thread other than the owner.
  *
- * <p>Every accepted request is tracked by one {@link Request}. Exactly one of the following happens
- * to it, never two: the applicator runs, the result is dropped, or the request failed. The in-flight
- * counter and the per-owner slot are released in the same callback that makes that decision, so a
- * request cannot leak a slot and a slot cannot outlive its last request.
+ * <p>Every submitted request ends in exactly one terminal call on the owning region thread:
+ * {@link RegionReliefWork#apply(Object)} when the result is usable, {@link RegionReliefWork#onFailure}
+ * when the computation or the applicator threw, and {@link RegionReliefWork#onDiscard} for stale,
+ * expired, cancelled and dropped outcomes. The single exception is an owner port that runs the task
+ * off the owner thread: the service then refuses to call anything and counts the request as dropped,
+ * because invoking region code from the wrong thread is worse than losing the notification.
  *
- * <p>Failure handling is intentionally asymmetric with the inline path: an exception from
- * {@link RegionReliefWork#compute(Object)} on a worker cannot be delivered to the region thread as a
- * throwable without inventing a second callback, so it is counted as {@code failed} and dropped. The
- * inline path runs on the caller's thread and propagates the same exception, which is what the region
- * would have seen before relief existed.
+ * <p>The in-flight counter and the per-owner slot are released by the same callback that makes the
+ * terminal decision, so a request cannot leak a slot and a slot cannot outlive its last request.
+ *
+ * <p>A failed computation is never rerun inline. The body would almost certainly fail again, and a
+ * second failure would cost the region more than the notification it just received.
  */
 public final class RegionReliefImpl implements RegionRelief {
+
+    private static final System.Logger LOG = System.getLogger(RegionReliefImpl.class.getName());
 
     private final ComputeEngine engine;
     private final RegionReliefSettings settings;
     private final ComputeClock clock;
     private final ConcurrentHashMap<RegionReliefOwner, RegionState> owners = new ConcurrentHashMap<>();
+
+    /**
+     * Owners that were cancelled at least once.
+     *
+     * <p>Weak keys on purpose: a region is cancelled when it goes away, and holding it strongly here
+     * would leak one small entry per dead region. While the caller still holds the owner (which is the
+     * case for any live region), a submission is refused instead of creating a fresh in-flight state.
+     */
+    private final Set<RegionReliefOwner> cancelledOwners =
+        Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+
     private final AtomicInteger inFlight = new AtomicInteger();
 
     private final LongAdder requests = new LongAdder();
@@ -101,8 +119,15 @@ public final class RegionReliefImpl implements RegionRelief {
             );
         }
         this.requests.increment();
+        if (owner.isStopped() || this.cancelledOwners.contains(owner)) {
+            // the region is gone or was cancelled: reserve nothing, queue nothing, and say so. the
+            // callback is safe here because we are on the owner thread
+            this.dropped.increment();
+            notifyDiscard(work, Reason.DROPPED);
+            return false;
+        }
         if (!this.enabled() || this.engine.state() != AsyncComputeScheduler.SchedulerState.RUNNING) {
-            return this.runInline(owner, work, false);
+            return this.runInline(owner, work);
         }
         final RegionState state = this.owners.computeIfAbsent(owner, ignored -> new RegionState());
         final boolean admitted;
@@ -113,7 +138,7 @@ public final class RegionReliefImpl implements RegionRelief {
             }
         }
         if (!admitted) {
-            return this.runInline(owner, work, false);
+            return this.runInline(owner, work);
         }
         // the snapshot is taken here, on the region thread, and never again
         final SnapshotTask<S, R> task = new SnapshotTask<>(work, work.snapshot(), this.clock);
@@ -127,7 +152,7 @@ public final class RegionReliefImpl implements RegionRelief {
             ));
         } catch (ComputeRejectedException | ComputeShutdownException _) {
             this.releaseReservation(state);
-            return this.runInline(owner, work, false);
+            return this.runInline(owner, work);
         }
         this.inFlight.incrementAndGet();
         final Request<S, R> request = new Request<>(owner, work, handle, task);
@@ -138,13 +163,14 @@ public final class RegionReliefImpl implements RegionRelief {
                 state.requests.add(request);
             }
         }
-        if (!tracked) {
-            // the owner was cancelled between the reservation and the submission: the result must not
-            // be applied, but the future still has to run its cleanup
+        if (tracked) {
+            this.accepted.increment();
+        } else {
+            // the owner was cancelled between the reservation and the submission: nothing counts as
+            // accepted, but the future still has to run its cleanup and report the discard
             request.dropped = true;
             handle.cancel();
         }
-        this.accepted.increment();
         handle.future().whenComplete((value, error) -> this.onCompleted(request, value, error));
         return true;
     }
@@ -152,6 +178,7 @@ public final class RegionReliefImpl implements RegionRelief {
     @Override
     public int cancel(final RegionReliefOwner owner) {
         Objects.requireNonNull(owner, "owner");
+        this.cancelledOwners.add(owner);
         final RegionState state = this.owners.remove(owner);
         if (state == null) {
             return 0;
@@ -204,43 +231,43 @@ public final class RegionReliefImpl implements RegionRelief {
     /**
      * Runs the work on the calling thread, which is the owner thread by contract.
      *
-     * @param owner       region that owns the work
-     * @param work        work to run
-     * @param afterAccept whether a pool request was accepted and has to be replaced
-     * @param <S>         type of the snapshot
-     * @param <R>         type of the computed result
+     * @param owner region that owns the work
+     * @param work  work to run
+     * @param <S>   type of the snapshot
+     * @param <R>   type of the computed result
      * @return always {@code false}, because the work did not go to the pool
-     * @throws IllegalStateException if the inline computation threw a checked exception
      */
-    private <S, R> boolean runInline(
-        final RegionReliefOwner owner,
-        final RegionReliefWork<S, R> work,
-        final boolean afterAccept
-    ) {
+    private <S, R> boolean runInline(final RegionReliefOwner owner, final RegionReliefWork<S, R> work) {
         if (owner.isStopped()) {
             this.dropped.increment();
+            notifyDiscard(work, Reason.DROPPED);
             return false;
         }
         this.inlineFallbacks.increment();
-        if (afterAccept) {
-            this.expired.increment();
-        }
-        final S snapshot = work.snapshot();
         final R result;
         try {
-            result = work.compute(snapshot);
+            result = work.compute(work.snapshot());
         } catch (final RuntimeException failure) {
             this.failed.increment();
-            throw failure;
+            notifyFailure(work, failure);
+            return false;
         } catch (final Exception failure) {
             this.failed.increment();
-            throw new IllegalStateException("region relief work failed inline", failure);
+            notifyFailure(work, failure);
+            return false;
         }
         if (!owner.isCurrent(work.epoch())) {
             this.stale.increment();
+            notifyDiscard(work, Reason.STALE);
             return false;
         }
-        work.apply(result);
+        try {
+            work.apply(result);
+        } catch (final RuntimeException failure) {
+            this.failed.increment();
+            notifyFailure(work, failure);
+            return false;
+        }
         this.completed.increment();
         return false;
     }
@@ -259,106 +286,211 @@ public final class RegionReliefImpl implements RegionRelief {
         final @Nullable R value,
         final @Nullable Throwable error
     ) {
-        if (request.dropped) {
-            this.dropped.increment();
-            this.release(request);
-            return;
-        }
         if (error == null) {
-            this.dispatch(request, value, false);
+            this.dispatch(request, value, Terminal.APPLY, null);
             return;
         }
         final Throwable cause = unwrap(error);
-        if (cause instanceof CancellationException) {
-            // the pool cancelled the request: shutdown, expiry or a consumer change. an expired
-            // request is the one case where the region still needs the work done, so it runs inline
-            if (cause instanceof ComputeCancelledException cancelled
-                && cancelled.reason() == ComputeCancelledException.Reason.QUEUE_EXPIRED) {
-                this.dispatch(request, null, true);
-                return;
-            }
-            this.dropped.increment();
-            this.release(request);
+        if (cause instanceof ComputeCancelledException cancelled
+            && cancelled.reason() == ComputeCancelledException.Reason.QUEUE_EXPIRED) {
+            // the only cancellation the region still needs: the work reruns on the owner thread
+            this.dispatch(request, null, Terminal.RERUN_INLINE, null);
             return;
         }
-        this.failed.increment();
-        this.release(request);
+        if (cause instanceof CancellationException) {
+            this.dispatch(request, null, Terminal.POOL_CANCELLED, null);
+            return;
+        }
+        this.dispatch(request, null, Terminal.FAILURE, cause);
     }
 
     /**
-     * Schedules the applicator, or the inline rerun, back onto the owning region thread.
+     * Schedules the terminal decision back onto the owning region thread.
      *
-     * @param request request whose result is ready
-     * @param value   computed value, {@code null} for an inline rerun
-     * @param inline  whether the work has to be computed again on the region thread
+     * @param request  request whose outcome is known
+     * @param value    computed value, {@code null} unless the terminal is an apply
+     * @param terminal what has to happen on the owner thread
+     * @param failure  failure to report, {@code null} unless the terminal is a failure
+     * @param <S>      type of the snapshot
+     * @param <R>      type of the computed result
+     */
+    private <S, R> void dispatch(
+        final Request<S, R> request,
+        final @Nullable R value,
+        final Terminal terminal,
+        final @Nullable Throwable failure
+    ) {
+        try {
+            request.owner.runOnOwner(() -> this.finishOnOwner(request, value, terminal, failure));
+        } catch (RuntimeException _) {
+            // the region refused the task: the outcome cannot be delivered, so it is only counted
+            if (request.released.compareAndSet(false, true)) {
+                this.dropped.increment();
+                this.releaseSlot(request);
+            }
+        }
+    }
+
+    /**
+     * Makes the one and only terminal decision for a request, on the owner thread.
+     *
+     * @param request  request whose outcome is known
+     * @param value    computed value, {@code null} unless the terminal is an apply
+     * @param terminal what has to happen
+     * @param failure  failure to report, {@code null} unless the terminal is a failure
+     * @param <S>      type of the snapshot
+     * @param <R>      type of the computed result
+     */
+    private <S, R> void finishOnOwner(
+        final Request<S, R> request,
+        final @Nullable R value,
+        final Terminal terminal,
+        final @Nullable Throwable failure
+    ) {
+        if (!request.released.compareAndSet(false, true)) {
+            // a broken owner port scheduled the same terminal twice; only the first one may report
+            return;
+        }
+        try {
+            if (Thread.currentThread() != request.owner.thread()) {
+                // ownership is absolute: no applicator and no callback ever run off-region
+                this.dropped.increment();
+                return;
+            }
+            if (request.dropped) {
+                this.dropped.increment();
+                notifyDiscard(request.work, Reason.DROPPED);
+                return;
+            }
+            switch (terminal) {
+                case FAILURE -> {
+                    this.failed.increment();
+                    notifyFailure(request.work, failure == null
+                        ? new IllegalStateException("region relief computation failed")
+                        : failure);
+                }
+                case POOL_CANCELLED -> {
+                    if (request.owner.isStopped()) {
+                        this.dropped.increment();
+                        notifyDiscard(request.work, Reason.DROPPED);
+                    } else {
+                        notifyDiscard(request.work, Reason.CANCELLED);
+                    }
+                }
+                case RERUN_INLINE -> this.rerunInline(request);
+                case APPLY -> this.applyResult(request, value, request.task.executionNanos);
+            }
+        } finally {
+            this.releaseSlot(request);
+        }
+    }
+
+    /**
+     * Reruns an expired request on the owner thread, which is the only cancellation the region wants
+     * back.
+     *
+     * @param request request that expired in the queue
      * @param <S>     type of the snapshot
      * @param <R>     type of the computed result
      */
-    private <S, R> void dispatch(final Request<S, R> request, final @Nullable R value, final boolean inline) {
-        try {
-            request.owner.runOnOwner(() -> this.applyOnOwner(request, value, inline));
-        } catch (RuntimeException _) {
-            // the region refused to take the task: the result cannot be applied and the request is over
+    private <S, R> void rerunInline(final Request<S, R> request) {
+        if (request.owner.isStopped()) {
+            this.expired.increment();
             this.dropped.increment();
-            this.release(request);
+            notifyDiscard(request.work, Reason.EXPIRED);
+            return;
         }
-    }
-
-    private <S, R> void applyOnOwner(final Request<S, R> request, final @Nullable R value, final boolean inline) {
+        this.inlineFallbacks.increment();
+        this.expired.increment();
+        final R result;
         try {
-            if (request.dropped || request.owner.isStopped()) {
-                this.dropped.increment();
-                return;
-            }
-            if (Thread.currentThread() != request.owner.thread()) {
-                // ownership is absolute: a result computed off-region is never applied from here
-                this.dropped.increment();
-                return;
-            }
-            final R result;
-            if (inline) {
-                this.inlineFallbacks.increment();
-                this.expired.increment();
-                result = this.computeInline(request);
-                if (result == null) {
-                    return;
-                }
-            } else {
-                result = value;
-            }
-            if (!request.owner.isCurrent(request.work.epoch())) {
-                this.stale.increment();
-                return;
-            }
-            request.work.apply(result);
-            this.completed.increment();
-            this.savedNanos.add(Math.max(0L, request.task.executionNanos));
-        } finally {
-            this.release(request);
-        }
-    }
-
-    private <S, R> @Nullable R computeInline(final Request<S, R> request) {
-        try {
-            return request.work.compute(request.work.snapshot());
+            result = request.work.compute(request.work.snapshot());
         } catch (final RuntimeException failure) {
             this.failed.increment();
-            throw failure;
+            notifyFailure(request.work, failure);
+            return;
         } catch (final Exception failure) {
             this.failed.increment();
-            throw new IllegalStateException("region relief work failed inline", failure);
+            notifyFailure(request.work, failure);
+            return;
+        }
+        this.applyResult(request, result, 0L);
+    }
+
+    /**
+     * Applies one result, or reports why it was not applied.
+     *
+     * @param request    request that produced the result
+     * @param result     computed value, may be {@code null} only if the body broke its contract
+     * @param savedNanos compute time to add to the estimate when the result is applied
+     * @param <S>        type of the snapshot
+     * @param <R>        type of the computed result
+     */
+    private <S, R> void applyResult(
+        final Request<S, R> request,
+        final @Nullable R result,
+        final long savedNanos
+    ) {
+        if (request.owner.isStopped()) {
+            this.dropped.increment();
+            notifyDiscard(request.work, Reason.DROPPED);
+            return;
+        }
+        if (!request.owner.isCurrent(request.work.epoch())) {
+            this.stale.increment();
+            notifyDiscard(request.work, Reason.STALE);
+            return;
+        }
+        if (result == null) {
+            this.failed.increment();
+            notifyFailure(request.work, new NullPointerException("region relief work returned null"));
+            return;
+        }
+        try {
+            request.work.apply(result);
+        } catch (final RuntimeException failure) {
+            this.failed.increment();
+            notifyFailure(request.work, failure);
+            return;
+        }
+        this.completed.increment();
+        this.savedNanos.add(Math.max(0L, savedNanos));
+    }
+
+    /**
+     * Reports a failure to the work, from the owner thread.
+     *
+     * @param work    work that failed
+     * @param failure what went wrong
+     */
+    private static void notifyFailure(final RegionReliefWork<?, ?> work, final Throwable failure) {
+        try {
+            work.onFailure(failure);
+        } catch (final Throwable handlerFailure) {
+            LOG.log(System.Logger.Level.WARNING, "region relief failure handler threw", handlerFailure);
         }
     }
 
     /**
-     * Releases the request's in-flight slot exactly once.
+     * Reports a discard to the work, from the owner thread.
+     *
+     * @param work   work that was discarded
+     * @param reason why it was discarded
+     */
+    private static void notifyDiscard(final RegionReliefWork<?, ?> work, final Reason reason) {
+        try {
+            work.onDiscard(reason);
+        } catch (final Throwable handlerFailure) {
+            LOG.log(System.Logger.Level.WARNING, "region relief discard handler threw", handlerFailure);
+        }
+    }
+
+    /**
+     * Releases the request's in-flight slot. Called once per request, after its terminal decision.
      *
      * @param request request that will never be applied again
      */
-    private void release(final Request<?, ?> request) {
-        if (!request.released.compareAndSet(false, true)) {
-            return;
-        }
+    private void releaseSlot(final Request<?, ?> request) {
         this.inFlight.decrementAndGet();
         this.owners.computeIfPresent(request.owner, (owner, state) -> {
             synchronized (state) {
@@ -379,6 +511,32 @@ public final class RegionReliefImpl implements RegionRelief {
     }
 
     /**
+     * What the owner thread has to do with a request whose pool stage is over.
+     */
+    private enum Terminal {
+
+        /**
+         * Apply the computed value.
+         */
+        APPLY,
+
+        /**
+         * Rerun the work inline because the queued request expired.
+         */
+        RERUN_INLINE,
+
+        /**
+         * Report a computation failure.
+         */
+        FAILURE,
+
+        /**
+         * Report a cancellation the pool made.
+         */
+        POOL_CANCELLED
+    }
+
+    /**
      * Per-region bookkeeping. Mutated only while holding the instance monitor, so the in-flight count
      * and the request set cannot drift apart.
      */
@@ -390,8 +548,8 @@ public final class RegionReliefImpl implements RegionRelief {
     }
 
     /**
-     * One accepted request. The handle is final; {@link #dropped} is the owner's cancellation flag and
-     * {@link #released} makes the slot release idempotent.
+     * One submitted request. {@link #dropped} is the owner's cancellation flag and {@link #released}
+     * makes the terminal decision idempotent.
      *
      * @param <S> type of the snapshot
      * @param <R> type of the computed result

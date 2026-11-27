@@ -184,14 +184,43 @@ public final class DynamicWorkerPool implements WorkerPool {
         final ComputeClock clock,
         final ThreadFactory factory
     ) {
+        this(workers, scheduling, availableProcessors, workers.minThreads(), loop, clock, factory);
+    }
+
+    /**
+     * Creates a pool with an explicit processor count and a higher minimum worker count.
+     *
+     * <p>The minimum is raised by subsystems that hold a reserve beyond {@code min-threads} - region
+     * relief does - so keep-alive retirement and autoscaling cannot shrink the reserve away. It is
+     * still capped by the configured maximum: an explicit {@code max-threads} wins over a reserve that
+     * does not fit.
+     *
+     * @param workers             worker sizing from the configuration
+     * @param scheduling          scheduling options, used for the idle wait
+     * @param availableProcessors processors available to the JVM, at least {@code 1}
+     * @param minimumWorkers      floor the pool must keep alive, at least {@code 1}
+     * @param loop                loop the workers execute, implemented by the engine
+     * @param clock               clock used for keep-alive measurements
+     * @param factory             factory for platform worker threads
+     */
+    public DynamicWorkerPool(
+        final ComputeSettings.Workers workers,
+        final ComputeSettings.Scheduling scheduling,
+        final int availableProcessors,
+        final int minimumWorkers,
+        final WorkerLoop loop,
+        final ComputeClock clock,
+        final ThreadFactory factory
+    ) {
         Preconditions.requireNonNull(scheduling, "scheduling");
         this.loop = Preconditions.requireNonNull(loop, "loop");
         this.clock = Preconditions.requireNonNull(clock, "clock");
         this.threadFactory = Preconditions.requireNonNull(factory, "factory");
         Preconditions.checkAtLeast(availableProcessors, 1, "availableProcessors");
+        Preconditions.checkAtLeast(minimumWorkers, 1, "minimumWorkers");
 
         this.maxWorkers = WorkerSizing.maxWorkers(workers, availableProcessors);
-        this.minWorkers = Math.min(workers.minThreads(), this.maxWorkers);
+        this.minWorkers = Math.min(Math.max(workers.minThreads(), minimumWorkers), this.maxWorkers);
         this.initialWorkers = WorkerSizing.targetWorkers(workers, availableProcessors);
         this.automatic = workers.automaticThreadCount();
         this.keepAliveNanos = Durations.toNanosSaturated(workers.keepAlive());

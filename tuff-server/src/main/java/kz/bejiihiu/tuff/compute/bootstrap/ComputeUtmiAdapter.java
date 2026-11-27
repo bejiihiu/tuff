@@ -238,19 +238,37 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
     }
 
     /**
-     * Applies the tick pressure reserve to a pool budget, never below {@code min-threads} and never
-     * below the core the relief path keeps for itself.
+     * Applies the tick pressure reserve to a pool budget, never below the budget the engine needs for
+     * {@code min-threads} plus the relief reserve.
      *
      * @param poolBudget cores the pool owns right now
      * @param reserve    cores it is yielding to the regions
-     * @return the processor budget to hand to the engine, at least the configured minimum
+     * @return the processor budget to hand to the engine, at least the configured floor
      */
     private int applyReserve(final int poolBudget, final int reserve) {
-        final int floor = Math.max(1, this.settings.workers().minThreads());
         // the floor is absolute, exactly like min-threads itself: a budget smaller than the floor still
         // runs the floor, because the engine refuses to go below it anyway
-        final int reliefFloor = floor + this.relief.effectiveReservedCores();
-        return Math.max(reliefFloor, TickPressureMonitor.budgetFor(poolBudget, reserve));
+        return Math.max(this.reliefBudgetFloor(), TickPressureMonitor.budgetFor(poolBudget, reserve));
+    }
+
+    /**
+     * Returns the budget the engine needs to run {@code min-threads + reserved-cores} workers.
+     *
+     * <p>Automatic sizing keeps one processor as headroom, so a budget of {@code N} resolves to
+     * {@code N - 1} workers. Reserving cores at the budget level alone would therefore reserve nothing
+     * at the worker level whenever {@code min-threads} is already binding; the extra budget unit is
+     * what makes the reserve show up as an actual worker. A fixed pool ignores the budget entirely, so
+     * for it the reserve is only an informational number.
+     *
+     * @return the lowest processor budget pressure may apply, never below {@code min-threads}
+     */
+    private int reliefBudgetFloor() {
+        final int floor = Math.max(1, this.settings.workers().minThreads());
+        final int reserved = this.relief.effectiveReservedCores();
+        if (reserved == 0) {
+            return floor;
+        }
+        return this.settings.workers().automaticThreadCount() ? floor + reserved + 1 : floor + reserved;
     }
 
     /**
@@ -492,7 +510,8 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
 
         @Override
         public int minBudget() {
-            return Math.max(1, ComputeUtmiAdapter.this.settings.workers().minThreads());
+            // the same floor the budget port applies, so the printed decision and the engine cannot diverge
+            return ComputeUtmiAdapter.this.reliefBudgetFloor();
         }
 
         @Override
@@ -502,13 +521,12 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
                 return 0;
             }
             final int configured = Math.max(0, monitor.maxReserveCores());
-            // the floor is the pool's own min-threads plus the relief reserve, and it applies to the
-            // pool budget - the same number the engine is sized from - not to the ledger's usable.
-            // without the relief part, pressure would be allowed to take the last core relief has
+            // the floor applies to the pool budget - the same number the engine is sized from - not to
+            // the ledger's usable. it already carries min-threads and the relief reserve, including
+            // the headroom unit that turns the reserve into an actual worker
             final int floor = Math.max(0,
                 ComputeUtmiAdapter.this.poolBudget(Math.max(1, usableCores))
-                    - Math.max(1, ComputeUtmiAdapter.this.settings.workers().minThreads())
-                    - ComputeUtmiAdapter.this.reliefReserveCores());
+                    - ComputeUtmiAdapter.this.reliefBudgetFloor());
             return Math.min(configured, floor);
         }
 
