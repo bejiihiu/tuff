@@ -81,6 +81,7 @@ TuffBench self-check
 | `--margin-ratio R` | `0.02` | relative margin for the other metrics |
 | `--force` | off | redo finished runs |
 | `--rebuild` | off | regenerate the template world |
+| `--no-kairos-jfr` | off | do not arm `kairos.metrics.jfr`; the run then has no per-tick source |
 | `--jvm "<flags>"` | empty | extra JVM flags |
 
 Exit codes: `0` success and every run valid, `2` the harness could not do the work, `3` the work
@@ -100,8 +101,10 @@ finished but at least one run is invalid.
 6. Measurement: the same sampling, with the window boundaries recorded in the manifest.
 7. Send `stop`, wait up to two minutes, capture the exit code and the stop duration. A process that does
    not leave is killed together with its descendants.
-8. Parse the console, read the JFR recording for the measurement window, run the guardrails, write the
-   CSVs, the summary and the report.
+8. Parse the console and read the JFR recording for the measurement window, then run the guardrails.
+9. Extract `tuff.scheduler.Tick` and `tuff.scheduler.Fund` with the JDK's `jfr print --json`, filter them
+   to the measurement window, write `ticks.csv` and `fund.csv` from them, and render the summary and the
+   report. Without those events the run keeps the fallback and says so.
 
 The console sampling sends one `say BENCH-SAMPLE <seq> <phase>` marker followed by `tuff scheduler` and
 `tuff threads`. The marker only delimits the answers of the two report commands; it does not influence
@@ -109,14 +112,41 @@ the scheduler.
 
 ## Metric definitions
 
-All values are computed inside the measurement window only, from the samples that arrived.
+All values are computed inside the measurement window only.
+
+The primary metric has a true source and a fallback:
+
+| Source | Definition |
+| --- | --- |
+| `jfr_per_tick` | a tick is a hard miss when its lag (`startNanos - scheduledStartNanos`) reaches one tick period (50 ms) or when the event's `missedPeriods` field is above 1 |
+| `sampled_region_aggregate_proxy` | a 5 s sample is a hard miss when min region TPS < 19.5 or the worst tick of the window is at least 50 ms |
+
+The field called `missedPeriods` in `tuff.scheduler.Tick` carries the handle's periods ahead, where 1
+means on time; `skipped` is the number of periods the body wrote off. `skipped_periods` in the summary is
+the sum of that field over the window.
+
+The event records the scheduled start after the handle advanced inside the body, so the raw difference
+`startNanos - scheduledStartNanos` is about one period short. The harness reconstructs the deadline the
+body actually ran against as `scheduledStartNanos - missedPeriods * period`, which is exact when the body
+finished before the next deadline. Rows where that does not hold are marked `lag_exact = 0`, counted as
+`lag_inexact_ticks`, and excluded from the lag distribution; the hard miss itself does not depend on the
+reconstruction, because the periods-ahead field carries it directly.
+
+The true source exists on arms that run the Kairos scheduler, because that scheduler is the one emitting
+`tuff.scheduler.Tick`. An EDF arm has no per-tick event source in the server today, so it falls back to
+the sampled aggregate. The analyzer compares a pair of arms on the true metric only when both produced
+ticks; otherwise it compares them on the fallback, and every row of `summary.csv` carries a `source`
+column that names the definition used. A pair is never mixed.
 
 | Metric | Definition |
 | --- | --- |
-| `hard_miss_share` | share of samples with `min TPS < 19.5` or `max 5 s MSPT >= 50 ms` |
+| `hard_miss_share` | share of hard-miss ticks on the per-tick source, or of hard-miss samples on the fallback |
+| `skipped_periods` | periods written off, per-tick source only |
+| `lag_p50/p95/p99/p99.9/max` | distribution of per-tick lag, per-tick source only |
+| `tick_mspt_p99_ns` | 99th percentile of per-tick body time, per-tick source only |
 | `late_share` | share of samples where at least one region was lagging |
 | `tps_min` / `tps_p50` | minimum and median of the lowest region TPS across samples |
-| `mspt_avg_p50/p95/p99` | percentiles of the per-sample average MSPT |
+| `mspt_avg_p50/p95/p99` | percentiles of the per-sample average MSPT, per region |
 | `mspt_peak_p99/max` | percentile and maximum of the per-sample worst tick |
 | `lag_pct_p50/p95` | percentiles of the lagging region share |
 | `fund_live_median/max`, `fund_queued_max`, `fund_overdue_max` | fund telemetry, Kairos only |
@@ -127,10 +157,10 @@ All values are computed inside the measurement window only, from the samples tha
 | `heap_used_max_mb` | highest used heap observed at a GC in the window |
 | `thread_starts`, `thread_ends` | `jdk.ThreadStart` / `jdk.ThreadEnd` counts |
 
-Things the stand cannot observe today, and says so in every report:
+Things the stand cannot observe, and says so in every report:
 
-- per-tick `scheduledStart`, `tickStart` and `periodsAhead`: the running server exposes only the sampled
-  region aggregate, so the primary metric is a sample-level proxy;
+- per-tick events on an EDF arm: the server emits them only from the Kairos scheduler, so the EDF
+  baseline is measured with the fallback;
 - player and packet load: regions come from force-loaded areas, not from clients;
 - compute lane pressure: loading it needs a bench plugin.
 
@@ -161,11 +191,15 @@ The analyzer groups valid runs by arm and follows the pre-registered method:
 - the difference of arm means is bootstrapped with 10 000 resamples and reported with its 95%
   percentile interval;
 - the margin of a metric is `max(2 * sigma_A/A, policy delta)`, where `sigma_A/A` is the pooled run-to-run
-  standard deviation of the two baseline runs (`A` and `A2`) on that metric and the policy delta is 1%
-  of the baseline for the primary metric and `--margin-ratio` for the others;
+  standard deviation of the two baseline runs (`A` and `A2`) on that metric; the policy delta is 1% of the
+  baseline for the primary metric, 500 microseconds absolute for lag p99 and `--margin-ratio` for the
+  others;
 - non-inferiority is `upper bound of (arm - baseline) < margin` for a lower-is-better metric and
   `lower bound > -margin` for a higher-is-better one; superiority is the same interval entirely below
   (or above) zero;
+- the noise band comes from the A/A pair on the fallback metric, because the baseline arm cannot emit
+  per-tick events; a true-sourced comparison therefore uses the policy delta alone as its margin, and
+  the report says that the true metric has no calibration pair in the block;
 - a block with no `A2` has no noise band, and the report marks every verdict provisional;
 - a block with fewer than ten valid runs per arm is a pilot and the report says so.
 
@@ -175,18 +209,31 @@ worse than the baseline, which stops the project).
 
 ## Artifact schema
 
-`ticks.csv`:
+`ticks.csv` - one row per executed tick, read from `tuff.scheduler.Tick`:
+
+```text
+run_id,seq,epoch_ms,elapsed_ms,region_id,tick_id,scheduled_start_ns,start_ns,end_ns,
+lag_ns,lag_exact,missed_periods,catch_up,skipped,executed_ns,hard_miss
+```
+
+`missed_periods` is the handle's periods ahead at the moment the body started (1 = on time), `skipped` is
+the periods the body wrote off and `hard_miss` is 1 when the row meets the true definition. The file is
+header only when the arm has no per-tick source.
+
+`fund.csv` - one row per supervisor pass, read from `tuff.scheduler.Fund`; when the arm has no fund
+events the same columns are filled from the console samples and the last column says so:
+
+```text
+run_id,seq,epoch_ms,elapsed_ms,min,live,target,max,queued,awaiting,executing,overdue,
+spawned,retired,source
+```
+
+`samples.csv` - the per-sample region aggregate from `/tuff threads`, used for the fallback metric and
+for the per-region MSPT/TPS numbers:
 
 ```text
 run_id,seq,phase,epoch_ms,elapsed_ms,regions,avg_mspt_5s,max_mspt_5s,avg_mspt_15s,
 max_mspt_15s,min_tps,lag_pct,lagging_regions,entities,players,chunks
-```
-
-`fund.csv`:
-
-```text
-run_id,seq,phase,epoch_ms,min,live,target,max,queued,awaiting,executing,overdue,
-oldest_overdue_ms,wait_avg_ms,wait_max_ms,spawned,retired
 ```
 
 An unavailable field is empty in the CSV and `null` in the JSON, never zero.
@@ -194,11 +241,13 @@ An unavailable field is empty in the CSV and `null` in the JSON, never zero.
 `summary.csv` / `compare.csv`:
 
 ```text
-metric,arm,baseline,n_arm,n_baseline,arm_mean,baseline_mean,delta,delta_rel,
+metric,arm,baseline,source,n_arm,n_baseline,arm_mean,baseline_mean,delta,delta_rel,
 ci_low,ci_high,margin,sigma,verdict
 ```
 
-`verdict` is one of `better`, `non_inferior`, `worse`, `inconclusive`, `noise_band` (the A/A row) or
+`source` is `jfr_per_tick` or `sampled_region_aggregate_proxy` and belongs to the row, not to the block:
+the same metric can be true-sourced in one comparison and fallback-sourced in another. `verdict` is one
+of `better`, `non_inferior`, `worse`, `inconclusive`, `noise_band` (the A/A row) or
 `insufficient_data`.
 
 ## Platform notes

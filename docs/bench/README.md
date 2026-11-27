@@ -66,8 +66,9 @@ runs/<arm>-<profile>-<nn>/
   server.log               captured console output
   gc.log                   -Xlog:gc* with time, uptime, level and tags
   jfr/recording.jfr        JFR profile recording, dumped on exit
-  ticks.csv                per sample region aggregate: TPS, MSPT, lag share, entities, chunks
-  fund.csv                 per sample fund counters (Kairos only; EDF rows carry -1)
+  ticks.csv                one row per executed tick, from the scheduler's JFR events
+  samples.csv              per sample region aggregate: TPS, MSPT, lag share, entities, chunks
+  fund.csv                 one row per supervisor pass, or the console samples when no event exists
   snapshots/               raw console blocks of the first, last and every tenth sample
   os/threads-*.txt         thread dumps taken by jcmd during the run
   summary.json             the run reduced to the numbers the analyzer compares
@@ -78,17 +79,18 @@ One block directory additionally contains `summary.csv`, `compare.csv`, `summary
 
 ## What the numbers mean
 
-`hard miss` is the primary metric. In the running server no per-tick `scheduledStart`,
-`tickStart` or `periodsAhead` is exposed, so a sample counts as a hard miss when the real region
-aggregate shows either a lost period or a full-period tick:
+`hard miss` is the primary metric. On the arms that run the Kairos scheduler it is the true per-tick
+value, read from the scheduler's own `tuff.scheduler.Tick` events:
 
 ```text
-hard miss (per 5 s sample) := min region TPS < 19.5  or  worst tick of the window >= 50 ms
+hard miss (per tick) := lag >= one tick period (50 ms)  or  periodsAhead > 1
 ```
 
-The summary names this source as `sampled_region_aggregate_proxy` and the report repeats it. Exact
-per-tick ingestion is deliberately not faked; see [harness.md](harness.md) for the full list of what the
-stand does and does not observe.
+An EDF arm does not emit that event, so a comparison that involves it falls back to the sampled region
+aggregate, where a sample counts as a hard miss when `min TPS < 19.5` or the worst tick of the window is
+at least 50 ms. The summary and every row of `summary.csv` carry the source that produced the number
+(`jfr_per_tick` or `sampled_region_aggregate_proxy`), and a pair of arms is never mixed across the two.
+See [harness.md](harness.md) for the full list of what the stand does and does not observe.
 
 Secondary metrics are the distribution of the per-sample average and peak MSPT, the lowest region TPS,
 the lagging region share, fund size and churn, thread seconds, JVM CPU and GC facts read from the JFR

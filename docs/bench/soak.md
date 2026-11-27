@@ -41,9 +41,10 @@ The assertions use observations, not timing assumptions:
 - **no permit leak** - `queued + awaiting + executing` from the snapshot is compared with the number of
   ticks the test still expects to be scheduled. The deterministic version schedules five ticks, cancels
   the four queued ones and then the awaiting one, and expects five, one and zero permits. The churn storm
-  issues a thousand schedule/cancel pairs against a fixed fund with a free permit each time and also ends
-  at zero. Each storm pair is issued under one test-side lock: with a queue present, cancelling an
-  awaiting tick promotes a queued one, and that promotion is not part of this accounting test.
+  is fully concurrent: four threads schedule and cancel four hundred far-dated ticks each, so a cancel
+  that frees a permit hands the replacement through the grant transition while the other threads are
+  still scheduling. All one thousand six hundred cancels must succeed, none of the cancelled ticks may
+  execute, and the permit count must be zero afterwards.
 - **progress after a supervisor failure** - the fund is frozen at its floor when its control thread
   dies; the test then schedules a tick that reschedules five times and requires all six executions.
 - **profiler pass does not change execution** - the same exactly-once check runs with CPU measurement
