@@ -19,28 +19,138 @@ import java.util.Locale;
  */
 final class Artifacts {
 
-    private static final String TICKS_HEADER =
+    private static final String SAMPLES_HEADER =
         "run_id,seq,phase,epoch_ms,elapsed_ms,regions,avg_mspt_5s,max_mspt_5s,avg_mspt_15s,"
             + "max_mspt_15s,min_tps,lag_pct,lagging_regions,entities,players,chunks";
 
+    private static final String TICKS_HEADER =
+        "run_id,seq,epoch_ms,elapsed_ms,region_id,tick_id,scheduled_start_ns,start_ns,end_ns,"
+            + "lag_ns,lag_exact,missed_periods,catch_up,skipped,executed_ns,hard_miss";
+
     private static final String FUND_HEADER =
-        "run_id,seq,phase,epoch_ms,min,live,target,max,queued,awaiting,executing,overdue,"
-            + "oldest_overdue_ms,wait_avg_ms,wait_max_ms,spawned,retired";
+        "run_id,seq,epoch_ms,elapsed_ms,min,live,target,max,queued,awaiting,executing,overdue,"
+            + "spawned,retired,source";
 
     private Artifacts() {
     }
 
     /**
-     * Writes the per-sample region series.
+     * Writes the per-tick series read from the scheduler's own JFR events.
+     *
+     * @param file            destination
+     * @param runId           run identifier
+     * @param perTick         tick events of the measurement window
+     * @param windowStartEpoch start of the window, epoch milliseconds
+     * @throws IOException if the file cannot be written
+     */
+    static void writeTicks(
+        final Path file,
+        final String runId,
+        final JfrTicks.Result perTick,
+        final long windowStartEpoch
+    ) throws IOException {
+        final StringBuilder out = new StringBuilder(4_096);
+        out.append(TICKS_HEADER).append('\n');
+        final long origin = perTick.ticks().isEmpty() ? windowStartEpoch : perTick.ticks().getFirst().epochMillis();
+        long seq = 0L;
+        for (final JfrTicks.Tick tick : perTick.ticks()) {
+            out.append(escape(runId)).append(',')
+                .append(seq++).append(',')
+                .append(tick.epochMillis()).append(',')
+                .append(tick.epochMillis() - origin).append(',')
+                .append(tick.regionId()).append(',')
+                .append(tick.tickId()).append(',')
+                .append(tick.scheduledStartNanos()).append(',')
+                .append(tick.startNanos()).append(',')
+                .append(tick.endNanos()).append(',')
+                .append(tick.lagNanos(JfrTicks.TICK_PERIOD_NANOS)).append(',')
+                .append(tick.lagExact() ? 1 : 0).append(',')
+                .append(tick.missedPeriods()).append(',')
+                .append(tick.catchUpTicks()).append(',')
+                .append(tick.skipped()).append(',')
+                .append(tick.executedNanos()).append(',')
+                .append(tick.hardMiss(JfrTicks.TICK_PERIOD_NANOS) ? 1 : 0)
+                .append('\n');
+        }
+        write(file, out);
+    }
+
+    /**
+     * Writes the fund series: supervisor passes when they exist, the console samples otherwise.
+     *
+     * @param file           destination
+     * @param runId          run identifier
+     * @param perTick        per-tick result, carrying the fund passes
+     * @param samples        console samples of the run
+     * @throws IOException if the file cannot be written
+     */
+    static void writeFund(
+        final Path file,
+        final String runId,
+        final JfrTicks.Result perTick,
+        final List<Sample> samples
+    ) throws IOException {
+        final StringBuilder out = new StringBuilder(4_096);
+        out.append(FUND_HEADER).append('\n');
+        if (!perTick.fund().isEmpty()) {
+            final long origin = perTick.fund().getFirst().epochMillis();
+            long seq = 0L;
+            for (final JfrTicks.Fund pass : perTick.fund()) {
+                out.append(escape(runId)).append(',')
+                    .append(seq++).append(',')
+                    .append(pass.epochMillis()).append(',')
+                    .append(pass.epochMillis() - origin).append(',')
+                    .append(pass.min()).append(',')
+                    .append(pass.live()).append(',')
+                    .append(pass.target()).append(',')
+                    .append(pass.max()).append(',')
+                    .append(pass.queued()).append(',')
+                    .append(pass.awaiting()).append(',')
+                    .append(pass.executing()).append(',')
+                    .append(pass.overdue()).append(',')
+                    .append(pass.spawned()).append(',')
+                    .append(pass.retired()).append(',')
+                    .append("jfr")
+                    .append('\n');
+            }
+        } else {
+            for (final Sample sample : samples) {
+                final Sample.FundSample fund = sample.fund();
+                if (!fund.present()) {
+                    continue;
+                }
+                out.append(escape(runId)).append(',')
+                    .append(sample.seq()).append(',')
+                    .append(sample.epochMillis()).append(',')
+                    .append(sample.elapsedMillis()).append(',')
+                    .append(fund.min()).append(',')
+                    .append(fund.live()).append(',')
+                    .append(fund.target()).append(',')
+                    .append(fund.max()).append(',')
+                    .append(fund.queued()).append(',')
+                    .append(fund.awaiting()).append(',')
+                    .append(fund.executing()).append(',')
+                    .append(fund.overdue()).append(',')
+                    .append(fund.spawned()).append(',')
+                    .append(fund.retired()).append(',')
+                    .append("sample")
+                    .append('\n');
+            }
+        }
+        write(file, out);
+    }
+
+    /**
+     * Writes the per-sample region aggregate.
      *
      * @param file  destination
      * @param runId run identifier
      * @param samples samples of the run
      * @throws IOException if the file cannot be written
      */
-    static void writeTicks(final Path file, final String runId, final List<Sample> samples) throws IOException {
+    static void writeSamples(final Path file, final String runId, final List<Sample> samples) throws IOException {
         final StringBuilder out = new StringBuilder(4_096);
-        out.append(TICKS_HEADER).append('\n');
+        out.append(SAMPLES_HEADER).append('\n');
         for (final Sample sample : samples) {
             final Sample.RegionSample region = sample.region();
             out.append(escape(runId)).append(',')
@@ -59,41 +169,6 @@ final class Artifacts {
                 .append(region.entities()).append(',')
                 .append(region.players()).append(',')
                 .append(region.chunks())
-                .append('\n');
-        }
-        write(file, out);
-    }
-
-    /**
-     * Writes the per-sample fund series.
-     *
-     * @param file  destination
-     * @param runId run identifier
-     * @param samples samples of the run
-     * @throws IOException if the file cannot be written
-     */
-    static void writeFund(final Path file, final String runId, final List<Sample> samples) throws IOException {
-        final StringBuilder out = new StringBuilder(4_096);
-        out.append(FUND_HEADER).append('\n');
-        for (final Sample sample : samples) {
-            final Sample.FundSample fund = sample.fund();
-            out.append(escape(runId)).append(',')
-                .append(sample.seq()).append(',')
-                .append(sample.phase()).append(',')
-                .append(sample.epochMillis()).append(',')
-                .append(fund.min()).append(',')
-                .append(fund.live()).append(',')
-                .append(fund.target()).append(',')
-                .append(fund.max()).append(',')
-                .append(fund.queued()).append(',')
-                .append(fund.awaiting()).append(',')
-                .append(fund.executing()).append(',')
-                .append(fund.overdue()).append(',')
-                .append(fund.oldestOverdueMs()).append(',')
-                .append(number(fund.waitAverageMs())).append(',')
-                .append(number(fund.waitMaximumMs())).append(',')
-                .append(fund.spawned()).append(',')
-                .append(fund.retired())
                 .append('\n');
         }
         write(file, out);
@@ -166,13 +241,38 @@ final class Artifacts {
         out.append('\n');
 
         out.append("## Primary metric\n\n");
-        out.append("`hard miss` source: `").append(summary.hardMissSource()).append("`.\n\n");
-        out.append("A sample is a hard miss when ").append(summary.hardMissDefinition()).append(".\n\n");
+        out.append("Definition: ").append(summary.hardMissDefinition()).append(".\n\n");
+        out.append("Source: `").append(summary.hardMissSource()).append("`");
+        if (summary.perTickRequested() && summary.ticks() > 0) {
+            out.append(" - the scheduler's own per-tick JFR events.");
+        } else if (summary.perTickRequested()) {
+            out.append(" - per-tick events were requested but absent, so the sampled fallback was used.");
+        } else {
+            out.append(" - this arm has no per-tick event source, so the sampled fallback was used.");
+        }
+        out.append("\n\n");
         out.append("| metric | value |\n|---|---|\n");
-        row(out, "samples in window", Integer.toString(summary.samples()));
-        row(out, "hard miss samples", Integer.toString(summary.hardMissSamples()));
-        row(out, "hard miss share", percent(summary.hardMissShare()));
-        row(out, "late sample share", percent(summary.lateShare()));
+        if (summary.ticks() > 0) {
+            row(out, "ticks in window", Integer.toString(summary.ticks()));
+            row(out, "hard miss ticks", Integer.toString(summary.hardMissTicks()));
+            row(out, "hard miss share", percent(summary.hardMissShare()));
+            row(out, "skipped periods", Long.toString(summary.skippedPeriods()));
+            row(out, "catch-up ticks", Long.toString(summary.catchUpTicks()));
+            row(out, "lag p50", nanos(summary.lagP50Nanos()));
+            row(out, "lag p95", nanos(summary.lagP95Nanos()));
+            row(out, "lag p99", nanos(summary.lagP99Nanos()));
+            row(out, "lag p99.9", nanos(summary.lagP999Nanos()));
+            row(out, "lag max", nanos(summary.lagMaxNanos()));
+            row(out, "ticks with inexact lag", Integer.toString(summary.lagInexactTicks()));
+            row(out, "tick body p99", nanos(summary.tickMsptP99Nanos()));
+            row(out, "fund passes", Integer.toString(summary.fundPasses()));
+            out.append("| sampled fallback share | ").append(percent(summary.proxyHardMissShare())).append(" |\n");
+        } else {
+            row(out, "samples in window", Integer.toString(summary.samples()));
+            row(out, "hard miss samples", Integer.toString(summary.hardMissSamples()));
+            row(out, "hard miss share", percent(summary.hardMissShare()));
+            row(out, "late sample share", percent(summary.lateShare()));
+        }
         out.append('\n');
 
         out.append("## Secondary metrics\n\n");
@@ -232,8 +332,13 @@ final class Artifacts {
         }
 
         out.append("## What is not observable in this setup\n\n");
-        out.append("- Per-tick `scheduledStart`, `tickStart` and `periodsAhead` are not exposed by the running "
-            + "server; the primary metric is a sample-level proxy over the real region aggregate.\n");
+        if (summary.ticks() > 0) {
+            out.append("- The per-tick events come from the scheduler, so they exist only on arms that run it; "
+                + "an EDF arm has no per-tick source and falls back to the sampled aggregate.\n");
+        } else {
+            out.append("- This run has no per-tick source, so the primary metric is the sampled aggregate: "
+                + "`min TPS < 19.5` or a 50 ms tick over a five second window.\n");
+        }
         out.append("- No client bots are used: regions come from force-loaded areas, so packet and player load "
             + "are absent.\n");
         out.append("- The `idle-compute` profile cannot load the compute lane without a bench plugin.\n\n");
@@ -243,8 +348,9 @@ final class Artifacts {
         out.append("- `server.log` - captured console output\n");
         out.append("- `gc.log` - JVM GC log\n");
         out.append("- `jfr/recording.jfr` - profiling recording\n");
-        out.append("- `ticks.csv` - per-sample region aggregate\n");
-        out.append("- `fund.csv` - per-sample fund counters\n");
+        out.append("- `ticks.csv` - one row per executed tick, from the scheduler's JFR events\n");
+        out.append("- `samples.csv` - per-sample region aggregate from the console\n");
+        out.append("- `fund.csv` - one row per supervisor pass, or the console samples when events are absent\n");
         out.append("- `snapshots/` - raw console blocks of selected samples\n");
         out.append("- `os/` - thread dumps taken during the run\n");
         out.append("- `summary.json` - the numbers above, machine readable\n\n");
@@ -281,6 +387,16 @@ final class Artifacts {
      */
     static String millis(final double value) {
         return Double.isFinite(value) ? String.format(Locale.ROOT, "%.3f ms", value) : "n/a";
+    }
+
+    /**
+     * Formats nanoseconds as milliseconds.
+     *
+     * @param value nanoseconds
+     * @return the text
+     */
+    static String nanos(final double value) {
+        return Double.isFinite(value) ? String.format(Locale.ROOT, "%.3f ms", value / 1_000_000.0d) : "n/a";
     }
 
     /**

@@ -36,6 +36,7 @@ final class SelfCheck {
         failures += check("bootstrap is deterministic", SelfCheck::bootstrapDeterministic);
         failures += check("guardrails", SelfCheck::guardrails);
         failures += check("sample parser", SelfCheck::sampleParser);
+        failures += check("jfr per tick events", SelfCheck::jfrEvents);
         if (failures == 0) {
             System.out.println("self-check: ok");
             return 0;
@@ -173,6 +174,94 @@ final class SelfCheck {
         } finally {
             Files.deleteIfExists(log);
         }
+    }
+
+    private static void jfrEvents() throws IOException {
+        final String document = """
+            {
+              "recording": {
+                "events": [{
+                  "type": "tuff.scheduler.Tick",
+                  "values": {
+                    "startTime": "2026-01-01T00:00:02+00:00",
+                    "regionId": 7,
+                    "tickId": 11,
+                    "scheduledStartNanos": 100000000,
+                    "startNanos": 50400000,
+                    "endNanos": 51000000,
+                    "missedPeriods": 1,
+                    "catchUpTicks": 0,
+                    "skipped": 0,
+                    "executedNanos": 600000
+                  }
+                }, {
+                  "type": "tuff.scheduler.Tick",
+                  "values": {
+                    "startTime": "2026-01-01T00:00:02+00:00",
+                    "regionId": 8,
+                    "tickId": 12,
+                    "scheduledStartNanos": 150000000,
+                    "startNanos": 100500000,
+                    "endNanos": 101000000,
+                    "missedPeriods": 2,
+                    "catchUpTicks": 0,
+                    "skipped": 1,
+                    "executedNanos": 500000
+                  }
+                }, {
+                  "type": "tuff.scheduler.Tick",
+                  "values": {
+                    "startTime": "2026-01-01T00:00:00+00:00",
+                    "regionId": 1,
+                    "tickId": 1,
+                    "scheduledStartNanos": 0,
+                    "startNanos": 1000,
+                    "endNanos": 2000,
+                    "missedPeriods": 0,
+                    "catchUpTicks": 0,
+                    "skipped": 0,
+                    "executedNanos": 1000
+                  }
+                }, {
+                  "type": "tuff.scheduler.Fund",
+                  "values": {
+                    "startTime": "2026-01-01T00:00:02+00:00",
+                    "minThreads": 2,
+                    "liveThreads": 3,
+                    "targetThreads": 3,
+                    "maxThreads": 4,
+                    "queuedTicks": 1,
+                    "awaitingTicks": 2,
+                    "executingTicks": 1,
+                    "overdueTicks": 0,
+                    "spawned": 1,
+                    "retired": 0
+                  }
+                }]
+              }
+            }
+            """;
+        final long from = java.time.OffsetDateTime.parse("2026-01-01T00:00:01+00:00")
+            .toInstant()
+            .toEpochMilli();
+        final long to = java.time.OffsetDateTime.parse("2026-01-01T00:00:03+00:00")
+            .toInstant()
+            .toEpochMilli();
+        final JfrTicks.Result result = JfrTicks.parseJson(document, from, to);
+        require(result.ticks().size() == 2, "only the ticks inside the window must be kept");
+        require(result.fund().size() == 1, "the fund pass inside the window must be kept");
+        final JfrTicks.Tick onTime = result.ticks().get(0);
+        require(onTime.regionId() == 7L, "region id");
+        require(onTime.lagExact(), "a body that finished before the next deadline has an exact lag");
+        require(onTime.lagNanos(JfrTicks.TICK_PERIOD_NANOS) == 400_000L, "lag is measured against the advanced deadline");
+        require(!onTime.hardMiss(JfrTicks.TICK_PERIOD_NANOS), "an on-time tick is not a hard miss");
+        final JfrTicks.Tick behind = result.ticks().get(1);
+        require(behind.missedPeriods() == 2L, "periods ahead are kept");
+        require(behind.hardMiss(JfrTicks.TICK_PERIOD_NANOS), "more than one period behind is a hard miss");
+        require(behind.skipped() == 1L, "skipped periods");
+        final JfrTicks.Fund pass = result.fund().getFirst();
+        require(pass.live() == 3 && pass.queued() == 1, "fund counters");
+        require(pass.spawned() == 1L, "fund spawn counter");
     }
 
     private static void require(final boolean condition, final String what) {

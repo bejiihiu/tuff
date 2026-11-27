@@ -66,7 +66,7 @@ final class RunExecutor {
         TemplateBuilder.deleteTree(runDir);
         ServerConfig.copyTemplate(this.template, runDir);
         ServerConfig.writeServerFiles(runDir, port, "1337");
-        ServerConfig.writeTuffYml(runDir, this.arm, this.options.threads, this.options.maxThreads, 4);
+        ServerConfig.writeTuffYml(runDir, this.arm, this.options.threads, this.options.maxThreads, 4, this.options.kairosJfr);
         ServerConfig.patchPaperGlobal(runDir, this.arm, this.options.threads, 4);
 
         final List<String> flags = BenchOptions.jvmFlags(runDir, this.options.heap, this.options.extraJvm);
@@ -149,7 +149,10 @@ final class RunExecutor {
         final List<Sample> samples = parsed.samples();
         final long from = measureStartEpoch < 0L ? System.currentTimeMillis() : measureStartEpoch;
         final long to = measureEndEpoch < 0L ? from + 1L : measureEndEpoch;
-        final JfrFacts.Facts jfr = JfrFacts.read(runDir.resolve("jfr").resolve("recording.jfr"), from, to);
+        final Path recording = runDir.resolve("jfr").resolve("recording.jfr");
+        final JfrFacts.Facts jfr = JfrFacts.read(recording, from, to);
+        final JfrTicks.Result perTick = JfrTicks.read(recording, JfrTicks.tool(), from, to);
+        final boolean perTickRequested = this.arm.kairosOptIn() && this.options.kairosJfr;
         final Guardrails.Result guardrails = Guardrails.inspect(log, exitCode);
         final double measuredSeconds = measureStartEpoch < 0L || measureEndEpoch < 0L
             ? 0.0d
@@ -170,11 +173,14 @@ final class RunExecutor {
             exitCode,
             stopSeconds,
             measuredSeconds,
+            perTick,
+            perTickRequested,
             extraReasons
         );
 
-        Artifacts.writeTicks(Artifacts.ticks(runDir), runId, samples);
-        Artifacts.writeFund(Artifacts.fund(runDir), runId, samples);
+        Artifacts.writeTicks(Artifacts.ticks(runDir), runId, perTick, from);
+        Artifacts.writeFund(Artifacts.fund(runDir), runId, perTick, samples);
+        Artifacts.writeSamples(runDir.resolve("samples.csv"), runId, samples);
         Artifacts.writeSnapshots(runDir.resolve("snapshots"), parsed, "warmup");
         Artifacts.writeSnapshots(runDir.resolve("snapshots"), parsed, "measure");
         Json.write(Artifacts.summary(runDir), summary.toMap());
@@ -190,6 +196,12 @@ final class RunExecutor {
         manifest.put("invalid_reasons", summary.invalidReasons());
         manifest.put("hard_miss_source", summary.hardMissSource());
         manifest.put("hard_miss_share", summary.hardMissShare());
+        manifest.put("hard_miss_ticks", summary.hardMissTicks());
+        manifest.put("ticks", summary.ticks());
+        manifest.put("skipped_periods", summary.skippedPeriods());
+        manifest.put("kairos_jfr", this.options.kairosJfr);
+        manifest.put("per_tick_requested", perTickRequested);
+        manifest.put("fund_passes", perTick.fund().size());
         manifest.put("guardrails", guardrails.evidence());
         Json.write(Artifacts.manifest(runDir), manifest);
         return summary;
@@ -222,10 +234,13 @@ final class RunExecutor {
             -1,
             -1.0d,
             0.0d,
+            JfrTicks.Result.absent("log unreadable"),
+            this.arm.kairosOptIn() && this.options.kairosJfr,
             List.of("log_unreadable: " + reason)
         );
-        Artifacts.writeTicks(Artifacts.ticks(runDir), runId, samples);
-        Artifacts.writeFund(Artifacts.fund(runDir), runId, samples);
+        Artifacts.writeTicks(Artifacts.ticks(runDir), runId, JfrTicks.Result.absent("log unreadable"), -1L);
+        Artifacts.writeFund(Artifacts.fund(runDir), runId, JfrTicks.Result.absent("log unreadable"), samples);
+        Artifacts.writeSamples(runDir.resolve("samples.csv"), runId, samples);
         Json.write(Artifacts.summary(runDir), summary.toMap());
         Artifacts.writeRunReport(
             Artifacts.report(runDir),

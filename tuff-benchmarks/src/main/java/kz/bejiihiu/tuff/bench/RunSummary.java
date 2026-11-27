@@ -11,12 +11,12 @@ import java.util.Map;
  * <p>The reduction happens inside the sample window only, and it is stored as {@code summary.json}
  * next to the raw samples so that the suite report can be recomputed without repeating the run.
  *
- * <p>{@code hard_miss_share} is the primary metric of this stand. It is computed from the real
- * per-sample region aggregate, not from invented ticks: a sample counts as a hard miss when the lowest
- * region TPS in its five second window is below 19.5 (the region lost at least 2.5% of its periods) or
- * when the worst single tick of the window reached a full 50 ms period. That is the closest observable
- * equivalent of "lag >= period or a period skipped"; the report names the source explicitly and the
- * analyzer prefers exact per-tick rows if a future collector provides them.
+ * <p>{@code hard_miss_share} is the primary metric of this stand. When the run produced the scheduler's
+ * own per-tick events it is the true share: a tick counts as a hard miss when its lag reached one tick
+ * period or when the handle was more than one period behind. Otherwise the run falls back to the
+ * sampled region aggregate, where a sample counts as a hard miss when the lowest region TPS is below
+ * 19.5 or the worst tick of the window reached 50 ms. The summary names the source, and the analyzer
+ * refuses to compare arms that were measured by different sources.
  */
 record RunSummary(
     String runId,
@@ -72,7 +72,22 @@ record RunSummary(
     double stopSeconds,
     boolean guardrailOk,
     List<String> invalidReasons,
-    boolean valid
+    boolean valid,
+    boolean perTickRequested,
+    int ticks,
+    int hardMissTicks,
+    double proxyHardMissShare,
+    long skippedPeriods,
+    long catchUpTicks,
+    long tickPeriodNanos,
+    double lagP50Nanos,
+    double lagP95Nanos,
+    double lagP99Nanos,
+    double lagP999Nanos,
+    double lagMaxNanos,
+    double tickMsptP99Nanos,
+    int fundPasses,
+    int lagInexactTicks
 ) {
 
     /**
@@ -143,6 +158,21 @@ record RunSummary(
         map.put("guardrail_ok", this.guardrailOk);
         map.put("invalid_reasons", new ArrayList<>(this.invalidReasons));
         map.put("valid", this.valid);
+        map.put("per_tick_requested", this.perTickRequested);
+        map.put("ticks", this.ticks);
+        map.put("hard_miss_ticks", this.hardMissTicks);
+        map.put("proxy_hard_miss_share", this.proxyHardMissShare);
+        map.put("skipped_periods", this.skippedPeriods);
+        map.put("catch_up_ticks", this.catchUpTicks);
+        map.put("tick_period_ns", this.tickPeriodNanos);
+        map.put("lag_p50_ns", this.lagP50Nanos);
+        map.put("lag_p95_ns", this.lagP95Nanos);
+        map.put("lag_p99_ns", this.lagP99Nanos);
+        map.put("lag_p99_9_ns", this.lagP999Nanos);
+        map.put("lag_max_ns", this.lagMaxNanos);
+        map.put("tick_mspt_p99_ns", this.tickMsptP99Nanos);
+        map.put("fund_passes", this.fundPasses);
+        map.put("lag_inexact_ticks", this.lagInexactTicks);
         return map;
     }
 
@@ -211,7 +241,22 @@ record RunSummary(
             Json.number(map, "stop_seconds", Double.NaN),
             Json.bool(map, "guardrail_ok", false),
             reasons,
-            Json.bool(map, "valid", false)
+            Json.bool(map, "valid", false),
+            Json.bool(map, "per_tick_requested", false),
+            (int) Json.integer(map, "ticks", 0),
+            (int) Json.integer(map, "hard_miss_ticks", 0),
+            Json.number(map, "proxy_hard_miss_share", Double.NaN),
+            Json.integer(map, "skipped_periods", 0L),
+            Json.integer(map, "catch_up_ticks", 0L),
+            Json.integer(map, "tick_period_ns", JfrTicks.TICK_PERIOD_NANOS),
+            Json.number(map, "lag_p50_ns", Double.NaN),
+            Json.number(map, "lag_p95_ns", Double.NaN),
+            Json.number(map, "lag_p99_ns", Double.NaN),
+            Json.number(map, "lag_p99_9_ns", Double.NaN),
+            Json.number(map, "lag_max_ns", Double.NaN),
+            Json.number(map, "tick_mspt_p99_ns", Double.NaN),
+            (int) Json.integer(map, "fund_passes", 0),
+            (int) Json.integer(map, "lag_inexact_ticks", 0)
         );
     }
 }

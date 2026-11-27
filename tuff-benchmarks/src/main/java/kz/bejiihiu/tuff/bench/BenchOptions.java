@@ -57,6 +57,7 @@ final class BenchOptions {
     String runId;
     boolean force;
     boolean rebuildTemplate;
+    boolean kairosJfr = true;
     List<String> extraJvm = List.of();
     Path analyzeDir;
 
@@ -185,6 +186,9 @@ final class BenchOptions {
                 }
                 case "--rebuild" -> {
                     options.rebuildTemplate = true;
+                }
+                case "--no-kairos-jfr" -> {
+                    options.kairosJfr = false;
                 }
                 case "--jvm" -> {
                     options.extraJvm = List.of(value(args, ++index, flag).split("\\s+"));

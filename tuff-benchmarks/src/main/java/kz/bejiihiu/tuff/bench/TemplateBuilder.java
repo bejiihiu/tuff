@@ -77,7 +77,7 @@ final class TemplateBuilder {
         Files.createDirectories(template);
         System.out.println("[bench] building the server template from " + identity.jarPath());
         ServerConfig.writeServerFiles(template, options.port, "1337");
-        ServerConfig.writeTuffYml(template, Arm.A, -1, -1, 4);
+        ServerConfig.writeTuffYml(template, Arm.A, -1, -1, 4, false);
         final Path bootLog = template.resolve("template-boot.log");
         final List<String> command = new ArrayList<>();
         command.add(BenchOptions.javaExecutable().toString());

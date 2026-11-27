@@ -16,14 +16,26 @@ import java.util.List;
 final class RunMetrics {
 
     /**
-     * Explains where the primary metric comes from; written into every summary and report.
+     * Source tag of the true primary metric: the scheduler's own per-tick events.
      */
-    static final String HARD_MISS_SOURCE = "sampled_region_aggregate_proxy";
+    static final String JFR_SOURCE = "jfr_per_tick";
 
     /**
-     * The rule behind {@code hard_miss_share}; written into every summary and report.
+     * Source tag of the fallback: the sampled region aggregate.
      */
-    static final String HARD_MISS_DEFINITION =
+    static final String PROXY_SOURCE = "sampled_region_aggregate_proxy";
+
+    /**
+     * The rule behind the true {@code hard_miss_share}; written into every summary and report.
+     */
+    static final String JFR_DEFINITION =
+        "a tick is a hard miss when the handle was more than one period behind (missedPeriods > 1), or when its "
+            + "reconstructible lag reached one tick period (50 ms); skipped counts the periods the handle wrote off";
+
+    /**
+     * The rule behind the fallback metric; written into every summary and report.
+     */
+    static final String PROXY_DEFINITION =
         "a 5 s sample counts as a hard miss when min region TPS < 19.5 or the worst tick of the window >= 50 ms";
 
     /** TPS below which a region lost at least 2.5% of its periods inside the five second window. */
@@ -52,6 +64,8 @@ final class RunMetrics {
      * @param exitCode     server exit code
      * @param stopSeconds  graceful stop duration
      * @param measuredSeconds how much of the requested measurement window the samples cover
+     * @param perTick      scheduler per-tick events of the window, or an absent result
+     * @param perTickRequested whether the arm was supposed to produce per-tick events
      * @param extraReasons reasons found outside the metrics, such as a harness failure
      * @return the summary
      */
@@ -70,6 +84,8 @@ final class RunMetrics {
         final int exitCode,
         final double stopSeconds,
         final double measuredSeconds,
+        final JfrTicks.Result perTick,
+        final boolean perTickRequested,
         final List<String> extraReasons
     ) {
         final List<Sample> measure = samples.stream()
@@ -133,6 +149,38 @@ final class RunMetrics {
             }
         }
 
+        final long periodNanos = JfrTicks.TICK_PERIOD_NANOS;
+        final int tickCount = perTick.ticks().size();
+        int hardMissTicks = 0;
+        long skippedPeriods = 0L;
+        long catchUpTicks = 0L;
+        int exactLagTicks = 0;
+        final long[] lagNanos = new long[tickCount];
+        final long[] tickMsptNanos = new long[tickCount];
+        for (int index = 0; index < tickCount; ++index) {
+            final JfrTicks.Tick tick = perTick.ticks().get(index);
+            if (tick.lagExact()) {
+                lagNanos[exactLagTicks++] = tick.lagNanos(periodNanos);
+            }
+            tickMsptNanos[index] = Math.max(0L, tick.executedNanos());
+            if (tick.hardMiss(periodNanos)) {
+                ++hardMissTicks;
+            }
+            if (tick.skipped() > 0L) {
+                skippedPeriods += tick.skipped();
+            }
+            catchUpTicks += tick.catchUpTicks();
+        }
+        java.util.Arrays.sort(tickMsptNanos);
+        final long[] exactLag = java.util.Arrays.copyOf(lagNanos, exactLagTicks);
+        java.util.Arrays.sort(exactLag);
+        final int lagInexactTicks = tickCount - exactLagTicks;
+        final boolean trueMetric = tickCount > 0;
+        final double proxyShare = measure.isEmpty() ? Double.NaN : hardMisses / (double) measure.size();
+        final double hardMissShare = trueMetric ? hardMissTicks / (double) tickCount : proxyShare;
+        final String source = trueMetric ? JFR_SOURCE : PROXY_SOURCE;
+        final String definition = trueMetric ? JFR_DEFINITION : PROXY_DEFINITION;
+
         final List<String> reasons = new ArrayList<>(guardrails.reasons());
         reasons.addAll(extraReasons);
         if (measure.size() < 2) {
@@ -146,6 +194,9 @@ final class RunMetrics {
         }
         if (!jfr.present()) {
             reasons.add("jfr_unavailable");
+        }
+        if (perTickRequested && !trueMetric) {
+            reasons.add("no_per_tick_events");
         }
         final boolean valid = reasons.isEmpty();
 
@@ -165,15 +216,15 @@ final class RunMetrics {
             options.warmupSeconds,
             options.measureSeconds,
             options.sampleMillis,
-            HARD_MISS_SOURCE,
-            HARD_MISS_DEFINITION,
+            source,
+            definition,
             measure.size(),
             Stats.median(regions),
             Stats.median(entities),
             Stats.median(players),
             Stats.median(chunks),
             hardMisses,
-            measure.isEmpty() ? Double.NaN : hardMisses / (double) measure.size(),
+            hardMissShare,
             measure.isEmpty() ? Double.NaN : late / (double) measure.size(),
             min(minTps),
             Stats.median(minTps),
@@ -203,7 +254,22 @@ final class RunMetrics {
             stopSeconds,
             guardrails.clean(),
             reasons,
-            valid
+            valid,
+            perTickRequested,
+            tickCount,
+            hardMissTicks,
+            proxyShare,
+            skippedPeriods,
+            catchUpTicks,
+            periodNanos,
+            Stats.percentile(exactLag, 0.50d),
+            Stats.percentile(exactLag, 0.95d),
+            Stats.percentile(exactLag, 0.99d),
+            Stats.percentile(exactLag, 0.999d),
+            exactLag.length == 0 ? Double.NaN : exactLag[exactLag.length - 1],
+            Stats.percentile(tickMsptNanos, 0.99d),
+            perTick.fund().size(),
+            lagInexactTicks
         );
     }
 
