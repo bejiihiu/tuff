@@ -24,6 +24,8 @@ import kz.bejiihiu.tuff.threads.kairos.KairosServices;
 import kz.bejiihiu.tuff.threads.kairos.KairosSnapshot;
 import kz.bejiihiu.tuff.threads.kairos.KairosSupervisorSource;
 import kz.bejiihiu.tuff.threads.kairos.KairosTuning;
+import kz.bejiihiu.tuff.threads.observe.JfrTickObserver;
+import kz.bejiihiu.tuff.threads.observe.TickObservers;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureMonitor;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
 import kz.bejiihiu.tuff.threads.probe.BackgroundPoolProbe;
@@ -164,6 +166,13 @@ public final class ThreadsBootstrap {
                         1_000L
                     )
                 );
+                // per-tick recording belongs to every scheduler, so it is armed here rather than by
+                // the Kairos gate; off means the tick path reads one volatile reference and nothing else
+                if (region.metricsJfr()) {
+                    TickObservers.install(JfrTickObserver.INSTANCE);
+                } else {
+                    TickObservers.uninstall();
+                }
                 if (result.missingFile()) {
                     // the thread layer starts before the compute engine, which is what writes the template
                     LOGGER.info("Thread config: {} does not exist yet; using the observe-only defaults",
@@ -205,6 +214,7 @@ public final class ThreadsBootstrap {
             } catch (final Throwable ex) {
                 this.runtime = null;
                 RegionThreads.clear();
+                TickObservers.uninstall();
                 final ThreadsSampler partial = this.sampler;
                 this.sampler = null;
                 if (partial != null) {
@@ -241,6 +251,7 @@ public final class ThreadsBootstrap {
             // before the runtime stops: no new region body may be wrapped while the manager is going down
             RegionThreads.clear();
             KairosGate.disarm();
+            TickObservers.uninstall();
             this.kairosServices = KairosServices.none();
             // flag + interrupt, no join: this runs in the window where the watchdog is still armed and
             // a blocking wait would look like a hung server. The thread is a daemon and exits on its own

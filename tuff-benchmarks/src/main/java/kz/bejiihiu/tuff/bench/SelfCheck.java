@@ -186,7 +186,8 @@ final class SelfCheck {
                     "startTime": "2026-01-01T00:00:02+00:00",
                     "regionId": 7,
                     "tickId": 11,
-                    "scheduledStartNanos": 100000000,
+                    "origin": "EDF",
+                    "scheduledStartNanos": 50000000,
                     "startNanos": 50400000,
                     "endNanos": 51000000,
                     "missedPeriods": 1,
@@ -200,9 +201,10 @@ final class SelfCheck {
                     "startTime": "2026-01-01T00:00:02+00:00",
                     "regionId": 8,
                     "tickId": 12,
-                    "scheduledStartNanos": 150000000,
-                    "startNanos": 100500000,
-                    "endNanos": 101000000,
+                    "origin": "EDF",
+                    "scheduledStartNanos": 100000000,
+                    "startNanos": 150500000,
+                    "endNanos": 151000000,
                     "missedPeriods": 2,
                     "catchUpTicks": 0,
                     "skipped": 1,
@@ -252,11 +254,13 @@ final class SelfCheck {
         require(result.fund().size() == 1, "the fund pass inside the window must be kept");
         final JfrTicks.Tick onTime = result.ticks().get(0);
         require(onTime.regionId() == 7L, "region id");
-        require(onTime.lagExact(), "a body that finished before the next deadline has an exact lag");
-        require(onTime.lagNanos(JfrTicks.TICK_PERIOD_NANOS) == 400_000L, "lag is measured against the advanced deadline");
+        require(onTime.origin().equals("EDF"), "origin is read from the event");
+        require(onTime.lagExact(), "the event carries the pre-advance deadline, so every lag is exact");
+        require(onTime.lagNanos() == 400_000L, "lag is start minus the pre-advance deadline");
         require(!onTime.hardMiss(JfrTicks.TICK_PERIOD_NANOS), "an on-time tick is not a hard miss");
         final JfrTicks.Tick behind = result.ticks().get(1);
         require(behind.missedPeriods() == 2L, "periods ahead are kept");
+        require(behind.lagNanos() == 50_500_000L, "a body that started after its deadline has a positive lag");
         require(behind.hardMiss(JfrTicks.TICK_PERIOD_NANOS), "more than one period behind is a hard miss");
         require(behind.skipped() == 1L, "skipped periods");
         final JfrTicks.Fund pass = result.fund().getFirst();

@@ -1397,18 +1397,12 @@ public final class KairosScheduler extends Scheduler {
      */
     private void prepareBody(final ScheduledState tick) {
         final KairosKernel knobs = this.kernel;
-        tick.catchUpBody = false;
-        if (!knobs.catchUp() && !this.jfr) {
+        if (!knobs.catchUp()) {
             // the stock path: no seam call, no bookkeeping, exactly what the ported scheduler did
-            tick.bodyMissedPeriods = -1L;
             return;
         }
         final long now = this.clock.getAsLong();
         final long behind = this.ticks.missedPeriods().applyAsLong(tick.tick);
-        tick.bodyMissedPeriods = behind;
-        if (!knobs.catchUp()) {
-            return;
-        }
         if (behind < 2L) {
             // on time: hand the handle back to the stock mode, but only if a burst happened, so an
             // ordinary tick never touches the seam at all
@@ -1431,40 +1425,8 @@ public final class KairosScheduler extends Scheduler {
             return;
         }
         ++tick.burstBodies;
-        tick.catchUpBody = true;
         this.catchUpTicks.increment();
         this.ticks.writeOffLimit().accept(tick.tick, 1L);
-    }
-
-    /**
-     * Records one executed body for a flight recording, if one is armed.
-     *
-     * <p>Called on the runner thread right after the body returned. The switch is checked before
-     * anything else, so a server that does not record does not pay the region lookup, the seam call or
-     * the event allocation.
-     *
-     * @param tick   tick that just ran
-     * @param start  when the body started, {@link System#nanoTime()} terms
-     * @param end    when the body returned
-     */
-    private void recordTick(final ScheduledState tick, final long start, final long end) {
-        if (!this.jfr) {
-            return;
-        }
-        final long missed = tick.bodyMissedPeriods;
-        final long skipped = missed < 0L
-            ? -1L
-            : (tick.catchUpBody ? 0L : Math.max(0L, missed - 1L));
-        KairosTickEvent.emit(
-            regionId(tick.tick),
-            tick.tick.id,
-            this.scheduledStart.applyAsLong(tick.tick),
-            start,
-            end,
-            missed,
-            tick.catchUpBody ? 1 : 0,
-            skipped
-        );
     }
 
     /**
@@ -2320,12 +2282,6 @@ public final class KairosScheduler extends Scheduler {
         /** When the current catch-up burst started; runner thread only. */
         private long burstStartNanos;
 
-        /** Periods the handle reported before the body, or {@code -1}; runner thread only. */
-        private long bodyMissedPeriods = -1L;
-
-        /** Whether the body about to run accounts for a single period; runner thread only. */
-        private boolean catchUpBody;
-
         private ScheduledState(final SchedulableTick tick) {
             this.tick = tick;
         }
@@ -2722,13 +2678,9 @@ public final class KairosScheduler extends Scheduler {
 
                         // the body may be a catch-up body; the decision is made before the handle moves
                         this.scheduler.prepareBody(startStateTask);
-                        final long bodyStart = System.nanoTime();
 
                         // failures reach Folia's uncaught handler, which halts and stops the server
                         final boolean reschedule = startStateTask.tick.runTick();
-                        final long bodyEnd = System.nanoTime();
-
-                        this.scheduler.recordTick(startStateTask, bodyStart, bodyEnd);
                         this.returnTask(startStateTask, reschedule);
                     }
 

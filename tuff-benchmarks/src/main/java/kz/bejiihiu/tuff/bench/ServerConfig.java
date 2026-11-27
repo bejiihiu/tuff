@@ -121,7 +121,7 @@ final class ServerConfig {
      * @param threads    floor of the fund, also the EDF thread count
      * @param maxThreads ceiling for an elastic arm
      * @param gridExp    region grid exponent
-     * @param kairosJfr  whether the scheduler should emit its per-tick and per-pass JFR events
+     * @param tickJfr    whether the scheduler should emit its per-tick and per-pass JFR events
      * @throws IOException if the file cannot be written
      */
     static void writeTuffYml(
@@ -130,7 +130,7 @@ final class ServerConfig {
         final int threads,
         final int maxThreads,
         final int gridExp,
-        final boolean kairosJfr
+        final boolean tickJfr
     ) throws IOException {
         final String yaml = """
             thread-management:
@@ -147,13 +147,15 @@ final class ServerConfig {
                 threads: {threads}
                 grid-exponent: {grid}
                 kairos-unstable: {unstable}
+                metrics:
+                  jfr: {tick_jfr}
                 kairos:
                   elastic: {elastic}
                   max-threads: {max}
                   keep-alive-seconds: 30
                   spawn-rate-per-second: 10
                   metrics:
-                    jfr: {jfr}
+                    jfr: {tick_jfr}
               metrics:
                 enabled: true
                 per-pool: true
@@ -167,7 +169,7 @@ final class ServerConfig {
             .replace("{unstable}", Boolean.toString(arm.kairosOptIn()))
             .replace("{elastic}", Boolean.toString(arm.elastic()))
             .replace("{max}", Integer.toString(arm.elastic() ? maxThreads : -1))
-            .replace("{jfr}", Boolean.toString(kairosJfr));
+            .replace("{tick_jfr}", Boolean.toString(tickJfr));
         final Path config = runDir.resolve("config");
         Files.createDirectories(config);
         Files.writeString(config.resolve("tuff.yml"), yaml, StandardCharsets.UTF_8);

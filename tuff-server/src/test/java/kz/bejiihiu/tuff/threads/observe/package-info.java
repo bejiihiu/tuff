@@ -1,5 +1,6 @@
 /**
- * Tests that the observe-only thread layer is invisible to everything else.
+ * Tests that the observe-only thread layer is invisible to everything else, plus the scheduler
+ * independent tick observation.
  *
  * <p>The package holds the cross-cutting checks: the compute engine keeps its own threads and budget,
  * and the server files the project patches keep exactly the hooks they already had. The lifecycle and

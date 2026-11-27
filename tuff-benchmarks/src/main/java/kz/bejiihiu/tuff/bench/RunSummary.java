@@ -23,6 +23,7 @@ record RunSummary(
     String arm,
     String profile,
     String scheduler,
+    String tickOrigin,
     boolean elastic,
     int threads,
     int maxThreads,
@@ -108,6 +109,7 @@ record RunSummary(
         map.put("arm", this.arm);
         map.put("profile", this.profile);
         map.put("scheduler", this.scheduler);
+        map.put("tick_origin", this.tickOrigin);
         map.put("elastic", this.elastic);
         map.put("threads", this.threads);
         map.put("max_threads", this.maxThreads);
@@ -192,6 +194,7 @@ record RunSummary(
             Json.string(map, "arm", ""),
             Json.string(map, "profile", ""),
             Json.string(map, "scheduler", ""),
+            Json.string(map, "tick_origin", ""),
             Json.bool(map, "elastic", false),
             (int) Json.integer(map, "threads", -1),
             (int) Json.integer(map, "max_threads", -1),

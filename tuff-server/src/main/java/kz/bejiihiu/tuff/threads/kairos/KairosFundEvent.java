@@ -16,8 +16,8 @@ import jdk.jfr.StackTrace;
  * counters - next to the per-tick events. That is what a stand needs to explain a hard miss: was the
  * permit missing because the fund had no headroom, or because a tick was slow?
  *
- * <p>Armed by {@code kairos.metrics.jfr} on top of the recording's own filter, exactly like the
- * per-tick event.
+ * <p>Armed by {@code region-execution.kairos.metrics.jfr} on top of the recording's own filter. The
+ * per-tick event belongs to the region handle and has a separate switch.
  */
 @Name("tuff.scheduler.Fund")
 @Label("Kairos Fund")

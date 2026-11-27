@@ -157,6 +157,7 @@ final class JfrTicks {
         return new Tick(
             integer(values, "regionId", -1L),
             integer(values, "tickId", -1L),
+            text(values, "origin", ""),
             integer(values, "scheduledStartNanos", -1L),
             integer(values, "startNanos", -1L),
             integer(values, "endNanos", -1L),
@@ -190,6 +191,10 @@ final class JfrTicks {
 
     private static long integer(final Map<?, ?> map, final String key, final long fallback) {
         return map.get(key) instanceof final Number number ? number.longValue() : fallback;
+    }
+
+    private static String text(final Map<?, ?> map, final String key, final String fallback) {
+        return map.get(key) instanceof final String value ? value : fallback;
     }
 
     private static long epoch(final Object value) {
@@ -296,18 +301,21 @@ final class JfrTicks {
      *
      * @param regionId            region of the tick, or {@code -1}
      * @param tickId              id of the scheduled tick
-     * @param scheduledStartNanos deadline the body was measured against
+     * @param origin              scheduler that ran the body, or the empty string on a recording that
+     *                            predates the field
+     * @param scheduledStartNanos deadline the body was measured against, before the handle advanced
      * @param startNanos          moment the body started
      * @param endNanos            moment the body returned
-     * @param missedPeriods       whole periods the handle was behind, or {@code -1}
+     * @param missedPeriods       whole periods the handle was behind; one is on time
      * @param catchUpTicks        {@code 1} for a catch-up body
-     * @param skipped             periods written off, or {@code -1}
+     * @param skipped             periods written off
      * @param executedNanos       wall clock spent in the body
      * @param epochMillis         event time, epoch milliseconds
      */
     record Tick(
         long regionId,
         long tickId,
+        String origin,
         long scheduledStartNanos,
         long startNanos,
         long endNanos,
@@ -319,46 +327,43 @@ final class JfrTicks {
     ) {
 
         /**
-         * Returns whether the recorded deadline allows an exact lag.
+         * Returns whether the recorded deadline is the exact one the body ran against.
          *
-         * <p>The handle advances its scheduled start inside the body, so the value recorded after the
-         * body is the next deadline (advanced by {@link #missedPeriods()} periods), unless the body
-         * itself finished after that deadline. In the latter case the recorded value is the body end
-         * and the original deadline is not recoverable from this event.
+         * <p>The handle records the deadline before it advances the schedule, so every row carries the
+         * exact value. The method is kept so the artifact schema and older readers stay compatible, and
+         * it is always {@code true}.
          *
-         * @return {@code true} when the lag can be reconstructed exactly
+         * @return {@code true}
          */
         boolean lagExact() {
-            return this.missedPeriods >= 0L && this.endNanos <= this.scheduledStartNanos;
+            return true;
         }
 
         /**
          * Returns the lag of the body against the deadline it actually ran against.
          *
-         * <p>Reconstruction: the recorded start is the deadline after the advance, so the deadline the
-         * body ran against is {@code scheduledStartNanos - missedPeriods * period}. It is only valid
-         * when {@link #lagExact()} holds; callers must not mix inexact rows into a distribution.
+         * <p>No reconstruction is involved: the event carries the pre-advance deadline, so the lag is
+         * the raw distance between the body start and that deadline.
          *
-         * @param periodNanos the tick period
          * @return nanoseconds late, never negative
          */
-        long lagNanos(final long periodNanos) {
-            return Math.max(0L, this.startNanos - this.scheduledStartNanos + this.missedPeriods * periodNanos);
+        long lagNanos() {
+            return Math.max(0L, this.startNanos - this.scheduledStartNanos);
         }
 
         /**
          * Returns whether this body counts as a hard miss.
          *
          * <p>The event's {@code missedPeriods} field is the handle's periods ahead at the body start, so
-         * a value above one already means a whole period was lost. The exact lag is used as a second
-         * signal when it is reconstructible.
+         * a value above one already means a whole period was lost; a lag of one full period is the
+         * second signal.
          *
          * @param periodNanos the tick period
          * @return {@code true} when the lag reached a whole period or the handle was more than one
          *     period behind
          */
         boolean hardMiss(final long periodNanos) {
-            return this.missedPeriods > 1L || (this.lagExact() && this.lagNanos(periodNanos) >= periodNanos);
+            return this.missedPeriods > 1L || this.lagNanos() >= periodNanos;
         }
     }
 

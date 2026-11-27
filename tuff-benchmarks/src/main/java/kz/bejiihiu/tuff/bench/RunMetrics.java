@@ -30,7 +30,8 @@ final class RunMetrics {
      */
     static final String JFR_DEFINITION =
         "a tick is a hard miss when the handle was more than one period behind (missedPeriods > 1), or when its "
-            + "reconstructible lag reached one tick period (50 ms); skipped counts the periods the handle wrote off";
+            + "lag against the pre-advance deadline reached one tick period (50 ms); skipped counts the periods "
+            + "the handle wrote off";
 
     /**
      * The rule behind the fallback metric; written into every summary and report.
@@ -154,14 +155,15 @@ final class RunMetrics {
         int hardMissTicks = 0;
         long skippedPeriods = 0L;
         long catchUpTicks = 0L;
-        int exactLagTicks = 0;
+        String tickOrigin = "";
         final long[] lagNanos = new long[tickCount];
         final long[] tickMsptNanos = new long[tickCount];
         for (int index = 0; index < tickCount; ++index) {
             final JfrTicks.Tick tick = perTick.ticks().get(index);
-            if (tick.lagExact()) {
-                lagNanos[exactLagTicks++] = tick.lagNanos(periodNanos);
+            if (tickOrigin.isEmpty() && !tick.origin().isEmpty()) {
+                tickOrigin = tick.origin();
             }
+            lagNanos[index] = tick.lagNanos();
             tickMsptNanos[index] = Math.max(0L, tick.executedNanos());
             if (tick.hardMiss(periodNanos)) {
                 ++hardMissTicks;
@@ -172,9 +174,7 @@ final class RunMetrics {
             catchUpTicks += tick.catchUpTicks();
         }
         java.util.Arrays.sort(tickMsptNanos);
-        final long[] exactLag = java.util.Arrays.copyOf(lagNanos, exactLagTicks);
-        java.util.Arrays.sort(exactLag);
-        final int lagInexactTicks = tickCount - exactLagTicks;
+        java.util.Arrays.sort(lagNanos);
         final boolean trueMetric = tickCount > 0;
         final double proxyShare = measure.isEmpty() ? Double.NaN : hardMisses / (double) measure.size();
         final double hardMissShare = trueMetric ? hardMissTicks / (double) tickCount : proxyShare;
@@ -205,6 +205,7 @@ final class RunMetrics {
             arm.label(),
             options.profile.cli(),
             arm.scheduler(),
+            tickOrigin,
             arm.elastic(),
             options.threads,
             arm.elastic() ? options.maxThreads : options.threads,
@@ -262,14 +263,14 @@ final class RunMetrics {
             skippedPeriods,
             catchUpTicks,
             periodNanos,
-            Stats.percentile(exactLag, 0.50d),
-            Stats.percentile(exactLag, 0.95d),
-            Stats.percentile(exactLag, 0.99d),
-            Stats.percentile(exactLag, 0.999d),
-            exactLag.length == 0 ? Double.NaN : exactLag[exactLag.length - 1],
+            Stats.percentile(lagNanos, 0.50d),
+            Stats.percentile(lagNanos, 0.95d),
+            Stats.percentile(lagNanos, 0.99d),
+            Stats.percentile(lagNanos, 0.999d),
+            lagNanos.length == 0 ? Double.NaN : lagNanos[lagNanos.length - 1],
             Stats.percentile(tickMsptNanos, 0.99d),
             perTick.fund().size(),
-            lagInexactTicks
+            0
         );
     }
 

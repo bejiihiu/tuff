@@ -79,17 +79,19 @@ One block directory additionally contains `summary.csv`, `compare.csv`, `summary
 
 ## What the numbers mean
 
-`hard miss` is the primary metric. On the arms that run the Kairos scheduler it is the true per-tick
-value, read from the scheduler's own `tuff.scheduler.Tick` events:
+`hard miss` is the primary metric. Every scheduler arm produces the true per-tick value, read from
+`tuff.scheduler.Tick`:
 
 ```text
 hard miss (per tick) := lag >= one tick period (50 ms)  or  periodsAhead > 1
 ```
 
-An EDF arm does not emit that event, so a comparison that involves it falls back to the sampled region
-aggregate, where a sample counts as a hard miss when `min TPS < 19.5` or the worst tick of the window is
-at least 50 ms. The summary and every row of `summary.csv` carry the source that produced the number
-(`jfr_per_tick` or `sampled_region_aggregate_proxy`), and a pair of arms is never mixed across the two.
+The event is written by the region handle for EDF, work stealing and Kairos alike, and carries the
+deadline the body was measured against before the handle advanced the schedule. A run made with the
+per-tick switch off falls back to the sampled region aggregate, where a sample counts as a hard miss
+when `min TPS < 19.5` or the worst tick of the window is at least 50 ms. The summary and every row of
+`summary.csv` carry the source that produced the number (`jfr_per_tick` or
+`sampled_region_aggregate_proxy`), and a pair of arms is never mixed across the two.
 See [harness.md](harness.md) for the full list of what the stand does and does not observe.
 
 Secondary metrics are the distribution of the per-sample average and peak MSPT, the lowest region TPS,

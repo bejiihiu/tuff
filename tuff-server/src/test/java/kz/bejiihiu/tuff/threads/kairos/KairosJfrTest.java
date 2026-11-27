@@ -12,16 +12,15 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * The two recording events that turn a per-region average into a real hard miss.
+ * The Kairos fund recording.
  *
- * <p>A recording stream is a real JFR recording, so the test also proves the switch is what arms the
- * code: with the switch off the very same recording sees nothing, which is the promise that an
- * unrecorded server does not pay for the event.
+ * <p>Only the fund event belongs to this scheduler: the per-tick {@code tuff.scheduler.Tick} event is
+ * written by the region handle for every scheduler, so the fund must not write a second row for the
+ * same body. A real recording stream also proves the switch is what arms the code.
  */
 @Timeout(120)
 class KairosJfrTest {
@@ -38,37 +37,6 @@ class KairosJfrTest {
             assertTrue(this.scheduler.join(10_000L), "halt must stop every thread of the fund");
         }
         KairosGate.disarm();
-    }
-
-    @Test
-    void everyExecutedTickIsRecordedWithItsDeadline() throws Exception {
-        final List<RecordedEvent> ticks = Collections.synchronizedList(new ArrayList<>());
-        try (RecordingStream stream = new RecordingStream()) {
-            stream.onEvent("tuff.scheduler.Tick", ticks::add);
-            stream.startAsync();
-            // the recording has to register the event before the first body, otherwise isEnabled() is
-            // still false for that body and the test would measure the race, not the behaviour
-            Thread.sleep(100L);
-
-            final KairosScheduler fixed = this.fund(new KairosKernel(1, 50, 0, 3, 0, true));
-            final CatchUpTick tick = new CatchUpTick("recorded", PERIOD, 4L, System::nanoTime, null, 0L).stopAfter(1);
-            fixed.schedule(tick);
-            fixed.start();
-            assertTrue(awaitEvent(ticks, 1, 5_000L), "the tick must be recorded");
-
-            final RecordedEvent event = ticks.getFirst();
-            assertEquals(tick.id, event.getLong("tickId"));
-            assertEquals(-1L, event.getLong("regionId"), "a fake tick has no region");
-            assertTrue(event.getLong("startNanos") > 0L);
-            assertTrue(event.getLong("endNanos") >= event.getLong("startNanos"));
-            assertTrue(event.getLong("executedNanos") >= 0L);
-            assertTrue(
-                event.getLong("missedPeriods") >= 2L,
-                "the handle is several periods behind and the event must say so: " + event
-            );
-            assertEquals(0, event.getInt("catchUpTicks"), "catch-up is off in this fund");
-            assertTrue(event.getLong("skipped") >= 1L, "the stock body wrote periods off: " + event);
-        }
     }
 
     @Test
@@ -97,24 +65,21 @@ class KairosJfrTest {
     }
 
     @Test
-    void theSwitchOffRecordsNothing() throws Exception {
+    void theFundDoesNotEmitItsOwnTickEvent() throws Exception {
         final List<RecordedEvent> ticks = Collections.synchronizedList(new ArrayList<>());
         try (RecordingStream stream = new RecordingStream()) {
             stream.onEvent("tuff.scheduler.Tick", ticks::add);
             stream.startAsync();
             Thread.sleep(100L);
 
-            final KairosScheduler fixed = this.fund(new KairosKernel(1, 50, 0, 3, 0, false));
-            final CatchUpTick tick = new CatchUpTick("silent", PERIOD, 0L, System::nanoTime, null, 0L).stopAfter(2);
-
+            final KairosScheduler fixed = this.fund(new KairosKernel(1, 50, 0, 3, 0, true));
+            final CatchUpTick tick = new CatchUpTick("recorded", PERIOD, 4L, System::nanoTime, null, 0L).stopAfter(1);
             fixed.schedule(tick);
             fixed.start();
             assertTrue(tick.awaitBodies(1, 5_000L), "the tick must run");
             Thread.sleep(300L);
 
-            assertTrue(ticks.isEmpty(), "the recording was enabled but the fund must not fill it: " + ticks);
-            assertFalse(KairosGate.kernel().jfr());
-
+            assertTrue(ticks.isEmpty(), "the region handle owns the tick event, the fund must not duplicate it: " + ticks);
         }
     }
 

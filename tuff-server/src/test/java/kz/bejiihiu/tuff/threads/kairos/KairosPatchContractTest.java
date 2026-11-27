@@ -49,7 +49,7 @@ class KairosPatchContractTest {
         Assumptions.assumeTrue(Files.isRegularFile(file), "applied source not present: " + file);
         final String source = Files.readString(file, StandardCharsets.UTF_8);
 
-        assertEquals(1, count(source, "\n        KAIROS\n"), "KAIROS belongs in the enum exactly once");
+        assertEquals(1, count(source, "\n        KAIROS"), "KAIROS belongs in the enum exactly once");
         assertEquals(1, count(source, "case KAIROS:"), "one switch case creates the scheduler");
         assertEquals(1, count(source, "new kz.bejiihiu.tuff.threads.kairos.KairosScheduler("),
             "the facade builds one Kairos instance");
@@ -68,6 +68,17 @@ class KairosPatchContractTest {
             "the facade wires the handle side of catch up once");
         assertEquals(1, count(source, "writeOff <= 0L ? periodsAhead : Math.min(periodsAhead, writeOff)"),
             "the write off stays a single clamped expression in runTick");
+        assertEquals(1, count(source, "TickObservers.observer()"),
+            "the tick path reads the observer exactly once");
+        assertEquals(1, count(source, "tickObserver.onTick("),
+            "one observation per executed body");
+        final int observation = source.indexOf("tickObserver.onTick(");
+        assertTrue(observation > source.lastIndexOf("final long tickEnd = System.nanoTime();"),
+            "the observation must see the measured body end");
+        assertTrue(observation > source.lastIndexOf("this.addTickTime(time);"),
+            "the observation must run after the body was accounted");
+        assertTrue(observation < source.indexOf("// Only AFTER updating the tickStart"),
+            "the observation must stay inside the per-body finally block");
     }
 
     private static int count(final String haystack, final String needle) {

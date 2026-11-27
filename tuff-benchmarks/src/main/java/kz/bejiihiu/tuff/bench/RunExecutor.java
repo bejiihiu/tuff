@@ -66,7 +66,7 @@ final class RunExecutor {
         TemplateBuilder.deleteTree(runDir);
         ServerConfig.copyTemplate(this.template, runDir);
         ServerConfig.writeServerFiles(runDir, port, "1337");
-        ServerConfig.writeTuffYml(runDir, this.arm, this.options.threads, this.options.maxThreads, 4, this.options.kairosJfr);
+        ServerConfig.writeTuffYml(runDir, this.arm, this.options.threads, this.options.maxThreads, 4, this.options.tickJfr);
         ServerConfig.patchPaperGlobal(runDir, this.arm, this.options.threads, 4);
 
         final List<String> flags = BenchOptions.jvmFlags(runDir, this.options.heap, this.options.extraJvm);
@@ -152,7 +152,7 @@ final class RunExecutor {
         final Path recording = runDir.resolve("jfr").resolve("recording.jfr");
         final JfrFacts.Facts jfr = JfrFacts.read(recording, from, to);
         final JfrTicks.Result perTick = JfrTicks.read(recording, JfrTicks.tool(), from, to);
-        final boolean perTickRequested = this.arm.kairosOptIn() && this.options.kairosJfr;
+        final boolean perTickRequested = this.options.tickJfr;
         final Guardrails.Result guardrails = Guardrails.inspect(log, exitCode);
         final double measuredSeconds = measureStartEpoch < 0L || measureEndEpoch < 0L
             ? 0.0d
@@ -199,7 +199,7 @@ final class RunExecutor {
         manifest.put("hard_miss_ticks", summary.hardMissTicks());
         manifest.put("ticks", summary.ticks());
         manifest.put("skipped_periods", summary.skippedPeriods());
-        manifest.put("kairos_jfr", this.options.kairosJfr);
+        manifest.put("tick_jfr", this.options.tickJfr);
         manifest.put("per_tick_requested", perTickRequested);
         manifest.put("fund_passes", perTick.fund().size());
         manifest.put("guardrails", guardrails.evidence());
@@ -235,7 +235,7 @@ final class RunExecutor {
             -1.0d,
             0.0d,
             JfrTicks.Result.absent("log unreadable"),
-            this.arm.kairosOptIn() && this.options.kairosJfr,
+            this.options.tickJfr,
             List.of("log_unreadable: " + reason)
         );
         Artifacts.writeTicks(Artifacts.ticks(runDir), runId, JfrTicks.Result.absent("log unreadable"), -1L);

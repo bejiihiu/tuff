@@ -251,11 +251,12 @@ class ThreadsConfigParserTest {
     void flattenCoversEveryKeyOfTheSection() throws IOException, InvalidConfigurationException {
         final Map<String, String> flat = ThreadsConfigParser.flatten(parse(template()).settings());
 
-        assertEquals(36, flat.size(), () -> "unexpected key count: " + flat.keySet());
+        assertEquals(37, flat.size(), () -> "unexpected key count: " + flat.keySet());
         assertEquals("true", flat.get("thread-management.enabled"));
         assertEquals("false", flat.get("thread-management.resources.load-shedding"));
         assertEquals("edf", flat.get("thread-management.region-execution.scheduler"));
         assertEquals("-1", flat.get("thread-management.region-execution.threads"));
+        assertEquals("false", flat.get("thread-management.region-execution.metrics.jfr"));
         assertEquals("false", flat.get("thread-management.region-execution.kairos.elastic"));
         assertEquals("-1", flat.get("thread-management.region-execution.kairos.max-threads"));
         assertEquals("30", flat.get("thread-management.region-execution.kairos.keep-alive-seconds"));
@@ -265,6 +266,27 @@ class ThreadsConfigParserTest {
         assertEquals("false", flat.get("thread-management.async-compute.tick-pressure.enabled"));
         assertEquals("0.25", flat.get("thread-management.async-compute.tick-pressure.enter-lag-fraction"));
         assertEquals("19.5", flat.get("thread-management.async-compute.tick-pressure.exit-min-tps"));
+    }
+
+    @Test
+    void regionTickRecordingIsArmedSeparatelyFromTheKairosFund() throws IOException, InvalidConfigurationException {
+        final Parsed armed = parse("""
+            thread-management:
+              region-execution:
+                metrics:
+                  jfr: true
+            """);
+        assertTrue(armed.problems().isEmpty(), () -> "unexpected problems: " + armed.problems());
+        assertTrue(armed.settings().regionExecution().metricsJfr());
+
+        final YamlConfiguration configuration = template();
+        configuration.set("thread-management.region-execution.metrics.jfr", "maybe");
+        final List<ConfigProblem> problems = new ArrayList<>();
+        final ThreadManagementSettings settings = ThreadsConfigParser.parse(configuration, problems);
+
+        assertFalse(settings.regionExecution().metricsJfr(), "a bad value must fall back to off");
+        assertEquals(1, problems.size(), () -> "expected one problem, got " + problems);
+        assertEquals("thread-management.region-execution.metrics.jfr", problems.getFirst().key());
     }
 
     @Test

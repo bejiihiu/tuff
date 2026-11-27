@@ -105,7 +105,8 @@ final class Analysis {
             // the A/A row is calibration, not a treatment
             if (!byArm.getOrDefault(Arm.A2.label(), List.of()).isEmpty() && options.baseline == Arm.A) {
                 final Map<String, Object> row = compare(
-                    metric, "A2", byArm.get(Arm.A2.label()), baselineRuns, options, false, proxySigma
+                    metric, "A2", byArm.get(Arm.A2.label()), baselineRuns, options,
+                    hasPerTick(byArm.get(Arm.A2.label())) && hasPerTick(baselineRuns), proxySigma
                 );
                 if (row != null) {
                     row.put("verdict", "noise_band");
@@ -342,8 +343,14 @@ final class Analysis {
         noise.put("n_baseline", baseline.size());
         noise.put("n_repeat", repeat.size());
         if (!baseline.isEmpty() && !repeat.isEmpty()) {
-            final double[] baselineValues = values(baseline, RunSummary::proxyHardMissShare);
-            final double[] repeatValues = values(repeat, RunSummary::proxyHardMissShare);
+            // once both baseline runs produced per-tick rows, the calibration is the true metric
+            final boolean perTickPair = hasPerTick(baseline) && hasPerTick(repeat);
+            final ToDoubleFunction<RunSummary> extractor = perTickPair
+                ? RunSummary::hardMissShare
+                : RunSummary::proxyHardMissShare;
+            final double[] baselineValues = values(baseline, extractor);
+            final double[] repeatValues = values(repeat, extractor);
+            noise.put("aa_source", perTickPair ? RunMetrics.JFR_SOURCE : RunMetrics.PROXY_SOURCE);
             final Stats.Interval interval = Stats.bootstrapDifference(
                 repeatValues,
                 baselineValues,
@@ -546,16 +553,17 @@ final class Analysis {
         out.append('\n');
         out.append("True definition: ").append(RunMetrics.JFR_DEFINITION).append(".\n\n");
         out.append("Fallback definition: ").append(RunMetrics.PROXY_DEFINITION).append(".\n\n");
-        out.append("A pair is compared on the true metric only when both arms produced per-tick events. ")
-            .append("An EDF arm has no per-tick source, so comparisons against it use the fallback that both ")
-            .append("arms can produce; the `source` column of every row says which one was used.\n\n");
+        out.append("A pair is compared on the true metric when both arms produced per-tick events. Every ")
+            .append("scheduler arm can produce them, so the fallback only applies to a run whose recording ")
+            .append("was off or missing; the `source` column of every row says which one was used.\n\n");
 
         out.append("## Runs\n\n");
-        out.append("| run | arm | threads | valid | hard miss | ticks | skipped | p99 avg MSPT | min TPS | exit |\n");
-        out.append("|---|---|---|---|---|---|---|---|---|---|\n");
+        out.append("| run | arm | origin | threads | valid | hard miss | ticks | skipped | p99 avg MSPT | min TPS | exit |\n");
+        out.append("|---|---|---|---|---|---|---|---|---|---|---|\n");
         for (final RunSummary summary : summaries) {
             out.append("| ").append(summary.runId())
                 .append(" | ").append(summary.arm())
+                .append(" | ").append(summary.tickOrigin().isEmpty() ? "unknown" : summary.tickOrigin())
                 .append(" | ").append(summary.threads()).append('/').append(summary.maxThreads())
                 .append(" | ").append(summary.valid() ? "yes" : "no")
                 .append(" | ").append(Artifacts.percent(summary.hardMissShare()))
@@ -582,8 +590,8 @@ final class Analysis {
 
         out.append("## A/A calibration\n\n");
         if (Boolean.TRUE.equals(noise.get("aa_present"))) {
-            out.append("The baseline arm was measured twice on the sampled fallback (the only source an EDF ")
-                .append("arm can produce). The noise band on the primary metric is ");
+            out.append("The baseline arm was measured twice. The noise band on the primary metric (source `")
+                .append(noise.get("aa_source")).append("`) is ");
             out.append('[').append(Artifacts.decimal(noise.get("hard_miss_delta_low") instanceof final Number low
                 ? low.doubleValue() : Double.NaN)).append(", ")
                 .append(Artifacts.decimal(noise.get("hard_miss_delta_high") instanceof final Number high

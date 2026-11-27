@@ -24,7 +24,7 @@ final class Artifacts {
             + "max_mspt_15s,min_tps,lag_pct,lagging_regions,entities,players,chunks";
 
     private static final String TICKS_HEADER =
-        "run_id,seq,epoch_ms,elapsed_ms,region_id,tick_id,scheduled_start_ns,start_ns,end_ns,"
+        "run_id,seq,epoch_ms,elapsed_ms,region_id,tick_id,origin,scheduled_start_ns,start_ns,end_ns,"
             + "lag_ns,lag_exact,missed_periods,catch_up,skipped,executed_ns,hard_miss";
 
     private static final String FUND_HEADER =
@@ -60,10 +60,11 @@ final class Artifacts {
                 .append(tick.epochMillis() - origin).append(',')
                 .append(tick.regionId()).append(',')
                 .append(tick.tickId()).append(',')
+                .append(escape(tick.origin())).append(',')
                 .append(tick.scheduledStartNanos()).append(',')
                 .append(tick.startNanos()).append(',')
                 .append(tick.endNanos()).append(',')
-                .append(tick.lagNanos(JfrTicks.TICK_PERIOD_NANOS)).append(',')
+                .append(tick.lagNanos()).append(',')
                 .append(tick.lagExact() ? 1 : 0).append(',')
                 .append(tick.missedPeriods()).append(',')
                 .append(tick.catchUpTicks()).append(',')
@@ -254,6 +255,7 @@ final class Artifacts {
         out.append("| metric | value |\n|---|---|\n");
         if (summary.ticks() > 0) {
             row(out, "ticks in window", Integer.toString(summary.ticks()));
+            row(out, "tick origin", summary.tickOrigin());
             row(out, "hard miss ticks", Integer.toString(summary.hardMissTicks()));
             row(out, "hard miss share", percent(summary.hardMissShare()));
             row(out, "skipped periods", Long.toString(summary.skippedPeriods()));
@@ -263,7 +265,6 @@ final class Artifacts {
             row(out, "lag p99", nanos(summary.lagP99Nanos()));
             row(out, "lag p99.9", nanos(summary.lagP999Nanos()));
             row(out, "lag max", nanos(summary.lagMaxNanos()));
-            row(out, "ticks with inexact lag", Integer.toString(summary.lagInexactTicks()));
             row(out, "tick body p99", nanos(summary.tickMsptP99Nanos()));
             row(out, "fund passes", Integer.toString(summary.fundPasses()));
             out.append("| sampled fallback share | ").append(percent(summary.proxyHardMissShare())).append(" |\n");

@@ -51,8 +51,11 @@ final class ThreadsConfigParser {
     );
     private static final Set<String> LIFECYCLE_KEYS = Set.of("centralized-thread-factory", "monitor-threads");
     private static final Set<String> REGION_KEYS = Set.of(
-        "managed", "preserve-folia-scheduling", "scheduler", "threads", "grid-exponent", "kairos-unstable", "kairos"
+        "managed", "preserve-folia-scheduling", "scheduler", "threads", "grid-exponent", "kairos-unstable",
+        "kairos", "metrics"
     );
+    private static final String REGION_METRICS_PATH = REGION_PATH + ".metrics";
+    private static final Set<String> REGION_METRICS_KEYS = Set.of("jfr");
     private static final String KAIROS_PATH = REGION_PATH + ".kairos";
     private static final Set<String> KAIROS_KEYS = Set.of(
         "elastic", "max-threads", "keep-alive-seconds", "spawn-rate-per-second",
@@ -160,6 +163,7 @@ final class ThreadsConfigParser {
         flat.put(REGION_PATH + ".threads", Integer.toString(region.threads()));
         flat.put(REGION_PATH + ".grid-exponent", Integer.toString(region.gridExponent()));
         flat.put(REGION_PATH + ".kairos-unstable", Boolean.toString(region.kairosUnstable()));
+        flat.put(REGION_METRICS_PATH + ".jfr", Boolean.toString(region.metricsJfr()));
         final ThreadManagementSettings.RegionExecution.Kairos kairos = region.kairos();
         flat.put(KAIROS_PATH + ".elastic", Boolean.toString(kairos.elastic()));
         flat.put(KAIROS_PATH + ".max-threads", Integer.toString(kairos.maxThreads()));
@@ -259,17 +263,41 @@ final class ThreadsConfigParser {
         final boolean kairos = readBoolean(
             section, "kairos-unstable", fallback.kairosUnstable(), REGION_PATH + ".kairos-unstable", problems
         );
+        final boolean metricsJfr = parseRegionMetrics(
+            readSection(section, "metrics", REGION_METRICS_PATH, problems), problems
+        );
         final ThreadManagementSettings.RegionExecution.Kairos kairosLimits = parseKairos(
             readSection(section, "kairos", KAIROS_PATH, problems), fallback.kairos(), problems
         );
         try {
             return new ThreadManagementSettings.RegionExecution(
-                managed, preserve, scheduler, threads, gridExponent, kairos, kairosLimits
+                managed, preserve, scheduler, threads, gridExponent, kairos, kairosLimits, metricsJfr
             );
         } catch (final IllegalArgumentException | NullPointerException ex) {
             problems.add(new ConfigProblem(REGION_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
             return fallback;
         }
+    }
+
+    /**
+     * Reads the region tick recording switch.
+     *
+     * <p>The block is optional and off when absent. An unreadable value is reported and off is kept,
+     * because recording is diagnostics: a typo must never turn a diagnostic on, and it must never stop
+     * the server.
+     *
+     * @param section  the {@code region-execution.metrics} section, or {@code null}
+     * @param problems problem sink, appended to in place
+     * @return whether per-tick recording is armed
+     */
+    private static boolean parseRegionMetrics(
+        final @Nullable ConfigurationSection section,
+        final List<ConfigProblem> problems
+    ) {
+        if (section == null) {
+            return false;
+        }
+        return readBoolean(section, "jfr", false, REGION_METRICS_PATH + ".jfr", problems);
     }
 
     private static ThreadManagementSettings.RegionExecution.Kairos parseKairos(
@@ -685,6 +713,7 @@ final class ThreadsConfigParser {
         reportUnknownIn(root.getConfigurationSection("region-execution"), REGION_PATH, REGION_KEYS, problems);
         final ConfigurationSection region = root.getConfigurationSection("region-execution");
         if (region != null) {
+            reportUnknownIn(region.getConfigurationSection("metrics"), REGION_METRICS_PATH, REGION_METRICS_KEYS, problems);
             final ConfigurationSection kairos = region.getConfigurationSection("kairos");
             reportUnknownIn(kairos, KAIROS_PATH, KAIROS_KEYS, problems);
             if (kairos != null) {

@@ -278,10 +278,23 @@ Eight events, all named under `tuff.threads`:
 | `tuff.threads.TickPressure` | `state`, `reason`, `reserveCores`, `maxReserveCores`, `budget`, `usableCores`, `regions`, `lagFraction`, `minimumTps`, `maximumMspt` | When the compute pool's tick pressure reserve moves; never per pass |
 
 Emission is gated on `EventType.isEnabled()` before the event object is built, so a server with no
-recording pays one check per hook. There is no `thread-management` key that switches these events on
-or off, and there is no `/tuff` subcommand that starts a recording for them: they appear in any
-recording that has the events enabled. The `/tuff compute jfr` recording enables the `tuff.compute`
+recording pays one check per hook. There is no `thread-management` key that switches a `tuff.threads`
+event on or off, and there is no `/tuff` subcommand that starts a recording for them: they appear in
+any recording that has the events enabled. The `/tuff compute jfr` recording enables the `tuff.compute`
 category only and will not contain them.
+
+Two scheduler events sit beside the thread events and have their own switches:
+
+| Event | Armed by | When |
+| --- | --- | --- |
+| `tuff.scheduler.Tick` | `thread-management.region-execution.metrics.jfr: true` | once per executed region tick body, for EDF, `WORK_STEALING` and Kairos |
+| `tuff.scheduler.Fund` | `thread-management.region-execution.kairos.metrics.jfr: true` | once per Kairos supervisor pass |
+
+Both are restart only and off by default. With the tick switch off the body pays one volatile read and
+a `null` check; with it on, the event carries the deadline the body was measured against before the
+handle advanced the schedule, the scheduler `origin`, the periods ahead (one is on time) and the
+periods written off. The field list and the metric definition are in
+[scheduler/kairos.md](../scheduler/kairos.md#recording).
 
 To capture them:
 

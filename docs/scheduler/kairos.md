@@ -17,6 +17,8 @@ threaded-regions:
 thread-management:
   region-execution:
     kairos-unstable: true   # required, Kairos refuses to start without it
+    metrics:
+      jfr: true             # per-tick tuff.scheduler.Tick, every scheduler
     kairos:
       elastic: true
       max-threads: 4
@@ -140,7 +142,8 @@ thread-management:
 | `region-execution.kairos.steal.threshold-millis` | tuff.yml | `3` | how late a kept tick must be before another runner may take it |
 | `region-execution.kairos.affinity.local-queue-size` | tuff.yml | `0` | ticks a runner may keep for itself; `0` keeps the single shared queue |
 | `region-execution.kairos.lease.timeout-seconds` | tuff.yml | `0` | permit wait that triggers a warning; `0` keeps the measurement only |
-| `region-execution.kairos.metrics.jfr` | tuff.yml | `false` | record every tick and every pass as JFR events; off costs one field read per tick |
+| `region-execution.metrics.jfr` | tuff.yml | `false` | record every executed tick body as `tuff.scheduler.Tick`, whatever scheduler runs it; off costs one volatile read per tick |
+| `region-execution.kairos.metrics.jfr` | tuff.yml | `false` | record every supervisor pass as `tuff.scheduler.Fund`; the per-tick event has its own switch above |
 | `region-execution.kairos.idle-work.enabled` | tuff.yml | `false` | master switch of the idle path |
 | `region-execution.kairos.idle-work.mid-tick` | tuff.yml | `false` | let a waiting runner drain its region's intermediate tasks |
 | `region-execution.kairos.idle-work.utmi-jobs` | tuff.yml | `false` | let a parked runner take jobs from the thread layer's idle-safe source |
@@ -215,24 +218,30 @@ stealing says `no fund telemetry (Kairos only)`.
 
 ## Recording
 
-With `thread-management.region-execution.kairos.metrics.jfr: true` the fund writes two JFR events.
-Both are off by default, and off means one field read per tick and nothing else: the switch is checked
-before the event is constructed, before the region lookup and before the period count is asked for.
-A recording still has to enable the events, so the switch arms the code and the recording decides what
-is kept.
+Per-tick recording belongs to the region handle, not to a scheduler. With
+`thread-management.region-execution.metrics.jfr: true` every executed body writes one
+`tuff.scheduler.Tick`, whether EDF, `WORK_STEALING` or Kairos ran it. The switch is read before the
+event is constructed, so off means one volatile read and a `null` check per body and nothing else. A
+recording still has to enable the event, so the switch arms the code and the recording decides what is
+kept.
 
-| Event | When | Fields |
-|---|---|---|
-| `tuff.scheduler.Tick` | once per executed tick body | `regionId`, `tickId`, `scheduledStartNanos`, `startNanos`, `endNanos`, `missedPeriods`, `catchUpTicks`, `skipped`, `executedNanos` |
-| `tuff.scheduler.Fund` | once per supervisor pass | `minThreads`, `liveThreads`, `targetThreads`, `maxThreads`, `queuedTicks`, `awaitingTicks`, `executingTicks`, `overdueTicks`, `spawned`, `retired` |
+The Kairos fund has a second switch, `thread-management.region-execution.kairos.metrics.jfr: true`,
+which writes one `tuff.scheduler.Fund` per supervisor pass. The two switches are independent on
+purpose: the per-tick row is not a Kairos feature, and the fund row only exists while Kairos runs.
+
+| Event | Armed by | When | Fields |
+|---|---|---|---|
+| `tuff.scheduler.Tick` | `region-execution.metrics.jfr` | once per executed tick body, every scheduler | `regionId`, `tickId`, `origin`, `scheduledStartNanos`, `startNanos`, `endNanos`, `missedPeriods`, `catchUpTicks`, `skipped`, `executedNanos` |
+| `tuff.scheduler.Fund` | `region-execution.kairos.metrics.jfr` | once per supervisor pass | `minThreads`, `liveThreads`, `targetThreads`, `maxThreads`, `queuedTicks`, `awaitingTicks`, `executingTicks`, `overdueTicks`, `spawned`, `retired` |
 
 `tuff.scheduler.Tick` exists for one reason: a per-region TPS average cannot tell a missed deadline
-from a slow tick. `scheduledStartNanos` against `startNanos` is the lag of that exact tick,
-`missedPeriods` is how many whole periods the handle was behind before the body, `skipped` is how many
-of them the body wrote off instead of running (`-1` when the handle could not answer, which is what a
-server with catch-up and recording both off reports), and `catchUpTicks` is `1` for a body that ran to
-recover a period. A stand can therefore compute a real hard miss - `lag >= period` or
-`missedPeriods > 1` - and a real skip count, instead of using a five second sample as a proxy.
+from a slow tick. `scheduledStartNanos` is the deadline the body was actually measured against, read
+before the handle advanced the schedule, so `startNanos - scheduledStartNanos` is the exact lag and
+nothing has to be reconstructed. `origin` is `EDF`, `WORK_STEALING` or `KAIROS`. `missedPeriods` is the
+handle's periods ahead at the body start (one is on time), `skipped` is how many of those periods the
+body wrote off instead of running, and `catchUpTicks` is `1` for a body that ran to recover a period. A
+stand can therefore compute a real hard miss - `lag >= period` or `missedPeriods > 1` - and a real skip
+count, instead of using a five second sample as a proxy.
 
 `tuff.scheduler.Fund` is the other half of the explanation: one row per pass with the fund's size, what
 the queues held, how many ticks were already past the threshold, and the lifetime spawn and retire

@@ -5,20 +5,52 @@ Subject: [PATCH] Tuff: hook region ticks for accounting and Kairos
 
 
 diff --git a/io/papermc/paper/threadedregions/TickRegionScheduler.java b/io/papermc/paper/threadedregions/TickRegionScheduler.java
-index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..7a0e9043f5e44b69b4ebe11b193ed4171e397ea9 100644
+index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..bd528072ea2323ddae1ef8a46eb9f342d4068b17 100644
 --- a/io/papermc/paper/threadedregions/TickRegionScheduler.java
 +++ b/io/papermc/paper/threadedregions/TickRegionScheduler.java
-@@ -53,7 +53,8 @@ public final class TickRegionScheduler {
+@@ -14,6 +14,9 @@ import ca.spottedleaf.moonrise.common.util.TickThread;
+ import com.mojang.logging.LogUtils;
+ import io.papermc.paper.util.TraceUtil;
+ import it.unimi.dsi.fastutil.ints.Int2IntLinkedOpenHashMap;
++import kz.bejiihiu.tuff.threads.observe.TickObserver;
++import kz.bejiihiu.tuff.threads.observe.TickObservers;
++import kz.bejiihiu.tuff.threads.observe.TickOrigin;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.world.level.ChunkPos;
+@@ -50,13 +53,30 @@ public final class TickRegionScheduler {
+     // Folia end - watchdog
+ 
+     private final Scheduler scheduler;
++    private final SchedulerType schedulerType;
  
      public static enum SchedulerType {
          EDF,
 -        WORK_STEALING;
 +        WORK_STEALING,
-+        KAIROS
++        KAIROS;
++
++        /**
++         * Tuff start - the observation origin of this scheduler variant.
++         *
++         * @return the origin written into every tick observation
++         */
++        public TickOrigin origin() {
++            return switch (this) {
++                case EDF -> TickOrigin.EDF;
++                case WORK_STEALING -> TickOrigin.WORK_STEALING;
++                case KAIROS -> TickOrigin.KAIROS;
++            };
++        }
++        // Tuff end - the observation origin of this scheduler variant
      }
  
      public TickRegionScheduler(final SchedulerType schedulerType, final int initialThreads) {
-@@ -66,7 +67,7 @@ public final class TickRegionScheduler {
++        this.schedulerType = schedulerType;
+         final ThreadFactory threadFactory = new ThreadFactory() {
+             private final AtomicInteger idGenerator = new AtomicInteger();
+             // on Linux, thread affinity is copied from the parent thread - but we do not want that, so we need
+@@ -66,7 +86,7 @@ public final class TickRegionScheduler {
  
              @Override
              public Thread newThread(final Runnable run) {
@@ -27,7 +59,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..7a0e9043f5e44b69b4ebe11b193ed417
                  ret.setUncaughtExceptionHandler(TickRegionScheduler.this::uncaughtException);
                  return ret;
              }
-@@ -84,6 +85,19 @@ public final class TickRegionScheduler {
+@@ -84,6 +104,19 @@ public final class TickRegionScheduler {
                  ((StealingScheduledThreadPool)this.scheduler).setFlags(StealingScheduledThreadPool.FLAG_SCHEDULE_EVENLY);
                  break;
              }
@@ -47,7 +79,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..7a0e9043f5e44b69b4ebe11b193ed417
              default: {
                  throw new IllegalStateException("Unknown scheduler type: " + schedulerType);
              }
-@@ -93,6 +107,8 @@ public final class TickRegionScheduler {
+@@ -93,6 +126,8 @@ public final class TickRegionScheduler {
      public void start() {
          if (this.scheduler instanceof EDFSchedulerThreadPool edfSchedulerThreadPool) {
              edfSchedulerThreadPool.start();
@@ -56,7 +88,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..7a0e9043f5e44b69b4ebe11b193ed417
          }
      }
  
-@@ -121,6 +137,8 @@ public final class TickRegionScheduler {
+@@ -121,6 +156,8 @@ public final class TickRegionScheduler {
              }
  
              stealingScheduledThreadPool.setThreadAllocation(threadAllocation, stealThresholdNS, taskTimeSliceNS);
@@ -65,7 +97,15 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..7a0e9043f5e44b69b4ebe11b193ed417
          }
      }
  
-@@ -315,6 +333,14 @@ public final class TickRegionScheduler {
+@@ -220,6 +257,7 @@ public final class TickRegionScheduler {
+      */
+     public void scheduleRegion(final RegionScheduleHandle region) {
+         region.scheduler = this;
++        region.origin = this.schedulerType.origin();
+         this.scheduler.schedule(region);
+     }
+ 
+@@ -315,7 +353,18 @@ public final class TickRegionScheduler {
  
          protected final Schedule tickSchedule;
  
@@ -78,9 +118,13 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..7a0e9043f5e44b69b4ebe11b193ed417
 +        // Tuff end - bounded catch up
 +
          private TickRegionScheduler scheduler;
++        // Tuff start - the scheduler that runs this handle, captured before a tick body
++        private TickOrigin origin = TickOrigin.EDF;
++        // Tuff end - the scheduler that runs this handle, captured before a tick body
  
          public RegionScheduleHandle(final TickRegions.TickRegionData region, final long firstStart) {
-@@ -340,6 +366,48 @@ public final class TickRegionScheduler {
+             this.currentTick = 0L;
+@@ -340,6 +389,48 @@ public final class TickRegionScheduler {
              this.tickSchedule.setLastPeriod(to == TimeUtil.DEADLINE_NOT_SET ? to : to - TIME_BETWEEN_TICKS);
          }
  
@@ -129,7 +173,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..7a0e9043f5e44b69b4ebe11b193ed417
          public final void markNonSchedulable() {
              this.cancelled.set(true);
          }
-@@ -430,7 +498,11 @@ public final class TickRegionScheduler {
+@@ -430,7 +521,11 @@ public final class TickRegionScheduler {
              final long tickStart = System.nanoTime();
  
              // use max(), don't assume that tickStart >= scheduledStart
@@ -142,3 +186,27 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..7a0e9043f5e44b69b4ebe11b193ed417
  
              if (!this.tryMarkTicking()) {
                  if (!this.cancelled.get()) {
+@@ -505,6 +600,23 @@ public final class TickRegionScheduler {
+                 if (this.region != null) {
+                     TickRegionScheduler.setTickingRegion(null);
+                 }
++
++                // Tuff start - one observation per executed body, whatever scheduler ran it
++                // the deadline is the local from before the advance above, so lag is exact
++                final TickObserver tickObserver = TickObservers.observer();
++                if (tickObserver != null) {
++                    tickObserver.onTick(
++                        this.origin,
++                        this.region == null ? -1L : this.region.id,
++                        this.id,
++                        scheduledStart,
++                        tickStart,
++                        tickEnd,
++                        periodsAhead,
++                        tickCount
++                    );
++                }
++                // Tuff end - one observation per executed body, whatever scheduler ran it
+             }
+ 
+             // Only AFTER updating the tickStart

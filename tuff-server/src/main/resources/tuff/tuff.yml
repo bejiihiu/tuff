@@ -74,6 +74,14 @@ thread-management:
     # Explicit opt in for the experimental Kairos scheduler. Never enabled implicitly; turning it on
     # without its own A/B run is not supported.
     kairos-unstable: false
+    metrics:
+      # Record every executed region tick body as tuff.scheduler.Tick, whatever scheduler runs it:
+      # EDF, work stealing or Kairos. The event carries the deadline the body was measured against
+      # before the handle advanced, so a stand can compute a real hard miss. Off costs one volatile
+      # read per tick. Turn it on for a measurement run, not permanently: one event per tick per
+      # region plus the global tick. The Kairos fund event (tuff.scheduler.Fund) has its own switch,
+      # kairos.metrics.jfr below.
+      jfr: false
     # Limits of the Kairos fund. The floor is threads above; everything here is about growing past it.
     # Only read while scheduler is kairos. Restart only.
     kairos:

@@ -218,6 +218,8 @@ public record ThreadManagementSettings(
      * @param kairosUnstable          opt in to the experimental Kairos scheduler; required for
      *                                {@link RegionScheduler#KAIROS} and never enabled implicitly
      * @param kairos                  limits of the Kairos fund; only read while the scheduler is Kairos
+     * @param metricsJfr              whether every executed tick body is recorded as a JFR event,
+     *                                whatever scheduler ran it
      */
     public record RegionExecution(
         boolean managed,
@@ -226,7 +228,8 @@ public record ThreadManagementSettings(
         int threads,
         int gridExponent,
         boolean kairosUnstable,
-        Kairos kairos
+        Kairos kairos,
+        boolean metricsJfr
     ) {
 
         /**
@@ -278,16 +281,44 @@ public record ThreadManagementSettings(
             final int gridExponent,
             final boolean kairosUnstable
         ) {
-            this(managed, preserveFoliaScheduling, scheduler, threads, gridExponent, kairosUnstable, Kairos.defaults());
+            this(managed, preserveFoliaScheduling, scheduler, threads, gridExponent, kairosUnstable,
+                Kairos.defaults(), false);
+        }
+
+        /**
+         * Creates region settings without the per-tick recording switch.
+         *
+         * <p>The seven argument shape predates the scheduler independent recorder; a caller that does
+         * not mention it gets recording off.
+         *
+         * @param managed                 whether the region pool is registered at L2 instead of L1
+         * @param preserveFoliaScheduling must stay {@code true}
+         * @param scheduler               scheduler variant Folia runs
+         * @param threads                 fixed tick thread count, or {@code -1}
+         * @param gridExponent            region grid exponent
+         * @param kairosUnstable          opt in to Kairos
+         * @param kairos                  limits of the Kairos fund
+         */
+        public RegionExecution(
+            final boolean managed,
+            final boolean preserveFoliaScheduling,
+            final RegionScheduler scheduler,
+            final int threads,
+            final int gridExponent,
+            final boolean kairosUnstable,
+            final Kairos kairos
+        ) {
+            this(managed, preserveFoliaScheduling, scheduler, threads, gridExponent, kairosUnstable, kairos, false);
         }
 
         /**
          * Returns the default region execution settings.
          *
-         * @return observe only, Folia EDF, automatic thread count, grid exponent four, Kairos off
+         * @return observe only, Folia EDF, automatic thread count, grid exponent four, Kairos off,
+         *     per-tick recording off
          */
         public static RegionExecution defaults() {
-            return new RegionExecution(false, true, RegionScheduler.EDF, -1, 4, false, Kairos.defaults());
+            return new RegionExecution(false, true, RegionScheduler.EDF, -1, 4, false, Kairos.defaults(), false);
         }
 
         /**
