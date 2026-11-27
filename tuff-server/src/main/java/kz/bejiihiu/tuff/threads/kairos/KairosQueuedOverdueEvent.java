@@ -3,6 +3,7 @@ package kz.bejiihiu.tuff.threads.kairos;
 import jdk.jfr.Category;
 import jdk.jfr.Description;
 import jdk.jfr.Event;
+import jdk.jfr.FlightRecorder;
 import jdk.jfr.Label;
 import jdk.jfr.Name;
 import jdk.jfr.StackTrace;
@@ -79,6 +80,10 @@ public final class KairosQueuedOverdueEvent extends Event {
         final boolean saturated
     ) {
         try {
+            if (!FlightRecorder.isInitialized()) {
+                // no recording was ever started, so there is not even a dormant event to fill
+                return;
+            }
             final KairosQueuedOverdueEvent event = new KairosQueuedOverdueEvent();
             if (!event.isEnabled()) {
                 return;

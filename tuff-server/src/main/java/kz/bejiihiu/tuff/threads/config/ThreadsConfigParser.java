@@ -7,6 +7,8 @@ import java.util.Map;
 import java.util.Set;
 import kz.bejiihiu.tuff.compute.config.ConfigProblem;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
+import kz.bejiihiu.tuff.threads.kairos.KairosGate;
+import kz.bejiihiu.tuff.threads.kairos.KairosKernel;
 import org.bukkit.configuration.Configuration;
 import org.bukkit.configuration.ConfigurationSection;
 import org.jspecify.annotations.Nullable;
@@ -52,8 +54,19 @@ final class ThreadsConfigParser {
     );
     private static final String KAIROS_PATH = REGION_PATH + ".kairos";
     private static final Set<String> KAIROS_KEYS = Set.of(
-        "elastic", "max-threads", "keep-alive-seconds", "spawn-rate-per-second"
+        "elastic", "max-threads", "keep-alive-seconds", "spawn-rate-per-second",
+        "catch-up", "steal", "affinity", "lease", "metrics"
     );
+    private static final String CATCH_UP_PATH = KAIROS_PATH + ".catch-up";
+    private static final Set<String> CATCH_UP_KEYS = Set.of("cap-ticks", "budget-millis");
+    private static final String STEAL_PATH = KAIROS_PATH + ".steal";
+    private static final Set<String> STEAL_KEYS = Set.of("threshold-millis");
+    private static final String AFFINITY_PATH = KAIROS_PATH + ".affinity";
+    private static final Set<String> AFFINITY_KEYS = Set.of("local-queue-size");
+    private static final String LEASE_PATH = KAIROS_PATH + ".lease";
+    private static final Set<String> LEASE_KEYS = Set.of("timeout-seconds");
+    private static final String KAIROS_METRICS_PATH = KAIROS_PATH + ".metrics";
+    private static final Set<String> KAIROS_METRICS_KEYS = Set.of("jfr");
     private static final Set<String> ASYNC_COMPUTE_KEYS = Set.of("managed", "max-threads", "tick-pressure");
     private static final Set<String> TICK_PRESSURE_KEYS = Set.of(
         "enabled",
@@ -80,6 +93,8 @@ final class ThreadsConfigParser {
      */
     static ThreadManagementSettings parse(final Configuration configuration, final List<ConfigProblem> problems) {
         final ThreadManagementSettings defaults = ThreadManagementSettings.defaults();
+        // a read that has no kairos block still has an answer for the scheduler: the stock behaviour
+        KairosGate.kernel(KairosKernel.defaults());
         final ConfigurationSection root = configuration.getConfigurationSection(SECTION);
         if (root == null) {
             problems.add(new ConfigProblem(SECTION, "section is missing, using the observe-only defaults"));
@@ -257,6 +272,7 @@ final class ThreadsConfigParser {
         final List<ConfigProblem> problems
     ) {
         if (section == null) {
+            KairosGate.kernel(KairosKernel.defaults());
             return fallback;
         }
         final boolean elastic = readBoolean(section, "elastic", fallback.elastic(), KAIROS_PATH + ".elastic", problems);
@@ -270,11 +286,59 @@ final class ThreadsConfigParser {
             section, "spawn-rate-per-second", fallback.spawnRatePerSecond(),
             KAIROS_PATH + ".spawn-rate-per-second", problems
         );
+        // the tick level knobs are published to the scheduler's opt-in gate instead of travelling
+        // through the settings record: that record belongs to the thread layer and is shared with
+        // pools that have no idea what a tick is. the gate is already the value that crosses this
+        // window, so the knobs arrive at the scheduler start with the rest of the kairos block
+        KairosGate.kernel(parseKernel(section, problems));
         try {
             return new ThreadManagementSettings.RegionExecution.Kairos(elastic, maxThreads, keepAlive, spawnRate);
         } catch (final IllegalArgumentException ex) {
             problems.add(new ConfigProblem(KAIROS_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
             return fallback;
+        }
+    }
+
+    /**
+     * Reads the knobs that act on a single tick or permit and publishes them to the scheduler.
+     *
+     * <p>A value outside its range is reported and replaced by the stock behaviour rather than by the
+     * neighbouring field, so one bad number cannot quietly change two behaviours at once.
+     *
+     * @param kairos   the {@code kairos} section
+     * @param problems problem sink, appended to in place
+     * @return the knobs to publish, never {@code null}
+     */
+    private static KairosKernel parseKernel(final ConfigurationSection kairos, final List<ConfigProblem> problems) {
+        final KairosKernel defaults = KairosKernel.defaults();
+        final ConfigurationSection catchUp = readSection(kairos, "catch-up", CATCH_UP_PATH, problems);
+        final ConfigurationSection steal = readSection(kairos, "steal", STEAL_PATH, problems);
+        final ConfigurationSection affinity = readSection(kairos, "affinity", AFFINITY_PATH, problems);
+        final ConfigurationSection lease = readSection(kairos, "lease", LEASE_PATH, problems);
+        final ConfigurationSection metrics = readSection(kairos, "metrics", KAIROS_METRICS_PATH, problems);
+        final int cap = readIntIn(
+            catchUp, "cap-ticks", defaults.catchUpCapTicks(), CATCH_UP_PATH + ".cap-ticks", problems
+        );
+        final int budget = readIntIn(
+            catchUp, "budget-millis", defaults.catchUpBudgetMillis(), CATCH_UP_PATH + ".budget-millis", problems
+        );
+        final int stealThreshold = readIntIn(
+            steal, "threshold-millis", defaults.stealThresholdMillis(), STEAL_PATH + ".threshold-millis", problems
+        );
+        final int queueSize = readIntIn(
+            affinity, "local-queue-size", defaults.affinityQueueSize(), AFFINITY_PATH + ".local-queue-size", problems
+        );
+        final int leaseSeconds = readIntIn(
+            lease, "timeout-seconds", defaults.leaseTimeoutMillis() / 1000, LEASE_PATH + ".timeout-seconds", problems
+        );
+        final boolean jfr = metrics != null && readBoolean(
+            metrics, "jfr", defaults.jfr(), KAIROS_METRICS_PATH + ".jfr", problems
+        );
+        try {
+            return new KairosKernel(cap, budget, queueSize, stealThreshold, leaseSeconds * 1000, jfr);
+        } catch (final IllegalArgumentException ex) {
+            problems.add(new ConfigProblem(CATCH_UP_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
+            return defaults;
         }
     }
 
@@ -491,6 +555,29 @@ final class ThreadsConfigParser {
         return fallback;
     }
 
+    /**
+     * Reads a whole number from an optional section.
+     *
+     * @param section  section that holds the key, or {@code null} when the operator did not write it
+     * @param key      key inside the section
+     * @param fallback value to use when the key or the section is missing
+     * @param path     dotted path for the problem message
+     * @param problems problem sink, appended to in place
+     * @return the value, or the fallback
+     */
+    private static int readIntIn(
+        final @Nullable ConfigurationSection section,
+        final String key,
+        final int fallback,
+        final String path,
+        final List<ConfigProblem> problems
+    ) {
+        if (section == null) {
+            return fallback;
+        }
+        return readInt(section, key, fallback, path, problems);
+    }
+
     private static double readDouble(
         final ConfigurationSection section,
         final String key,
@@ -546,7 +633,17 @@ final class ThreadsConfigParser {
         reportUnknownIn(root.getConfigurationSection("region-execution"), REGION_PATH, REGION_KEYS, problems);
         final ConfigurationSection region = root.getConfigurationSection("region-execution");
         if (region != null) {
-            reportUnknownIn(region.getConfigurationSection("kairos"), KAIROS_PATH, KAIROS_KEYS, problems);
+            final ConfigurationSection kairos = region.getConfigurationSection("kairos");
+            reportUnknownIn(kairos, KAIROS_PATH, KAIROS_KEYS, problems);
+            if (kairos != null) {
+                reportUnknownIn(kairos.getConfigurationSection("catch-up"), CATCH_UP_PATH, CATCH_UP_KEYS, problems);
+                reportUnknownIn(kairos.getConfigurationSection("steal"), STEAL_PATH, STEAL_KEYS, problems);
+                reportUnknownIn(kairos.getConfigurationSection("affinity"), AFFINITY_PATH, AFFINITY_KEYS, problems);
+                reportUnknownIn(kairos.getConfigurationSection("lease"), LEASE_PATH, LEASE_KEYS, problems);
+                reportUnknownIn(
+                    kairos.getConfigurationSection("metrics"), KAIROS_METRICS_PATH, KAIROS_METRICS_KEYS, problems
+                );
+            }
         }
         reportUnknownIn(root.getConfigurationSection("async-compute"), ASYNC_COMPUTE_PATH, ASYNC_COMPUTE_KEYS, problems);
         final ConfigurationSection asyncCompute = root.getConfigurationSection("async-compute");

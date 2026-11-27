@@ -39,6 +39,11 @@ import java.util.Objects;
  * @param retireCount             runners retired since the process began
  * @param budgetSource            where the ceiling came from, never {@code null}
  * @param degradedReasons         reasons the fund is not at its best, possibly empty
+ * @param leaseWait               permit waits and the timeout they are compared against
+ * @param affinityHits            ticks handed back to the runner that ran them last
+ * @param stolenTicks             ticks another runner took out of a backlog
+ * @param catchUpBursts           catch-up bursts the fund started
+ * @param catchUpTicks            tick bodies run to recover a backlog
  */
 public record KairosSnapshot(
     boolean elastic,
@@ -60,7 +65,12 @@ public record KairosSnapshot(
     long spawnCount,
     long retireCount,
     String budgetSource,
-    List<Degraded> degradedReasons
+    List<Degraded> degradedReasons,
+    LeaseWait leaseWait,
+    long affinityHits,
+    long stolenTicks,
+    long catchUpBursts,
+    long catchUpTicks
 ) {
 
     /**
@@ -73,6 +83,7 @@ public record KairosSnapshot(
         Objects.requireNonNull(lastDecision, "lastDecision");
         Objects.requireNonNull(lastDecisionDetail, "lastDecisionDetail");
         Objects.requireNonNull(budgetSource, "budgetSource");
+        Objects.requireNonNull(leaseWait, "leaseWait");
         degradedReasons = List.copyOf(degradedReasons);
     }
 
@@ -172,5 +183,36 @@ public record KairosSnapshot(
          * At least one queued tick is past the wait threshold right now.
          */
         QUEUED_OVERDUE
+    }
+
+    /**
+     * Permit waits of the fund, and the timeout the operator asked to be warned about.
+     *
+     * <p>The maxima are the worst values since the scheduler started. They are best effort: two
+     * runners racing for the same maximum may overwrite each other, and a metric that is occasionally
+     * one sample short is worth more than an atomic on the tick path.
+     *
+     * @param grants             permits handed out and measured
+     * @param queuedMaxMillis    longest wait between a deadline and its permit grant
+     * @param parkedMaxMillis    longest wait between the later of grant and deadline and the body
+     * @param timeouts           grants whose wait exceeded the timeout
+     * @param timeoutMillis      configured timeout, or zero when only accounting is on
+     */
+    public record LeaseWait(
+        long grants,
+        long queuedMaxMillis,
+        long parkedMaxMillis,
+        long timeouts,
+        long timeoutMillis
+    ) {
+
+        /**
+         * Returns whether the operator asked to be warned about slow permits.
+         *
+         * @return {@code true} when a timeout is configured
+         */
+        public boolean armed() {
+            return this.timeoutMillis > 0L;
+        }
     }
 }

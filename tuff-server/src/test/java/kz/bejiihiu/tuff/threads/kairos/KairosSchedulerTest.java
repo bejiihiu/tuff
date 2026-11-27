@@ -4,7 +4,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -208,6 +210,63 @@ class KairosSchedulerTest {
         assertFalse(this.threads.anyAlive(), "a refused start must not start a thread");
     }
 
+    @Test
+    void joinWaitsForARetiredThreadThatIsStillAlive() throws InterruptedException {
+        // the factory keeps a thread alive after its loop returns, which is the only way to hold a
+        // retired runner in the state the shutdown contract is about: out of the fund, still running
+        final SlowExitFactory factory = new SlowExitFactory();
+        KairosGate.arm(true, new KairosTuning(true, 2, 50, 50, 20L));
+        final KairosScheduler elastic = this.scheduler =
+            new KairosScheduler(1, factory, tick -> ((FakeTick) tick).deadline());
+        final CountDownLatch done = new CountDownLatch(2);
+        final long now = System.nanoTime();
+        elastic.schedule(this.tick("a", now, done).runFor(millis(120L)));
+        elastic.schedule(this.tick("b", now, done).runFor(millis(120L)));
+        elastic.start();
+        this.awaitAlive(2);
+        assertTrue(done.await(5L, TimeUnit.SECONDS));
+
+        final long retireDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10L);
+        while (elastic.retireCount() == 0L) {
+            if (System.nanoTime() - retireDeadline >= 0L) {
+                throw new AssertionError("the surplus runner was never retired");
+            }
+            Thread.sleep(5L);
+        }
+        // the retired runner is out of the fund but its thread has not exited
+        assertEquals(1, elastic.getCoreThreads().length, "a retiring runner is not an executor any more");
+        assertEquals(2, factory.created().size());
+
+        elastic.halt();
+
+        assertFalse(elastic.join(300L), "join must still wait for the retired thread");
+        factory.allowExit();
+        assertTrue(elastic.join(10_000L), "and return once that thread is done");
+        assertFalse(factory.anyAlive(), "no thread of the fund may survive the join");
+    }
+
+    @Test
+    void noThreadIsStartedAfterHalt() throws InterruptedException {
+        KairosGate.arm(true, new KairosTuning(true, 4, 5_000, 50, 20L));
+        final KairosScheduler elastic = this.scheduler =
+            new KairosScheduler(1, this.threads, tick -> ((FakeTick) tick).deadline());
+        final CountDownLatch done = new CountDownLatch(8);
+        final long now = System.nanoTime();
+        for (int index = 0; index < 8; ++index) {
+            elastic.schedule(this.tick("t" + index, now, done).runFor(millis(200L)));
+        }
+        elastic.start();
+
+        elastic.halt();
+        final int createdAtHalt = this.threads.created().size();
+
+        assertTrue(elastic.join(10_000L));
+        Thread.sleep(100L);
+        assertEquals(createdAtHalt, this.threads.created().size(), "a spawn that lost the race must not start");
+        assertEquals(0, elastic.getAliveThreads().length);
+        assertFalse(this.threads.anyAlive());
+    }
+
     private KairosScheduler scheduler(final int size) {
         return new KairosScheduler(size, this.threads, tick -> ((FakeTick) tick).deadline());
     }
@@ -230,5 +289,45 @@ class KairosSchedulerTest {
 
     private static long millis(final long value) {
         return TimeUnit.MILLISECONDS.toNanos(value);
+    }
+
+    /**
+     * A factory whose threads outlive their runner loop until the test lets them go.
+     *
+     * <p>That is what a retired runner looks like during shutdown: it is no longer part of the fund,
+     * and it is still a thread that the save must not race.
+     */
+    private static final class SlowExitFactory implements ThreadFactory {
+
+        private final List<Thread> created = Collections.synchronizedList(new ArrayList<>());
+        private final CountDownLatch exit = new CountDownLatch(1);
+        private final AtomicInteger ids = new AtomicInteger();
+
+        @Override
+        public Thread newThread(final Runnable run) {
+            final Thread thread = new Thread(() -> {
+                run.run();
+                try {
+                    this.exit.await();
+                } catch (InterruptedException _) {
+                    Thread.currentThread().interrupt();
+                }
+            }, "kairos-slow-exit-" + this.ids.getAndIncrement());
+            thread.setDaemon(true);
+            this.created.add(thread);
+            return thread;
+        }
+
+        void allowExit() {
+            this.exit.countDown();
+        }
+
+        List<Thread> created() {
+            return List.copyOf(this.created);
+        }
+
+        boolean anyAlive() {
+            return this.created.stream().anyMatch(Thread::isAlive);
+        }
     }
 }

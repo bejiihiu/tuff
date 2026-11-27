@@ -59,7 +59,15 @@ class KairosPatchContractTest {
         assertEquals(1, count(source, "this.scheduler = new EDFSchedulerThreadPool(initialThreads, threadFactory);"),
             "the EDF line must stay byte for byte the one Folia had");
         assertEquals(1, count(source, "public final long scheduledStart()"),
-            "the deadline accessor is the only added API on the tick handle");
+            "the deadline accessor is added once");
+        assertEquals(1, count(source, "public final long missedPeriods()"),
+            "catch up reads the handle's own period count through one accessor");
+        assertEquals(1, count(source, "public final void limitWriteOff(final long periods)"),
+            "and bounds the write off through one setter");
+        assertEquals(1, count(source, "new kz.bejiihiu.tuff.threads.kairos.KairosTickControl("),
+            "the facade wires the handle side of catch up once");
+        assertEquals(1, count(source, "writeOff <= 0L ? periodsAhead : Math.min(periodsAhead, writeOff)"),
+            "the write off stays a single clamped expression in runTick");
     }
 
     private static int count(final String haystack, final String needle) {

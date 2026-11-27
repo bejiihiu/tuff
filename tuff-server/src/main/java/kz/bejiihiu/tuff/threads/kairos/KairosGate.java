@@ -21,9 +21,37 @@ public final class KairosGate {
 
     private static volatile boolean armed;
     private static volatile KairosTuning tuning = KairosTuning.fixed();
+    private static volatile KairosKernel kernel = KairosKernel.defaults();
     private static volatile KairosServices services = KairosServices.none();
 
     private KairosGate() {
+    }
+
+    /**
+     * Records the knobs that act on a single tick or permit.
+     *
+     * <p>They are published here by the configuration reader rather than carried with
+     * {@link #arm(boolean, KairosTuning)} because the settings record they would belong to is owned
+     * by the thread layer and shared with pools that know nothing about ticks. The gate is already
+     * the value that crosses the window between reading {@code config/tuff.yml} and starting the
+     * region scheduler, so the tick knobs travel with it and arrive at the same moment.
+     *
+     * <p>A value that could not be read arrives here as the default of its field, which is the stock
+     * behaviour: no catch-up, no local backlogs, no lease warning.
+     *
+     * @param tickKernel the knobs to use once the scheduler starts, never {@code null}
+     */
+    public static void kernel(final KairosKernel tickKernel) {
+        kernel = tickKernel;
+    }
+
+    /**
+     * Returns the knobs that came with the last configuration read.
+     *
+     * @return the tick knobs to apply, never {@code null}; the stock behaviour when nothing was read
+     */
+    public static KairosKernel kernel() {
+        return kernel;
     }
 
     /**
@@ -99,6 +127,7 @@ public final class KairosGate {
     public static void disarm() {
         armed = false;
         tuning = KairosTuning.fixed();
+        kernel = KairosKernel.defaults();
         services = KairosServices.none();
     }
 

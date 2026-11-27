@@ -5,7 +5,7 @@ Subject: [PATCH] Tuff: hook region ticks for accounting and Kairos
 
 
 diff --git a/io/papermc/paper/threadedregions/TickRegionScheduler.java b/io/papermc/paper/threadedregions/TickRegionScheduler.java
-index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd0dc6a15f403a140e1e5ab7765136bcd7e4bedc 100644
+index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd81008a9f5341e8631964074696b06a1d0b9e25 100644
 --- a/io/papermc/paper/threadedregions/TickRegionScheduler.java
 +++ b/io/papermc/paper/threadedregions/TickRegionScheduler.java
 @@ -53,7 +53,8 @@ public final class TickRegionScheduler {
@@ -27,20 +27,25 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd0dc6a15f403a140e1e5ab7765136bc
                  ret.setUncaughtExceptionHandler(TickRegionScheduler.this::uncaughtException);
                  return ret;
              }
-@@ -84,6 +85,12 @@ public final class TickRegionScheduler {
+@@ -84,6 +85,17 @@ public final class TickRegionScheduler {
                  ((StealingScheduledThreadPool)this.scheduler).setFlags(StealingScheduledThreadPool.FLAG_SCHEDULE_EVENLY);
                  break;
              }
 +            case KAIROS: {
 +                this.scheduler = new kz.bejiihiu.tuff.threads.kairos.KairosScheduler(
-+                    initialThreads, threadFactory, tick -> ((RegionScheduleHandle)tick).scheduledStart()
++                    initialThreads, threadFactory, tick -> ((RegionScheduleHandle)tick).scheduledStart(),
++                    // Tuff - catch up reads the handle's own period count and bounds its write off
++                    new kz.bejiihiu.tuff.threads.kairos.KairosTickControl(
++                        tick -> ((RegionScheduleHandle)tick).missedPeriods(),
++                        (tick, periods) -> ((RegionScheduleHandle)tick).limitWriteOff(periods)
++                    )
 +                );
 +                break;
 +            }
              default: {
                  throw new IllegalStateException("Unknown scheduler type: " + schedulerType);
              }
-@@ -93,6 +100,8 @@ public final class TickRegionScheduler {
+@@ -93,6 +105,8 @@ public final class TickRegionScheduler {
      public void start() {
          if (this.scheduler instanceof EDFSchedulerThreadPool edfSchedulerThreadPool) {
              edfSchedulerThreadPool.start();
@@ -49,7 +54,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd0dc6a15f403a140e1e5ab7765136bc
          }
      }
  
-@@ -121,6 +130,8 @@ public final class TickRegionScheduler {
+@@ -121,6 +135,8 @@ public final class TickRegionScheduler {
              }
  
              stealingScheduledThreadPool.setThreadAllocation(threadAllocation, stealThresholdNS, taskTimeSliceNS);
@@ -58,7 +63,22 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd0dc6a15f403a140e1e5ab7765136bc
          }
      }
  
-@@ -340,6 +351,13 @@ public final class TickRegionScheduler {
+@@ -315,6 +331,14 @@ public final class TickRegionScheduler {
+ 
+         protected final Schedule tickSchedule;
+ 
++        // Tuff start - bounded catch up
++        /**
++         * How many missed periods the next tick body may account for, or zero to write off the whole
++         * backlog exactly like the stock handle does.
++         */
++        private volatile long writeOffLimit;
++        // Tuff end - bounded catch up
++
+         private TickRegionScheduler scheduler;
+ 
+         public RegionScheduleHandle(final TickRegions.TickRegionData region, final long firstStart) {
+@@ -340,6 +364,48 @@ public final class TickRegionScheduler {
              this.tickSchedule.setLastPeriod(to == TimeUtil.DEADLINE_NOT_SET ? to : to - TIME_BETWEEN_TICKS);
          }
  
@@ -69,6 +89,54 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd0dc6a15f403a140e1e5ab7765136bc
 +            return this.getScheduledStart();
 +        }
 +
++        /**
++         * Tuff start - the number of whole tick periods this handle is behind its schedule right now.
++         *
++         * <p>The period count is computed inside {@link #runTick()} from the handle's private schedule,
++         * so a scheduler that wants to decide whether a region is late cannot re-derive it without
++         * duplicating that arithmetic. Zero means the handle is on time or early; every whole period
++         * that has elapsed since the missed deadline adds one. One is the normal lateness of a tick that
++         * has just become due, so a caller that wants to know whether a period was actually missed is
++         * looking for two or more.
++         *
++         * @return the elapsed periods behind the deadline, never negative
++         */
++        public final long missedPeriods() {
++            if (this.cancelled.get()) {
++                // a region that is done is not late; a scheduler must not start work for it
++                return 0L;
++            }
++            return Math.max(0L, this.tickSchedule.getPeriodsAhead(TIME_BETWEEN_TICKS, System.nanoTime()));
++        }
++
++        /**
++         * Tuff start - limits how many missed periods the next tick body may write off.
++         *
++         * <p>One keeps a body honest: it runs a real tick and moves the deadline by a single period, so
++         * a late region stays late and is acquired again through the normal queue instead of swallowing
++         * its whole backlog at once. Zero is the stock behaviour and is what every other caller of this
++         * class gets, because nothing else sets this field.
++         *
++         * @param periods periods the next body may account for, or zero for the whole backlog
++         */
++        public final void limitWriteOff(final long periods) {
++            this.writeOffLimit = Math.max(0L, periods);
++        }
++        // Tuff end - bounded catch up
++
          public final void markNonSchedulable() {
              this.cancelled.set(true);
          }
+@@ -430,7 +496,11 @@ public final class TickRegionScheduler {
+             final long tickStart = System.nanoTime();
+ 
+             // use max(), don't assume that tickStart >= scheduledStart
+-            final long tickCount = Math.max(1L, this.tickSchedule.getPeriodsAhead(TIME_BETWEEN_TICKS, tickStart));
++            final long periodsAhead = this.tickSchedule.getPeriodsAhead(TIME_BETWEEN_TICKS, tickStart);
++            // Tuff start - bounded catch up
++            final long writeOff = this.writeOffLimit;
++            final long tickCount = Math.max(1L, writeOff <= 0L ? periodsAhead : Math.min(periodsAhead, writeOff));
++            // Tuff end - bounded catch up
+ 
+             if (!this.tryMarkTicking()) {
+                 if (!this.cancelled.get()) {

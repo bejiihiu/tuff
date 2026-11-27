@@ -87,6 +87,35 @@ thread-management:
       keep-alive-seconds: 30
       # How many new tick threads may be started per second while regions are waiting.
       spawn-rate-per-second: 10
+      # What one late region is allowed to do. Off by default: the stock behaviour runs one tick body
+      # and writes off the whole backlog, which is exactly Folia.
+      catch-up:
+        # Tick bodies a region may run back to back while it is behind. Each of them accounts for one
+        # period, so the missed ticks are actually run instead of skipped; the last body of the burst
+        # writes off whatever is left, so the region returns to its normal cadence. 1 is the stock
+        # behaviour. The value only takes effect together with a budget above 0.
+        cap-ticks: 1
+        # Wall clock a single catch-up burst may spend, in milliseconds. 0 disables catch-up, because a
+        # cap without a budget would let one slow region hold a permit for a whole tick.
+        budget-millis: 50
+      steal:
+        # How late a tick kept by another runner must be before this runner may take it. Only used
+        # while affinity.local-queue-size is above 0.
+        threshold-millis: 3
+      affinity:
+        # Ticks a runner may keep for the region it just ticked. 0 is the stock single queue; above 0
+        # is soft affinity: the tick tends to come back to the same thread, and another runner only
+        # takes it when it is past `steal.threshold-millis`.
+        local-queue-size: 0
+      lease:
+        # Warn (once per ten seconds) when a tick waited longer than this for its permit. 0 keeps the
+        # measurement in /tuff scheduler and the JFR event only, with no log line.
+        timeout-seconds: 0
+      metrics:
+        # Record every executed tick and every supervisor pass as JFR events
+        # (tuff.scheduler.Tick, tuff.scheduler.Fund). Off costs one field read per tick. Turn it on for
+        # a measurement run, not permanently: the per-tick event is one event per tick per region.
+        jfr: false
 
   async-compute:
     # Older spelling of execution-pools.compute.managed below: both keys describe one switch and

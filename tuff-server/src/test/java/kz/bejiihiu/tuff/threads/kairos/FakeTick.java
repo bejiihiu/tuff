@@ -2,6 +2,8 @@ package kz.bejiihiu.tuff.threads.kairos;
 
 import ca.spottedleaf.common.util.TimeUtil;
 import ca.spottedleaf.concurrentutil.scheduler.SchedulableTick;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -14,17 +16,19 @@ import java.util.function.BooleanSupplier;
  * <p>The deadline is kept in a field as well as in the tick, because the scheduler reads it through
  * the accessor the facade supplies; a real handle writes both in {@code runTick}.
  */
-final class FakeTick extends SchedulableTick {
+class FakeTick extends SchedulableTick {
 
     private final String label;
     private final List<String> order;
     private final CountDownLatch done;
     private final AtomicInteger runs = new AtomicInteger();
     private final CountDownLatch entered = new CountDownLatch(1);
+    private final List<String> threads = Collections.synchronizedList(new ArrayList<>());
 
     private volatile long deadline;
     private volatile long nextDeadline = TimeUtil.DEADLINE_NOT_SET;
     private volatile long runNanos;
+    private volatile int reschedulesLeft = Integer.MAX_VALUE;
 
     FakeTick(final String label, final long deadline, final List<String> order, final CountDownLatch done) {
         this.label = label;
@@ -44,6 +48,19 @@ final class FakeTick extends SchedulableTick {
         return this;
     }
 
+    /**
+     * Limits how many times this tick asks to be scheduled again.
+     *
+     * @param next  deadline of the next and following bodies
+     * @param times number of reschedules before the tick reports it is done
+     * @return this tick
+     */
+    FakeTick thenRescheduleAt(final long next, final int times) {
+        this.nextDeadline = next;
+        this.reschedulesLeft = times;
+        return this;
+    }
+
     long deadline() {
         return this.deadline;
     }
@@ -56,10 +73,20 @@ final class FakeTick extends SchedulableTick {
         return this.entered;
     }
 
+    /**
+     * Returns the thread name of every body this tick ran.
+     *
+     * @return immutable list in execution order
+     */
+    List<String> threadNames() {
+        return List.copyOf(this.threads);
+    }
+
     @Override
     public boolean runTick() {
         this.order.add(this.label);
         this.runs.incrementAndGet();
+        this.threads.add(Thread.currentThread().getName());
         this.entered.countDown();
         if (this.runNanos > 0L) {
             try {
@@ -69,7 +96,8 @@ final class FakeTick extends SchedulableTick {
                 Thread.currentThread().interrupt();
             }
         }
-        if (this.nextDeadline != TimeUtil.DEADLINE_NOT_SET) {
+        if (this.nextDeadline != TimeUtil.DEADLINE_NOT_SET && this.reschedulesLeft > 0) {
+            --this.reschedulesLeft;
             this.deadline = this.nextDeadline;
             this.setScheduledStart(this.nextDeadline);
             this.done.countDown();

@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.LongSupplier;
 import java.util.function.ToLongFunction;
@@ -85,10 +86,31 @@ public final class KairosScheduler extends Scheduler {
     private static final String SUPERVISOR_NAME = "Tuff Kairos Supervisor";
 
     /**
-     * How long a tick may sit in the wait queue before R5 starts caring. Two periods at 20 TPS: a tick
-     * that is a whole tick late is starvation, a tick that is a few hundred microseconds late is noise.
+     * How long a tick may sit in the wait queue before R5 starts caring when the fund has no period
+     * sample yet. Two periods at 20 TPS: a tick that is a whole tick late is starvation, a tick that is
+     * a few hundred microseconds late is noise. It is also the floor of the derived threshold, so a
+     * healthy 20 TPS server keeps exactly this number.
      */
-    private static final long OVERDUE_THRESHOLD_NANOS = TimeUnit.MILLISECONDS.toNanos(100L);
+    private static final long OVERDUE_FLOOR_NANOS = TimeUnit.MILLISECONDS.toNanos(100L);
+
+    /**
+     * The period of a healthy server, 20 ticks per second. It seeds the observed period so the first
+     * pass of the detector uses the documented floor instead of a wild guess.
+     */
+    private static final long NOMINAL_PERIOD_NANOS = TimeUnit.MILLISECONDS.toNanos(50L);
+
+    /**
+     * Ceiling for a period sample. A region that was inactive for a minute, or a clock jump, must not
+     * move the overdue threshold for the whole server by that amount.
+     */
+    private static final long PERIOD_SAMPLE_CAP_NANOS = TimeUnit.SECONDS.toNanos(10L);
+
+    /**
+     * Longest a parked runner sleeps without rechecking the halt flag. Halt unparks every runner, so
+     * this only matters in the tiny window where a runner decided to park and the unpark arrived
+     * first; without it that window would turn into a thread that outlives the join budget.
+     */
+    private static final long IDLE_PARK_NANOS = TimeUnit.SECONDS.toNanos(1L);
 
     /**
      * At most one overdue warning per this window. The detector still counts the suppressed passes so
@@ -105,6 +127,15 @@ public final class KairosScheduler extends Scheduler {
 
     private final ToLongFunction<SchedulableTick> scheduledStart;
     private final ThreadFactory threadFactory;
+
+    /**
+     * The handle questions catch-up needs. {@link KairosTickControl#none()} when the caller has no
+     * region handle to offer, in which case catch-up quietly does not engage.
+     */
+    private final KairosTickControl ticks;
+
+    /** Deadline order, shared by the global queue and by every runner backlog. */
+    private final Comparator<ScheduledState> byDeadline;
 
     /**
      * Monotonic time used by the supervisor, the stale-tick detector and the snapshot. Production
@@ -172,8 +203,70 @@ public final class KairosScheduler extends Scheduler {
 
     private volatile boolean elastic;
     private volatile KairosTuning tuning = KairosTuning.fixed();
+
+    /** Tick level knobs, resolved at start. Defaults keep the stock queue. */
+    private volatile KairosKernel kernel = KairosKernel.defaults();
+
+    /** Whether the per-tick and per-pass recording is armed. Read once per body, never allocates. */
+    private volatile boolean jfr;
+
+    /** Ticks a runner may keep for itself, {@code 0} when soft affinity is off. */
+    private volatile int affinityQueueSize;
+
+    /** How late a kept tick must be before another runner may take it. */
+    private volatile long stealThresholdNanos;
+
+    /**
+     * Average distance between two bodies of the same handle, in nanoseconds. Runners update it; the
+     * detector reads it. A best effort sample: a lost update only means one more pass at the previous
+     * average, which is what a metric of this kind is for.
+     */
+    private volatile long observedPeriodNanos = NOMINAL_PERIOD_NANOS;
+
+    /** Whether {@link #observedPeriodNanos} already saw a sample; the first one replaces the seed. */
+    private volatile boolean periodSampled;
+
+    /** Ticks sitting in runner backlogs. Guarded by {@link #scheduleLock}. */
+    private int localDepth;
+
     private volatile boolean started;
     private volatile boolean halted;
+
+    /** Ticks that were handed back to the runner that just ran them. */
+    private final LongAdder affinityHits = new LongAdder();
+
+    /** Ticks another runner took out of a backlog because they were late. */
+    private final LongAdder stolenTicks = new LongAdder();
+
+    /** Permits whose wait was measured. */
+    private final LongAdder leaseGrants = new LongAdder();
+
+    /** Permits whose wait exceeded the configured lease timeout. */
+    private final LongAdder leaseTimeouts = new LongAdder();
+
+    /** Longest wait between a tick deadline and its permit grant, best effort. */
+    private volatile long leaseQueuedMaxNanos;
+
+    /** Longest wait between a permit grant and the tick start, best effort. */
+    private volatile long leaseParkedMaxNanos;
+
+    /** Set by a runner that saw a wait above the timeout; cleared by the warning that reports it. */
+    private volatile boolean leaseTimeoutPending;
+
+    /** Catch-up bursts the fund started. */
+    private final LongAdder catchUpBursts = new LongAdder();
+
+    /** Extra tick bodies run to recover a backlog beyond the first body of a burst. */
+    private final LongAdder catchUpTicks = new LongAdder();
+
+    /** Supervisor only: not before this instant may the next lease warning be written. */
+    private long lastLeaseWarnNanos;
+
+    /** Supervisor only: lease timeouts the quiet window swallowed since the last warning. */
+    private long suppressedLeaseWarns;
+
+    /** Supervisor only: at least one lease warning was written, so the quiet window has a start. */
+    private boolean leaseWarned;
 
     /**
      * Not before this instant may the next runner be retired. Supervisor only.
@@ -206,19 +299,39 @@ public final class KairosScheduler extends Scheduler {
         final ThreadFactory threadFactory,
         final ToLongFunction<SchedulableTick> scheduledStart
     ) {
-        this(threads, threadFactory, scheduledStart, System::nanoTime);
+        this(threads, threadFactory, scheduledStart, KairosTickControl.none(), System::nanoTime);
+    }
+
+    /**
+     * Creates the fund with the handle questions catch-up needs.
+     *
+     * @param threads        initial floor of the fund
+     * @param threadFactory  factory owned by the caller
+     * @param scheduledStart reader for a tick's current deadline, in nanoseconds
+     * @param ticks          source of the missed period count and of the write-off limit
+     * @throws IllegalArgumentException if {@code threads} is not positive
+     * @throws NullPointerException     if an argument is {@code null}
+     */
+    public KairosScheduler(
+        final int threads,
+        final ThreadFactory threadFactory,
+        final ToLongFunction<SchedulableTick> scheduledStart,
+        final KairosTickControl ticks
+    ) {
+        this(threads, threadFactory, scheduledStart, ticks, System::nanoTime);
     }
 
     /**
      * Creates the fund with a clock the tests can move.
      *
-     * <p>The clock drives the supervisor, the stale-tick detector and the snapshot only. Parking a
-     * runner still uses real time, because a deadline comes from Folia's handle and must not be
-     * reinterpreted through a fake clock.
+     * <p>The clock drives the supervisor, the stale-tick detector, the snapshot and the observed
+     * period. Parking a runner still uses real time, because a deadline comes from Folia's handle and
+     * must not be reinterpreted through a fake clock.
      *
      * @param threads        initial floor of the fund
      * @param threadFactory  factory owned by the caller
      * @param scheduledStart reader for a tick's current deadline, in nanoseconds
+     * @param ticks          source of the missed period count and of the write-off limit
      * @param clock          monotonic time source, never {@code null}
      * @throws IllegalArgumentException if {@code threads} is not positive
      */
@@ -226,6 +339,7 @@ public final class KairosScheduler extends Scheduler {
         final int threads,
         final ThreadFactory threadFactory,
         final ToLongFunction<SchedulableTick> scheduledStart,
+        final KairosTickControl ticks,
         final LongSupplier clock
     ) {
         if (threads <= 0) {
@@ -233,6 +347,7 @@ public final class KairosScheduler extends Scheduler {
         }
         this.threadFactory = Objects.requireNonNull(threadFactory, "threadFactory");
         this.scheduledStart = Objects.requireNonNull(scheduledStart, "scheduledStart");
+        this.ticks = Objects.requireNonNull(ticks, "ticks");
         this.clock = Objects.requireNonNull(clock, "clock");
 
         final Comparator<ScheduledState> byDeadline = (final ScheduledState s1, final ScheduledState s2) -> {
@@ -249,6 +364,7 @@ public final class KairosScheduler extends Scheduler {
             // the tie break is part of the contract; do not "improve" it
             return Long.signum(t1.id - t2.id);
         };
+        this.byDeadline = byDeadline;
         this.awaiting = new LinkedSortedSet<>(byDeadline);
         this.queued = new PriorityQueue<>(byDeadline);
 
@@ -290,6 +406,10 @@ public final class KairosScheduler extends Scheduler {
             }
             this.tuning = fundTuning;
             this.elastic = fundTuning.elastic();
+            this.kernel = KairosGate.kernel();
+            this.jfr = this.kernel.jfr();
+            this.affinityQueueSize = this.kernel.affinityQueueSize();
+            this.stealThresholdNanos = TimeUnit.MILLISECONDS.toNanos(this.kernel.stealThresholdMillis());
             final int floor = this.minThreads;
             // one source for the ceiling: the thread layer's controller when it runs, the documented
             // core fraction otherwise. the port already accounts for the reserve, so nothing here
@@ -305,6 +425,7 @@ public final class KairosScheduler extends Scheduler {
             this.floorChangedNanos = this.clock.getAsLong();
 
             for (final Runner runner : this.slots) {
+                runner.prepareBacklog();
                 runner.thread.start();
                 this.live.incrementAndGet();
             }
@@ -461,6 +582,7 @@ public final class KairosScheduler extends Scheduler {
      */
     public KairosSnapshot snapshot() {
         final long now = this.clock.getAsLong();
+        final long threshold = this.overdueThresholdNanos();
         int awaiting = 0;
         int executing = 0;
         int queued = 0;
@@ -489,9 +611,29 @@ public final class KairosScheduler extends Scheduler {
                     longestAge = Math.max(longestAge, age);
                     ++aged;
                 }
-                if (age >= OVERDUE_THRESHOLD_NANOS) {
+                if (age >= threshold) {
                     ++overdue;
                     oldestOverdue = Math.max(oldestOverdue, age);
+                }
+            }
+            for (final Runner runner : this.slots) {
+                if (runner == null || runner.localBacklog == null) {
+                    continue;
+                }
+                for (final ScheduledState state : runner.localBacklog) {
+                    // a kept tick is still waiting for a permit; leaving it out would make the queue
+                    // look shorter and the detector blind exactly when affinity is on
+                    final long age = this.waitAge(now, state);
+                    ++queued;
+                    if (age > 0L) {
+                        totalAge += age;
+                        longestAge = Math.max(longestAge, age);
+                        ++aged;
+                    }
+                    if (age >= threshold) {
+                        ++overdue;
+                        oldestOverdue = Math.max(oldestOverdue, age);
+                    }
                 }
             }
             for (final ScheduledState state : this.awaiting) {
@@ -517,15 +659,40 @@ public final class KairosScheduler extends Scheduler {
             TimeUnit.NANOSECONDS.toMillis(oldestOverdue),
             averageMillis,
             longestAge / 1_000_000.0d,
-            TimeUnit.NANOSECONDS.toMillis(OVERDUE_THRESHOLD_NANOS),
+            TimeUnit.NANOSECONDS.toMillis(threshold),
             this.supervisorState(),
             this.lastDecision.kind(),
             this.lastDecision.describe(),
             this.spawnCount.get(),
             this.retireCount.get(),
             this.budgetSource,
-            this.degradedReasons(overdue)
+            this.degradedReasons(overdue),
+            new KairosSnapshot.LeaseWait(
+                this.leaseGrants.sum(),
+                TimeUnit.NANOSECONDS.toMillis(this.leaseQueuedMaxNanos),
+                TimeUnit.NANOSECONDS.toMillis(this.leaseParkedMaxNanos),
+                this.leaseTimeouts.sum(),
+                this.kernel.leaseTimeoutMillis()
+            ),
+            this.affinityHits.sum(),
+            this.stolenTicks.sum(),
+            this.catchUpBursts.sum(),
+            this.catchUpTicks.sum()
         );
+    }
+
+    /**
+     * Returns the wait above which a queued tick counts as overdue.
+     *
+     * <p>Two observed periods, floored at the 20 TPS value so a healthy server keeps the documented
+     * number. The constant this replaces was blind at low TPS: at 12 TPS a whole period is 83 ms, so a
+     * tick that had already missed its slot never reached 100 ms and the detector stayed silent.
+     *
+     * @return the threshold in nanoseconds
+     */
+    long overdueThresholdNanos() {
+        final long derived = 2L * this.observedPeriodNanos;
+        return Math.max(OVERDUE_FLOOR_NANOS, derived);
     }
 
     private KairosSnapshot.SupervisorState supervisorState() {
@@ -767,17 +934,25 @@ public final class KairosScheduler extends Scheduler {
             if (this.queued.remove(state)) {
                 return true;
             }
+            if (state.localOwner != null) {
+                // a tick kept by a runner is still unleased, so it is cancellable just like a queued one
+                return this.unstash(state.localOwner, state);
+            }
             if (state.awaitingLink != null) {
                 this.awaiting.remove(state.awaitingLink);
                 state.awaitingLink = null;
 
                 final Runner runner = state.ownedBy;
-                final ScheduledState replace = this.queued.poll();
+                state.ownedBy = null;
+                // the permit has to be handed over through the same transition a returning runner
+                // uses, otherwise the replacement is owned and running but invisible to the queues,
+                // and the next tick start would throw on the runner thread
+                final ScheduledState replace = this.pollNext(runner);
                 if (replace == null) {
                     this.idleThreads.set(runner.slot);
                     runner.forceIdle();
                 } else {
-                    runner.replaceTask(replace);
+                    this.grant(runner, replace);
                 }
                 return true;
             }
@@ -796,10 +971,7 @@ public final class KairosScheduler extends Scheduler {
 
         final int firstIdleThread = this.idleThreads.nextSetBit(0);
         if (firstIdleThread != -1) {
-            this.idleThreads.clear(firstIdleThread);
-            final Runner runner = runners[firstIdleThread];
-            task.awaitingLink = this.awaiting.addLast(task);
-            runner.acceptTask(task);
+            this.grant(runners[firstIdleThread], task);
             return false;
         }
 
@@ -808,11 +980,11 @@ public final class KairosScheduler extends Scheduler {
         if (last != null && this.compareByDeadline(task, last) < 0) {
             this.awaiting.pollLast();
             last.awaitingLink = null;
-            task.awaitingLink = this.awaiting.addLast(task);
+            final Runner runner = last.ownedBy;
+            last.ownedBy = null;
             this.queued.add(last);
 
-            final Runner runner = last.ownedBy;
-            runner.replaceTask(task);
+            this.grant(runner, task);
             this.recordDemand();
             return false;
         }
@@ -823,11 +995,48 @@ public final class KairosScheduler extends Scheduler {
     }
 
     /**
+     * The one place that hands a tick to a runner.
+     *
+     * <p>Four paths can move a tick into a permit - a fresh schedule, a spawn that fills the fund, a
+     * runner returning from a tick, and a cancel that has to replace the tick it removed - and all of
+     * them have to leave the same state behind: the tick linked into {@code awaiting}, marked as owned
+     * by the runner, stamped with the grant, and the runner's own state pointing at it. Anything less
+     * makes the tick invisible to the queue counters and turns the next {@link #takeTask} into an
+     * exception on a runner thread, which is outside Folia's handler and would kill the fund silently.
+     *
+     * <p>The caller has already removed the tick from whatever queue held it and cleared the previous
+     * owner; this method does not search the queues. Guarded by {@link #scheduleLock}.
+     *
+     * @param runner runner that is about to hold the permit
+     * @param task   unowned, unlinked tick to hand over
+     * @throws IllegalStateException if the tick is still attached to a queue, an owner, or a runner in
+     *                               a state that cannot take a permit
+     */
+    private void grant(final Runner runner, final ScheduledState task) {
+        if (task.ownedBy != null || task.awaitingLink != null || task.localOwner != null) {
+            throw new IllegalStateException("Task is already scheduled: " + task.tick);
+        }
+        final int state = runner.state.state;
+        if (state != Runner.STATE_IDLE && state != Runner.STATE_AWAITING_TICK
+            && state != Runner.STATE_EXECUTING_TICK) {
+            throw new IllegalStateException("Cannot hand a tick to a runner in state " + state);
+        }
+        if (state == Runner.STATE_IDLE) {
+            this.idleThreads.clear(runner.slot);
+        }
+        task.ownedBy = runner;
+        task.grantedNanos = this.clock.getAsLong();
+        task.awaitingLink = this.awaiting.addLast(task);
+        runner.setStateVolatile(new Runner.TickThreadRunnerState(task, Runner.STATE_AWAITING_TICK));
+        LockSupport.unpark(runner.getRunnerThread());
+    }
+
+    /**
      * Remembers that a tick had to wait, so the supervisor sees the burst even when it samples a quiet
      * moment. Guarded by {@link #scheduleLock}.
      */
     private void recordDemand() {
-        this.peakDemand = Math.max(this.peakDemand, this.live.get() + this.queued.size());
+        this.peakDemand = Math.max(this.peakDemand, this.live.get() + this.queued.size() + this.localDepth);
     }
 
     private int compareByDeadline(final ScheduledState s1, final ScheduledState s2) {
@@ -847,19 +1056,311 @@ public final class KairosScheduler extends Scheduler {
             throw new IllegalStateException("Task is not in awaiting");
         }
         tick.awaitingLink = null;
+        this.recordWait(tick);
+    }
+
+    /**
+     * Records how long the permit took, and the period between two bodies of the same handle.
+     *
+     * <p>Two waits are kept apart because they name different faults. The queued wait is the distance
+     * between the deadline and the grant: a region that had to wait for a permit, which is the signal
+     * that the fund is short. The parked wait is the distance between the later of the grant and the
+     * deadline and the actual start: the permit existed and the tick was due, yet the body still did
+     * not run, which is CPU or parking contention rather than a shortage of permits.
+     *
+     * <p>Cheap on purpose: a few counter updates on the runner thread. Nothing here locks, logs or
+     * allocates, because this is the tick path; the warning that reports a timeout is written by the
+     * supervisor.
+     *
+     * @param tick tick whose body is about to run
+     */
+    private void recordWait(final ScheduledState tick) {
+        final long now = this.clock.getAsLong();
+        final long granted = tick.grantedNanos;
+        if (granted != 0L) {
+            final long deadline = this.scheduledStart.applyAsLong(tick.tick);
+            final long queued = deadline == TimeUtil.DEADLINE_NOT_SET ? 0L : Math.max(0L, granted - deadline);
+            final long reference = deadline == TimeUtil.DEADLINE_NOT_SET ? granted : Math.max(granted, deadline);
+            final long parked = Math.max(0L, now - reference);
+            this.leaseGrants.increment();
+            if (queued > this.leaseQueuedMaxNanos) {
+                this.leaseQueuedMaxNanos = queued;
+            }
+            if (parked > this.leaseParkedMaxNanos) {
+                this.leaseParkedMaxNanos = parked;
+            }
+            final long timeout = TimeUnit.MILLISECONDS.toNanos(this.kernel.leaseTimeoutMillis());
+            if (timeout > 0L && Math.max(queued, parked) >= timeout) {
+                this.leaseTimeouts.increment();
+                this.leaseTimeoutPending = true;
+            }
+        }
+        this.recordPeriod(now, tick);
+    }
+
+    /**
+     * Feeds the observed period, which the overdue detector derives its threshold from.
+     *
+     * <p>The sample is the distance between two bodies of the same handle, so a region that is ticked
+     * at 12 TPS contributes 83 ms no matter how many regions share the fund. The first sample replaces
+     * the 20 TPS seed, which makes the detector honest as soon as a region has ticked twice; later
+     * samples are averaged so one freak tick does not move the threshold for the whole server.
+     *
+     * @param now  current clock reading
+     * @param tick tick whose body is about to run
+     */
+    private void recordPeriod(final long now, final ScheduledState tick) {
+        final long previous = tick.lastStartNanos;
+        tick.lastStartNanos = now;
+        if (previous == 0L) {
+            return;
+        }
+        final long sample = Math.clamp(now - previous, NOMINAL_PERIOD_NANOS, PERIOD_SAMPLE_CAP_NANOS);
+        if (!this.periodSampled) {
+            this.observedPeriodNanos = sample;
+            this.periodSampled = true;
+            return;
+        }
+        final long average = this.observedPeriodNanos;
+        this.observedPeriodNanos = Math.clamp(
+            (average * 3L + sample) / 4L, NOMINAL_PERIOD_NANOS, PERIOD_SAMPLE_CAP_NANOS
+        );
+    }
+
+    /**
+     * Decides what the next body may write off, which is the whole of catch-up.
+     *
+     * <p>A handle that is on time, or a fund that was not asked for catch-up, takes the stock path and
+     * the handle is never touched. A handle that is at least one whole period behind gets a body that
+     * accounts for exactly one period: the region stays late, so it is picked up again immediately
+     * through the normal queue, and the lost ticks are actually run instead of skipped. After at most
+     * {@code catch-up.cap-ticks} bodies, or when the time budget is spent, the next body settles the
+     * remaining backlog exactly like the stock body would, so a region that cannot catch up still
+     * returns to its normal cadence instead of keeping a permit busy.
+     *
+     * <p>Every body still goes through its own acquisition, so the one-permit-per-runner invariant,
+     * the cancellation check and the watchdog see exactly what they see on the stock path.
+     *
+     * @param tick tick whose body is about to run
+     */
+    private void prepareBody(final ScheduledState tick) {
+        final KairosKernel knobs = this.kernel;
+        tick.catchUpBody = false;
+        if (!knobs.catchUp() && !this.jfr) {
+            // the stock path: no seam call, no bookkeeping, exactly what the ported scheduler did
+            tick.bodyMissedPeriods = -1L;
+            return;
+        }
+        final long now = this.clock.getAsLong();
+        final long behind = this.ticks.missedPeriods().applyAsLong(tick.tick);
+        tick.bodyMissedPeriods = behind;
+        if (!knobs.catchUp()) {
+            return;
+        }
+        if (behind < 2L) {
+            // on time: hand the handle back to the stock mode, but only if a burst happened, so an
+            // ordinary tick never touches the seam at all
+            if (tick.burstBodies != 0) {
+                tick.burstBodies = 0;
+                this.ticks.writeOffLimit().accept(tick.tick, 0L);
+            }
+            return;
+        }
+        if (tick.burstBodies == 0) {
+            tick.burstStartNanos = now;
+            this.catchUpBursts.increment();
+        }
+        final boolean settled = tick.burstBodies + 1 >= knobs.catchUpCapTicks()
+            || now - tick.burstStartNanos >= TimeUnit.MILLISECONDS.toNanos(knobs.catchUpBudgetMillis());
+        if (settled) {
+            // the burst is over: write off the rest, which is exactly the stock body
+            tick.burstBodies = 0;
+            this.ticks.writeOffLimit().accept(tick.tick, 0L);
+            return;
+        }
+        ++tick.burstBodies;
+        tick.catchUpBody = true;
+        this.catchUpTicks.increment();
+        this.ticks.writeOffLimit().accept(tick.tick, 1L);
+    }
+
+    /**
+     * Records one executed body for a flight recording, if one is armed.
+     *
+     * <p>Called on the runner thread right after the body returned. The switch is checked before
+     * anything else, so a server that does not record does not pay the region lookup, the seam call or
+     * the event allocation.
+     *
+     * @param tick   tick that just ran
+     * @param start  when the body started, {@link System#nanoTime()} terms
+     * @param end    when the body returned
+     */
+    private void recordTick(final ScheduledState tick, final long start, final long end) {
+        if (!this.jfr) {
+            return;
+        }
+        final long missed = tick.bodyMissedPeriods;
+        final long skipped = missed < 0L
+            ? -1L
+            : (tick.catchUpBody ? 0L : Math.max(0L, missed - 1L));
+        KairosTickEvent.emit(
+            regionId(tick.tick),
+            tick.tick.id,
+            this.scheduledStart.applyAsLong(tick.tick),
+            start,
+            end,
+            missed,
+            tick.catchUpBody ? 1 : 0,
+            skipped
+        );
+    }
+
+    /**
+     * Queues a tick the runner just finished into its own backlog when soft affinity allows it.
+     *
+     * <p>Two conditions keep this from becoming a latency trap. The backlog must have room, and no
+     * other permit may be free: a free permit is exactly what the tick needs, so it must never be left
+     * parked while the tick sits in a private queue behind a busy runner. A tick that was just run has
+     * a deadline about one period out, so in the normal case it waits for a permit anyway and the
+     * affinity only decides whose permit it is.
+     *
+     * @param runner runner that just finished the tick
+     * @param task   tick that wants to be scheduled again
+     * @return {@code true} when the tick was kept for this runner
+     */
+    private boolean stash(final Runner runner, final ScheduledState task) {
+        if (this.affinityQueueSize <= 0 || runner.localBacklog == null) {
+            return false;
+        }
+        if (runner.localBacklog.size() >= this.affinityQueueSize) {
+            return false;
+        }
+        if (this.idleThreads.nextSetBit(0) >= 0) {
+            return false;
+        }
+        task.localOwner = runner;
+        runner.localBacklog.add(task);
+        ++this.localDepth;
+        return true;
+    }
+
+    private boolean unstash(final Runner runner, final ScheduledState task) {
+        if (runner.localBacklog == null || !runner.localBacklog.remove(task)) {
+            return false;
+        }
+        task.localOwner = null;
+        --this.localDepth;
+        return true;
+    }
+
+    /**
+     * Picks the next tick for a permit that just became free.
+     *
+     * <p>Order is: this runner's own kept tick, the global queue, and one candidate kept by another
+     * runner. The own backlog comes first on purpose - that is the whole point of affinity - and the
+     * two are compared by the EDF comparator before either is taken, so an earlier global tick still
+     * wins. A foreign candidate is only taken when it is already past its deadline by at least the
+     * steal threshold, and stealing moves an unleased tick, never a permit, which is what keeps the
+     * one-permit-per-runner invariant intact.
+     *
+     * <p>Guarded by {@link #scheduleLock}.
+     *
+     * @param runner runner the permit belongs to
+     * @return the tick to hand over, or {@code null} when nothing is ready
+     */
+    private @Nullable ScheduledState pollNext(final Runner runner) {
+        final long now = this.clock.getAsLong();
+        ScheduledState best = runner.localBacklog == null ? null : runner.localBacklog.peek();
+        boolean bestIsLocal = best != null;
+
+        final ScheduledState global = this.queued.peek();
+        if (global != null && (best == null || this.compareByDeadline(global, best) < 0)) {
+            best = global;
+            bestIsLocal = false;
+        }
+
+        if (this.affinityQueueSize > 0) {
+            final Runner victim = this.stealCandidate(runner);
+            final ScheduledState kept = victim == null ? null : victim.localBacklog.peek();
+            if (kept != null && this.overdueBy(now, kept) >= this.stealThresholdNanos
+                && (best == null || this.compareByDeadline(kept, best) < 0)) {
+                // the head of the victim backlog is the tick we just peeked at; the lock makes that safe
+                victim.localBacklog.poll();
+                kept.localOwner = null;
+                --this.localDepth;
+                this.stolenTicks.increment();
+                best = kept;
+                bestIsLocal = false;
+            }
+        }
+
+        if (best == null) {
+            return null;
+        }
+        if (bestIsLocal) {
+            runner.localBacklog.poll();
+            best.localOwner = null;
+            --this.localDepth;
+            this.affinityHits.increment();
+        } else if (best == global) {
+            this.queued.poll();
+        }
+        return best;
+    }
+
+    /**
+     * Returns the next runner whose backlog may be inspected for a steal.
+     *
+     * <p>One candidate per pick, round robin, exactly like the work stealing scheduler Folia ships:
+     * with more than a handful of runners the most overdue tick may not be the one inspected, and a
+     * steal is an optimisation rather than a promise.
+     *
+     * @param runner runner that is about to take a tick
+     * @return a runner with a backlog, or {@code null}
+     */
+    private @Nullable Runner stealCandidate(final Runner runner) {
+        final Runner[] runners = this.slots;
+        if (runners.length < 2) {
+            return null;
+        }
+        for (int step = 1; step < runners.length; ++step) {
+            final int index = (runner.slot + step) % runners.length;
+            final Runner candidate = runners[index];
+            if (candidate == null || candidate == runner || candidate.localBacklog == null
+                || candidate.localBacklog.isEmpty()) {
+                continue;
+            }
+            return candidate;
+        }
+        return null;
+    }
+
+    /**
+     * Returns how far past its deadline a tick already is.
+     *
+     * @param now  current clock reading
+     * @param task waiting tick
+     * @return the positive lateness in nanoseconds, zero when it is not due yet
+     */
+    private long overdueBy(final long now, final ScheduledState task) {
+        final long start = this.scheduledStart.applyAsLong(task.tick);
+        if (start == TimeUtil.DEADLINE_NOT_SET) {
+            return 0L;
+        }
+        return Math.max(0L, now - start);
     }
 
     private @Nullable ScheduledState returnTask(final Runner runner, final @Nullable ScheduledState reschedule) {
-        if (reschedule != null) {
+        if (reschedule != null && !this.stash(runner, reschedule)) {
             this.queued.add(reschedule);
         }
-        final ScheduledState ret = this.queued.poll();
-        if (ret == null) {
+        final ScheduledState next = this.pollNext(runner);
+        if (next == null) {
             this.idleThreads.set(runner.slot);
             return null;
         }
-        ret.awaitingLink = this.awaiting.addLast(ret);
-        return ret;
+        this.grant(runner, next);
+        return next;
     }
 
     private void release(final ScheduledState task) {
@@ -868,20 +1369,21 @@ public final class KairosScheduler extends Scheduler {
     }
 
     /**
-     * Hands queued ticks to permits that just became free. Called after a spawn, with the schedule
+     * Hands waiting ticks to permits that just became free. Called after a spawn, with the schedule
      * lock held.
+     *
+     * <p>The pick is the same one a returning runner makes, so a freshly spawned runner may also take
+     * a backlog tick that is already late; otherwise it would park next to work it is allowed to do.
      */
     private void pump() {
         int slot;
         while ((slot = this.idleThreads.nextSetBit(0)) >= 0) {
-            final ScheduledState next = this.queued.poll();
+            final Runner runner = this.slots[slot];
+            final ScheduledState next = this.pollNext(runner);
             if (next == null) {
                 return;
             }
-            this.idleThreads.clear(slot);
-            final Runner runner = this.slots[slot];
-            next.awaitingLink = this.awaiting.addLast(next);
-            runner.acceptTask(next);
+            this.grant(runner, next);
         }
     }
 
@@ -970,6 +1472,7 @@ public final class KairosScheduler extends Scheduler {
             final Thread thread = this.threadFactory.newThread(body);
             final Runner runner = new Runner(thread, slot, this);
             body.setRunnable(runner);
+            runner.prepareBacklog();
             final Runner[] grown = slot == before.length ? Arrays.copyOf(before, slot + 1) : before.clone();
             grown[slot] = runner;
             this.slots = grown;
@@ -1007,22 +1510,26 @@ public final class KairosScheduler extends Scheduler {
     private void superviseOnce() {
         final long now = this.clock.getAsLong();
         final int target;
+        int awaiting = 0;
+        int executing = 0;
         synchronized (this.scheduleLock) {
-            int busy = 0;
             for (final Runner runner : this.slots) {
                 if (runner == null || !runner.thread.isAlive()) {
                     continue;
                 }
                 final int state = runner.state.state;
-                if (state == Runner.STATE_AWAITING_TICK || state == Runner.STATE_EXECUTING_TICK) {
-                    ++busy;
+                if (state == Runner.STATE_AWAITING_TICK) {
+                    ++awaiting;
+                } else if (state == Runner.STATE_EXECUTING_TICK) {
+                    ++executing;
                 }
             }
+            final int busy = awaiting + executing;
             // a tick that had to wait means every permit was taken at that moment, so the peak is a
             // better demand signal than a single sample of a queue that drains in microseconds
             final int peak = this.peakDemand;
             this.peakDemand = 0;
-            final int demand = Math.max(busy + this.queued.size(), peak);
+            final int demand = Math.max(busy + this.queued.size() + this.localDepth, peak);
             target = Math.max(this.minThreads, Math.min(this.maxThreads, demand));
         }
         this.targetThreads = target;
@@ -1056,7 +1563,28 @@ public final class KairosScheduler extends Scheduler {
                 this.recordDecision(KairosSnapshot.Decision.IDLE, liveNow, liveNow, target);
             }
         }
-        this.warnQueuedOverdue(now);
+        final int overdue = this.warnQueuedOverdue(now);
+        this.warnLeaseWait(now);
+        if (this.jfr) {
+            final int waiting;
+            synchronized (this.scheduleLock) {
+                waiting = this.queued.size() + this.localDepth;
+            }
+            // one event per pass: a recording then holds the fund's own timeline next to the per-tick
+            // events, which is what explains a hard miss without guessing from a TPS sample
+            KairosFundEvent.emit(
+                this.minThreads,
+                this.live.get(),
+                target,
+                this.maxThreads,
+                waiting,
+                awaiting,
+                executing,
+                overdue,
+                this.spawnCount.get(),
+                this.retireCount.get()
+            );
+        }
     }
 
     /**
@@ -1092,8 +1620,10 @@ public final class KairosScheduler extends Scheduler {
      * counted, not logged, and the next warning reports how many it swallowed.
      *
      * @param now supervisor clock at the start of the pass
+     * @return how many waiting ticks were already past the threshold
      */
-    private void warnQueuedOverdue(final long now) {
+    private int warnQueuedOverdue(final long now) {
+        final long threshold = this.overdueThresholdNanos();
         int overdue = 0;
         long oldestAge = 0L;
         long oldestRegion = -1L;
@@ -1101,7 +1631,7 @@ public final class KairosScheduler extends Scheduler {
         synchronized (this.scheduleLock) {
             for (final ScheduledState state : this.queued) {
                 final long age = this.waitAge(now, state);
-                if (age < OVERDUE_THRESHOLD_NANOS) {
+                if (age < threshold) {
                     continue;
                 }
                 ++overdue;
@@ -1111,14 +1641,31 @@ public final class KairosScheduler extends Scheduler {
                     oldestTick = state.tick.id;
                 }
             }
+            for (final Runner runner : this.slots) {
+                if (runner == null || runner.localBacklog == null) {
+                    continue;
+                }
+                for (final ScheduledState state : runner.localBacklog) {
+                    final long age = this.waitAge(now, state);
+                    if (age < threshold) {
+                        continue;
+                    }
+                    ++overdue;
+                    if (age > oldestAge) {
+                        oldestAge = age;
+                        oldestRegion = regionId(state.tick);
+                        oldestTick = state.tick.id;
+                    }
+                }
+            }
         }
         if (overdue == 0) {
-            return;
+            return 0;
         }
         if (this.lastOverdueWarnNanos != 0L
             && now - this.lastOverdueWarnNanos < OVERDUE_WARN_INTERVAL_NANOS) {
             ++this.suppressedOverdueWarns;
-            return;
+            return overdue;
         }
         final long suppressed = this.suppressedOverdueWarns;
         this.suppressedOverdueWarns = 0L;
@@ -1127,6 +1674,7 @@ public final class KairosScheduler extends Scheduler {
         final int liveNow = this.live.get();
         final boolean saturated = liveNow >= this.maxThreads;
         final long ageMillis = TimeUnit.NANOSECONDS.toMillis(oldestAge);
+        final long thresholdMillis = TimeUnit.NANOSECONDS.toMillis(threshold);
         final String oldest = oldestRegion >= 0L
             ? "region " + oldestRegion
             : "region unknown (tick " + oldestTick + ')';
@@ -1138,7 +1686,7 @@ public final class KairosScheduler extends Scheduler {
                 "Kairos: tick queue is saturated: {} queued tick(s) are past the {} ms wait threshold, "
                     + "oldest {} waited {} ms; the fund is at its ceiling {}/{}{}",
                 overdue,
-                TimeUnit.NANOSECONDS.toMillis(OVERDUE_THRESHOLD_NANOS),
+                thresholdMillis,
                 oldest,
                 ageMillis,
                 liveNow,
@@ -1150,7 +1698,7 @@ public final class KairosScheduler extends Scheduler {
                 "Kairos: tick starvation: {} queued tick(s) are past the {} ms wait threshold, "
                     + "oldest {} waited {} ms; the fund is at {}/{} thread(s) and can still grow{}",
                 overdue,
-                TimeUnit.NANOSECONDS.toMillis(OVERDUE_THRESHOLD_NANOS),
+                thresholdMillis,
                 oldest,
                 ageMillis,
                 liveNow,
@@ -1160,6 +1708,62 @@ public final class KairosScheduler extends Scheduler {
         }
         KairosQueuedOverdueEvent.emit(
             oldestRegion, ageMillis, overdue, liveNow, this.maxThreads, saturated
+        );
+        return overdue;
+    }
+
+    /**
+     * Warns when a permit was handed out too slowly, at most once per quiet window.
+     *
+     * <p>The measurement itself happens on the runner thread and is a couple of counters, so no tick
+     * ever waits on a lock to record it. This method is the only place that logs, and it runs on the
+     * supervisor: a warning from a tick thread would put disk I/O inside somebody's tick.
+     *
+     * <p>A timeout of zero means accounting only; the snapshot still shows the waits, there is simply
+     * no line and no event.
+     *
+     * @param now supervisor clock at the start of the pass
+     */
+    private void warnLeaseWait(final long now) {
+        if (!this.leaseTimeoutPending) {
+            return;
+        }
+        this.leaseTimeoutPending = false;
+        final long threshold = TimeUnit.MILLISECONDS.toNanos(this.kernel.leaseTimeoutMillis());
+        if (threshold <= 0L) {
+            return;
+        }
+        if (this.leaseWarned && now - this.lastLeaseWarnNanos < OVERDUE_WARN_INTERVAL_NANOS) {
+            ++this.suppressedLeaseWarns;
+            return;
+        }
+        final long suppressed = this.suppressedLeaseWarns;
+        this.suppressedLeaseWarns = 0L;
+        this.lastLeaseWarnNanos = now;
+        this.leaseWarned = true;
+
+        final long grants = this.leaseGrants.sum();
+        final long timeouts = this.leaseTimeouts.sum();
+        final long queuedMillis = TimeUnit.NANOSECONDS.toMillis(this.leaseQueuedMaxNanos);
+        final long parkedMillis = TimeUnit.NANOSECONDS.toMillis(this.leaseParkedMaxNanos);
+        final String quiet = suppressed == 0L
+            ? ""
+            : " (" + suppressed + " more lease timeout pass(es) suppressed since the last warning)";
+        LOGGER.warn(
+            "Kairos: lease wait above the {} ms timeout: {} of {} grant(s) timed out, "
+                + "longest queued {} ms, longest parked {} ms, fund {}/{}; the tick body is never blocked{}",
+            TimeUnit.NANOSECONDS.toMillis(threshold),
+            timeouts,
+            grants,
+            queuedMillis,
+            parkedMillis,
+            this.live.get(),
+            this.maxThreads,
+            quiet
+        );
+        KairosLeaseWaitEvent.emit(
+            queuedMillis, parkedMillis, grants, timeouts,
+            TimeUnit.NANOSECONDS.toMillis(threshold), this.live.get()
         );
     }
 
@@ -1267,10 +1871,40 @@ public final class KairosScheduler extends Scheduler {
                 return false;
             }
             this.idleThreads.clear(candidate.slot);
+            // the hint of a leaving runner dies with it: whatever it kept goes back to the one queue,
+            // and the slot that may be reused by the next spawn has no stale owner left behind
+            this.drainBacklog(candidate);
             candidate.retire();
             this.nextRetireNanos = now + RETIRE_COOLDOWN_NANOS;
             this.retireCount.incrementAndGet();
+            this.pump();
             return true;
+        }
+    }
+
+    /**
+     * Moves every tick a runner kept for itself back to the global queue.
+     *
+     * <p>Called when the runner leaves the fund. The ticks were never leased, so they are scheduled
+     * again by the normal order; a stale hint would otherwise point at a runner whose slot no longer
+     * belongs to it.
+     *
+     * @param runner runner that is about to leave
+     */
+    private void drainBacklog(final Runner runner) {
+        final PriorityQueue<ScheduledState> backlog = runner.localBacklog;
+        if (backlog == null) {
+            return;
+        }
+        ScheduledState kept;
+        while ((kept = backlog.poll()) != null) {
+            kept.localOwner = null;
+            this.queued.add(kept);
+            --this.localDepth;
+        }
+        if (this.localDepth < 0) {
+            // defensive: the counter only feeds the demand signal, but a negative depth would poison it
+            this.localDepth = 0;
         }
     }
 
@@ -1299,31 +1933,49 @@ public final class KairosScheduler extends Scheduler {
     }
 
     private void logStart(final int floor) {
+        final String tickKnobs = this.describeKernel();
         if (!this.elastic) {
             LOGGER.info(
                 "Kairos: fixed fund of {} tick thread(s) (elasticity is off); threaded-regions.threads "
-                    + "needs a restart",
-                floor
+                    + "needs a restart; {}",
+                floor,
+                tickKnobs
             );
             return;
         }
         if (this.maxThreads <= floor) {
             LOGGER.warn(
-                "Kairos: fund is fixed at {} tick thread(s): the ceiling {} gives no headroom ({})",
+                "Kairos: fund is fixed at {} tick thread(s): the ceiling {} gives no headroom ({}); {}",
                 floor,
                 this.maxThreads,
-                this.budgetSource
+                this.budgetSource,
+                tickKnobs
             );
             return;
         }
         LOGGER.info(
-            "Kairos: elastic fund min {}, max {} ({}), keep-alive {}s, spawn rate {}/s",
+            "Kairos: elastic fund min {}, max {} ({}), keep-alive {}s, spawn rate {}/s; {}",
             floor,
             this.maxThreads,
             this.budgetSource,
             this.tuning.keepAliveMillis() / 1000L,
-            this.tuning.spawnRatePerSecond()
+            this.tuning.spawnRatePerSecond(),
+            tickKnobs
         );
+    }
+
+    /**
+     * Describes the tick level knobs in one clause for the startup line.
+     *
+     * @return a short human readable summary, never {@code null}
+     */
+    private String describeKernel() {
+        final KairosKernel knobs = this.kernel;
+        return "catch-up " + knobs.catchUpCapTicks() + " tick(s)/"
+            + (knobs.catchUpBudgetMillis() > 0 ? knobs.catchUpBudgetMillis() + " ms" : "off")
+            + ", affinity queue " + knobs.affinityQueueSize()
+            + " (steal " + knobs.stealThresholdMillis() + " ms), lease timeout "
+            + (knobs.leaseTimeoutMillis() > 0 ? knobs.leaseTimeoutMillis() + " ms" : "off");
     }
 
     /**
@@ -1400,6 +2052,27 @@ public final class KairosScheduler extends Scheduler {
         private @Nullable Runner ownedBy;
         private LinkedSortedSet.@Nullable Link<ScheduledState> awaitingLink;
 
+        /** Runner whose private queue holds this tick, or {@code null} when it sits in the one queue. */
+        private @Nullable Runner localOwner;
+
+        /** When the permit was handed out, or zero before the first grant. */
+        private long grantedNanos;
+
+        /** Start of the previous body, for the observed period sample; zero before the first body. */
+        private long lastStartNanos;
+
+        /** Catch-up bodies already run in the current burst; runner thread only. */
+        private int burstBodies;
+
+        /** When the current catch-up burst started; runner thread only. */
+        private long burstStartNanos;
+
+        /** Periods the handle reported before the body, or {@code -1}; runner thread only. */
+        private long bodyMissedPeriods = -1L;
+
+        /** Whether the body about to run accounts for a single period; runner thread only. */
+        private boolean catchUpBody;
+
         private ScheduledState(final SchedulableTick tick) {
             this.tick = tick;
         }
@@ -1438,11 +2111,27 @@ public final class KairosScheduler extends Scheduler {
          */
         private volatile long idleSince;
 
+        /**
+         * Ticks kept for this runner while soft affinity is on, or {@code null} when it is off.
+         * Guarded by {@link KairosScheduler#scheduleLock}.
+         */
+        private @Nullable PriorityQueue<ScheduledState> localBacklog;
+
         private Runner(final Thread thread, final int slot, final KairosScheduler scheduler) {
             this.thread = thread;
             this.slot = slot;
             this.scheduler = scheduler;
             this.idleSince = scheduler.clock.getAsLong();
+        }
+
+        /**
+         * Allocates the private queue when the operator asked for soft affinity. Called before the
+         * thread starts, never on the tick path.
+         */
+        private void prepareBacklog() {
+            if (this.scheduler.affinityQueueSize > 0 && this.localBacklog == null) {
+                this.localBacklog = new PriorityQueue<>(this.scheduler.byDeadline);
+            }
         }
 
         private void setStatePlain(final TickThreadRunnerState state) {
@@ -1462,35 +2151,6 @@ public final class KairosScheduler extends Scheduler {
 
         private Thread getRunnerThread() {
             return this.thread;
-        }
-
-        private void acceptTask(final ScheduledState task) {
-            if (task.ownedBy != null) {
-                throw new IllegalStateException("Already owned by another runner");
-            }
-            task.ownedBy = this;
-            final TickThreadRunnerState state = this.state;
-            if (state.state != STATE_IDLE) {
-                throw new IllegalStateException("Cannot accept task in state " + state);
-            }
-            this.setStateVolatile(new TickThreadRunnerState(task, STATE_AWAITING_TICK));
-            LockSupport.unpark(this.getRunnerThread());
-        }
-
-        private void replaceTask(final ScheduledState task) {
-            final TickThreadRunnerState state = this.state;
-            if (state.state != STATE_AWAITING_TICK) {
-                throw new IllegalStateException("Cannot replace task in state " + state);
-            }
-            if (task.ownedBy != null) {
-                throw new IllegalStateException("Already owned by another runner");
-            }
-            task.ownedBy = this;
-
-            state.stateTarget.ownedBy = null;
-
-            this.setStateVolatile(new TickThreadRunnerState(task, STATE_AWAITING_TICK));
-            LockSupport.unpark(this.getRunnerThread());
         }
 
         private void forceIdle() {
@@ -1528,17 +2188,13 @@ public final class KairosScheduler extends Scheduler {
             synchronized (this.scheduler.scheduleLock) {
                 task.ownedBy = null;
 
-                final ScheduledState newWait = this.scheduler.returnTask(this, reschedule ? task : null);
-                if (newWait == null) {
+                final ScheduledState next = this.scheduler.returnTask(this, reschedule ? task : null);
+                if (next == null) {
                     this.idleSince = this.scheduler.clock.getAsLong();
                     this.setStatePlain(new TickThreadRunnerState(null, STATE_IDLE));
-                } else {
-                    if (newWait.ownedBy != null) {
-                        throw new IllegalStateException("Already owned by another runner");
-                    }
-                    newWait.ownedBy = this;
-                    this.setStatePlain(new TickThreadRunnerState(newWait, STATE_AWAITING_TICK));
                 }
+                // when there is a next tick, the scheduler already linked it and moved this runner to
+                // AWAITING_TICK in the same transition; nothing is left to set here
                 if (!reschedule) {
                     this.scheduler.release(task);
                 }
@@ -1568,7 +2224,9 @@ public final class KairosScheduler extends Scheduler {
                     case STATE_IDLE -> {
                         while (this.state.state == STATE_IDLE) {
                             Thread.interrupted();
-                            LockSupport.park();
+                            // bounded on purpose: halt sets its flag before it unparks, and a park that
+                            // lands between the two would otherwise never be woken
+                            LockSupport.parkNanos(IDLE_PARK_NANOS);
                             if (this.scheduler.halted) {
                                 return;
                             }
@@ -1593,9 +2251,15 @@ public final class KairosScheduler extends Scheduler {
                             continue;
                         }
 
+                        // the body may be a catch-up body; the decision is made before the handle moves
+                        this.scheduler.prepareBody(startStateTask);
+                        final long bodyStart = System.nanoTime();
+
                         // failures reach Folia's uncaught handler, which halts and stops the server
                         final boolean reschedule = startStateTask.tick.runTick();
+                        final long bodyEnd = System.nanoTime();
 
+                        this.scheduler.recordTick(startStateTask, bodyStart, bodyEnd);
                         this.returnTask(startStateTask, reschedule);
                     }
 

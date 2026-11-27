@@ -87,8 +87,27 @@ public final class KairosReport {
             + "; last decision " + describeDecision(snapshot));
         lines.add(INDENT + "fund events: spawned " + snapshot.spawnCount()
             + ", retired " + snapshot.retireCount());
+        lines.add(INDENT + "ticks: affinity hits " + snapshot.affinityHits()
+            + ", steals " + snapshot.stolenTicks()
+            + ", catch-up " + snapshot.catchUpBursts() + " burst(s) / "
+            + snapshot.catchUpTicks() + " tick(s)");
+        lines.add(INDENT + "leases: " + describeLeaseWait(snapshot.leaseWait()));
         lines.add(INDENT + "degraded: " + describeReasons(snapshot.degradedReasons()));
         return List.copyOf(lines);
+    }
+
+    private static String describeLeaseWait(final KairosSnapshot.LeaseWait leaseWait) {
+        final StringBuilder text = new StringBuilder(64);
+        text.append(leaseWait.grants()).append(" measured, wait max queued ")
+            .append(leaseWait.queuedMaxMillis()).append(" ms / parked ")
+            .append(leaseWait.parkedMaxMillis()).append(" ms");
+        if (leaseWait.armed()) {
+            text.append(", ").append(leaseWait.timeouts())
+                .append(" over the ").append(leaseWait.timeoutMillis()).append(" ms timeout");
+        } else {
+            text.append(", timeout off");
+        }
+        return text.toString();
     }
 
     private static String describeSupervisor(

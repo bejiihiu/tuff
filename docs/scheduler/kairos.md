@@ -22,6 +22,15 @@ thread-management:
       max-threads: 4
       keep-alive-seconds: 30
       spawn-rate-per-second: 10
+      catch-up:             # off by default: 1 body, whole backlog written off
+        cap-ticks: 1
+        budget-millis: 50
+      steal:
+        threshold-millis: 3
+      affinity:
+        local-queue-size: 0 # off by default: one shared queue
+      lease:
+        timeout-seconds: 0  # accounting only, no warning
 ```
 
 ## What it does
@@ -47,10 +56,37 @@ thread-management:
   already deducted for this lane. The controller has already removed the deducted lanes and the
   reserve, so nothing here subtracts the reserve a second time. Only when the thread layer is off does
   the documented `floor(cores * 0.8)` rule apply. An explicit `max-threads` always wins.
+- **A late region can run its missing ticks** (`catch-up`). Off by default: the stock behaviour runs
+  one body and writes off the whole backlog, so a region that missed five periods loses four ticks.
+  With `cap-ticks` above 1 and a budget above 0, a region that is at least one whole period behind
+  gets bodies that each account for a single period, so the missed ticks are run instead of dropped.
+  After at most `cap-ticks` bodies of one burst, or when `budget-millis` is spent, the next body
+  settles the remaining backlog exactly like the stock body would; the region then waits its normal
+  period, so catching up is paced and never becomes a tick storm. Every body still goes through its
+  own acquisition, so the one-permit-per-runner invariant, the cancellation check and the watchdog see
+  exactly what they see on the stock path, and a cancelled region never gets a catch-up body.
+- **A tick tends to come back to the same thread** (`affinity`). With `local-queue-size` above 0 a
+  runner keeps the regions it just ticked in a bounded private queue instead of the one shared queue,
+  so their thread locals and caches stay warm. The shared queue is still consulted, and an earlier
+  tick there wins; the private queue never holds a permit, only ticks. A tick is kept only while every
+  permit is taken, so a free permit never parks next to a private queue. Another runner may take a
+  kept tick only when it is already past its deadline by `steal-threshold-millis`, and a steal moves
+  the tick, never the permit. A hint dies with its runner: when a runner retires its queue goes back
+  to the shared one, and the slot that a later spawn reuses starts empty.
+- **A slow permit is measured and reported** (`lease`). Two waits are counted apart on every grant:
+  the distance between the tick deadline and the moment a permit existed, which is the shortage
+  signal, and the extra time after both the permit and the deadline existed, which is contention.
+  With `timeout-seconds` above 0 the supervisor warns when a wait exceeded it, at most once per ten
+  seconds, and emits `tuff.scheduler.LeaseWait`; the suppressed passes are counted and named in the
+  next line. The measurement itself is a few counters on the runner thread: no tick ever waits on a
+  lock or on the log.
 - **A stale tick is reported.** The Folia watchdog only sees a tick that already started, so a region
-  whose permit never arrives is invisible to it. The supervisor scans the wait queue once per pass and
-  warns when a tick's `scheduledStart` is more than two periods (100 ms) old: "starvation" while the
-  fund still has room, "saturated" when it is already at its ceiling. Warnings are limited to one per
+  whose permit never arrives is invisible to it. The supervisor scans the wait queue - and every
+  private queue - once per pass and warns when a tick's `scheduledStart` is more than two observed
+  periods old: "starvation" while the fund still has room, "saturated" when it is already at its
+  ceiling. The period is measured from the distance between two bodies of the same region, so a
+  server that manages 12 TPS uses 166 ms instead of the fixed 100 ms that made the detector blind
+  below 20 TPS; a healthy 20 TPS server keeps exactly the old number. Warnings are limited to one per
   ten seconds, suppressed passes are counted and reported in the next line, and the same moment is
   emitted as the `tuff.scheduler.QueuedOverdue` JFR event. A fixed fund has no supervisor and
   therefore no such warning; `/tuff scheduler` still counts the overdue ticks for it.
@@ -81,23 +117,32 @@ thread-management:
 | `region-execution.kairos.max-threads` | tuff.yml | `-1` | ceiling; `-1` means the thread layer budget when it runs, otherwise `floor(cores * 0.8)` |
 | `region-execution.kairos.keep-alive-seconds` | tuff.yml | `30` | how long a thread must sit idle before it may be retired |
 | `region-execution.kairos.spawn-rate-per-second` | tuff.yml | `10` | how many new tick threads may be started per second |
+| `region-execution.kairos.catch-up.cap-ticks` | tuff.yml | `1` | tick bodies one late region may run back to back; `1` is the stock skip, needs a budget above 0 |
+| `region-execution.kairos.catch-up.budget-millis` | tuff.yml | `50` | wall clock one catch-up burst may spend; `0` disables catch-up |
+| `region-execution.kairos.steal.threshold-millis` | tuff.yml | `3` | how late a kept tick must be before another runner may take it |
+| `region-execution.kairos.affinity.local-queue-size` | tuff.yml | `0` | ticks a runner may keep for itself; `0` keeps the single shared queue |
+| `region-execution.kairos.lease.timeout-seconds` | tuff.yml | `0` | permit wait that triggers a warning; `0` keeps the measurement only |
+| `region-execution.kairos.metrics.jfr` | tuff.yml | `false` | record every tick and every pass as JFR events; off costs one field read per tick |
 
 Everything except `threaded-regions.threads` is restart only. The settings are read when the region
 scheduler starts; the scheduler object itself is created while `paper-global.yml` is being loaded, so
-the values travel through the opt-in gate rather than the constructor.
+the values travel through the opt-in gate rather than the constructor. A value outside its range is
+reported in the startup log and replaced by the stock behaviour instead of crashing the start.
 
 ## What the logs say
 
 ```
-[Tuff/Kairos] Kairos: elastic fund min 2, max 4 (kairos.max-threads 4), keep-alive 30s, spawn rate 10/s
+[Tuff/Kairos] Kairos: elastic fund min 2, max 4 (kairos.max-threads 4), keep-alive 30s, spawn rate 10/s; catch-up 3 tick(s)/50 ms, affinity queue 4 (steal 3 ms), lease timeout 100 ms
 [Tuff/Kairos] Kairos: fund reached its ceiling of 4 tick thread(s) under load
 [Tuff/Kairos] Kairos: fund is back to its floor of 2 tick thread(s)
+[Tuff/Kairos] Kairos: lease wait above the 100 ms timeout: 3 of 812 grant(s) timed out, longest queued 240 ms, longest parked 41 ms, fund 4/4; the tick body is never blocked
 ```
 
-Per thread spawn and retire decisions are `DEBUG`; only the edges (ceiling reached, floor reached)
-are `INFO`, so a normal run does not flood the log. A failing supervisor pass is one `WARN` per
-minute: the fund keeps the size it has and the ticks keep running. A stale tick is one `WARN` per ten
-seconds, and the line names the region, its wait, and whether the fund is at its ceiling.
+Per thread spawn and retire decisions are `DEBUG`; only the edges (ceiling reached, floor reached,
+the tick knobs at start) are `INFO`, so a normal run does not flood the log. A failing supervisor pass
+is one `WARN` per minute: the fund keeps the size it has and the ticks keep running. A stale tick and
+a slow permit are one `WARN` per ten seconds each, and the lines name the region, its wait, and
+whether the fund is at its ceiling.
 
 ## `/tuff scheduler`
 
@@ -108,19 +153,29 @@ never waits for a tick. The shape is fixed, the numbers are whatever the server 
 ```
 Tuff scheduler: Kairos (experimental) - status: ok
   fund: min 2, live 3, target 4, max 11; elasticity on, ceiling source: utmi budget (usable cores plus the deducted region threads)
-  queue: 1 queued, 2 awaiting, 0 executing; tick wait avg 40.0 ms, max 104.0 ms; overdue 1 (threshold 100 ms, oldest 104 ms)
+  queue: 1 queued, 2 awaiting, 0 executing; tick wait avg 40.0 ms, max 104.0 ms; overdue 1 (threshold 166 ms, oldest 180 ms)
   supervisor: running; last decision grow (2 -> 3, target 4)
   fund events: spawned 1, retired 0
+  ticks: affinity hits 214, steals 3, catch-up 7 burst(s) / 12 tick(s)
+  leases: 812 measured, wait max queued 24 ms / parked 4 ms, 3 over the 100 ms timeout
   degraded: none
 ```
 
 - `status` is `DEGRADED` as soon as `degraded` is not `none`; the reasons are `NO_HEADROOM` (the
   resolved ceiling is not above the floor, so elasticity can do nothing), `SUPERVISOR_DEAD` (the fund
   is elastic, started, and its control thread is gone) and `QUEUED_OVERDUE` (at least one tick is
-  past the 100 ms wait threshold right now).
+  past the wait threshold right now).
 - `tick wait avg / max` is the age of `scheduledStart` for ticks that are waiting. A tick whose
   deadline is still in the future contributes zero, so an idle queue and a queue of early ticks both
   read `0.0 ms`.
+- `overdue` counts waiting ticks in the shared queue **and** in runner backlogs, so affinity cannot
+  hide a tick from the detector. `threshold` is two observed periods with a 100 ms floor: `100 ms` on
+  a healthy 20 TPS server, `166 ms` at 12 TPS.
+- `ticks` is the affinity counter pair and the catch-up counters: `affinity hits` are ticks handed
+  back to the runner that ran them last, `steals` are ticks another runner took because they were
+  late, and `catch-up bursts / tick(s)` are the bursts started and the extra bodies they ran.
+- `leases` is the permit accounting: grants measured, the worst wait before a permit existed, the
+  worst wait after it existed, and the timeouts when a timeout is configured.
 - `last decision` is `grow`, `shrink` or `idle` with the before, after and target of the last pass.
 - Under EDF or `WORK_STEALING` the command prints `no fund telemetry` and the configured thread count.
   Those schedulers have no fund, no supervisor and no wait queue this project can read; inventing a
@@ -128,6 +183,32 @@ Tuff scheduler: Kairos (experimental) - status: ok
 
 `/tuff threads` shows the same fund condensed into one `scheduler:` line, and under EDF or work
 stealing says `no fund telemetry (Kairos only)`.
+
+## Recording
+
+With `thread-management.region-execution.kairos.metrics.jfr: true` the fund writes two JFR events.
+Both are off by default, and off means one field read per tick and nothing else: the switch is checked
+before the event is constructed, before the region lookup and before the period count is asked for.
+A recording still has to enable the events, so the switch arms the code and the recording decides what
+is kept.
+
+| Event | When | Fields |
+|---|---|---|
+| `tuff.scheduler.Tick` | once per executed tick body | `regionId`, `tickId`, `scheduledStartNanos`, `startNanos`, `endNanos`, `missedPeriods`, `catchUpTicks`, `skipped`, `executedNanos` |
+| `tuff.scheduler.Fund` | once per supervisor pass | `minThreads`, `liveThreads`, `targetThreads`, `maxThreads`, `queuedTicks`, `awaitingTicks`, `executingTicks`, `overdueTicks`, `spawned`, `retired` |
+
+`tuff.scheduler.Tick` exists for one reason: a per-region TPS average cannot tell a missed deadline
+from a slow tick. `scheduledStartNanos` against `startNanos` is the lag of that exact tick,
+`missedPeriods` is how many whole periods the handle was behind before the body, `skipped` is how many
+of them the body wrote off instead of running (`-1` when the handle could not answer, which is what a
+server with catch-up and recording both off reports), and `catchUpTicks` is `1` for a body that ran to
+recover a period. A stand can therefore compute a real hard miss - `lag >= period` or
+`missedPeriods > 1` - and a real skip count, instead of using a five second sample as a proxy.
+
+`tuff.scheduler.Fund` is the other half of the explanation: one row per pass with the fund's size, what
+the queues held, how many ticks were already past the threshold, and the lifetime spawn and retire
+counters. A hard miss next to `liveThreads == maxThreads` and `queuedTicks > 0` is a missing permit; the
+same miss next to free headroom is a slow tick.
 
 
 ## Risks and limits
@@ -147,9 +228,18 @@ stealing says `no fund telemetry (Kairos only)`.
 - **A stale tick is detected, not fixed.** The warning proves that permits, not CPU scarcity, are the
   reason a region is not moving; it cannot create capacity that is not there. The honest fixes are
   fewer regions or a larger budget, and admission control is not in this prototype.
-- **Not a faster scheduler.** Order, catch up and clamping are EDF's. Any gain must come from the
-  elasticity itself; if a measurement shows none, the feature is expected to be removed rather than
-  kept as a curiosity.
+- **Affinity trades latency for locality.** A late tick that another runner could have taken waits for
+  its owner until it is past the steal threshold, and an owner that frees up before that moment runs
+  it itself. The wait is bounded by the owner's current body, and the private queue is only used while
+  every permit is busy, so the fund never parks next to work it could do. Turn
+  `affinity.local-queue-size` back to 0 to get the single shared queue with no such trade.
+- **Catch-up changes game semantics, so it is opt in.** Running a missed tick means the world ticked
+  once more than a skip would have allowed, with the same consequences for anything that counts
+  ticks. That is why the cap exists, why the budget is required for it to engage at all, and why the
+  default is exactly Folia's skip. Measure it on your own profile before enabling it.
+- **Not a faster scheduler.** Order and clamping are EDF's. Any gain must come from the elasticity
+  and from the optional tick policies above; if a measurement shows none, the feature is expected to
+  be removed rather than kept as a curiosity.
 - **Experimental.** No soak, no full A/B and no canary yet. Do not enable it on a server whose world
   you cannot restore from a backup.
 - **NUMA and affinity are not supported.** Threads are created on demand by the supervisor and
@@ -158,4 +248,7 @@ stealing says `no fund telemetry (Kairos only)`.
 ## Rollback
 
 Set `scheduler: EDF` and restart. Kairos classes are not loaded and no Kairos thread exists on the
-EDF path. Nothing migrates; the world is untouched.
+EDF path. If you only want the stock tick behaviour back while staying on Kairos, set
+`catch-up.cap-ticks: 1`, `affinity.local-queue-size: 0` and `lease.timeout-seconds: 0` and restart:
+those three defaults are the ported Folia path, verified by the ordering parity test. Nothing
+migrates; the world is untouched.
