@@ -483,19 +483,28 @@ proxies:
 `GlobalConfiguration.Proxies#isProxyOnlineMode()` reports online mode when **any** of these is true:
 `server.properties: online-mode`, `settings.bungeecord` together with `bungee-cord.online-mode`, or
 `proxies.velocity.enabled` together with `velocity.online-mode`. That check does not reject a
-combination; it only answers the question. Pick one authentication authority and make the other
-component defer to it. The proxy's own mode, its `velocity.toml` / `config.yml` and the exact pairing
-of the backend's `online-mode` with it are outside this repository and are not verified here.
+combination; it only answers the question.
+
+The login path fixes the pairing. `ServerLoginPacketListenerImpl#handleHello` only asks Velocity for
+the forwarded profile when the backend is **not** authenticating players itself: the branch tests
+`server.usesAuthentication()`, and `MinecraftServer#usesAuthentication()` returns the
+`server.properties: online-mode` value. With `online-mode=true` the server sends its own encryption
+request and never requests the Velocity payload, so a Velocity-backed backend runs with
+`server.properties: online-mode=false`; `proxies.velocity.online-mode` then describes the proxy's
+authentication to the rest of the server. The proxy's own mode, its `velocity.toml` / `config.yml` and
+its forwarding configuration are outside this repository and are not verified here.
 
 ### Modern forwarding versus legacy
 
 - **Velocity modern forwarding** is the supported path. The backend enables it with
   `proxies.velocity.enabled: true` and a non-empty secret, from `proxies.velocity.secret` or the
-  environment; `VelocityProxy` verifies
-  every forwarded login payload with `HmacSHA256` over the shared secret and reads the player's UUID,
-  name and profile properties from it. If Velocity is enabled and the secret is still empty, the
+  environment; `VelocityProxy` verifies every forwarded login payload with `HmacSHA256` over the
+  shared secret and reads the player's UUID, name and profile properties from it, and it replaces the
+  connection address with the one in the payload (`VelocityProxy.readAddress`). If Velocity is
+  enabled and the secret is still empty, the
   server logs `Velocity is enabled, but no secret key was specified...` and disables Velocity instead
-  of starting an unauthenticated forwarding path.
+  of starting an unauthenticated forwarding path. While it is enabled, a direct connection that did
+  not go through the proxy is refused with `This server requires you to connect with Velocity.`
 - **Legacy BungeeCord forwarding** is `settings.bungeecord: true` in `config/spigot.yml`, with
   `proxies.bungee-cord.online-mode` describing whether that proxy authenticates. The comment in
   `VelocityProxy` states plainly that BungeeCord-style IP forwarding is not secure. Prefer modern
@@ -546,8 +555,8 @@ The proxy is the only process that should be reachable from the internet.
   region remain the number that matters, which is why the hub preset above is about tick headroom,
   not about compute.
 - **One player is still one connection.** The backend's netty loops accept the proxy's connections and
-  the player count is the same; only the peer address changes unless PROXY protocol or forwarding
-  supplies the original one.
+  the player count is the same. Forwarding can carry the client address (modern forwarding does, and
+  the backend applies it); without it the backend sees the proxy's address.
 - **Join rate limiting moves to the proxy.** `CraftServer#getConnectionThrottle` returns `-1` when
   either `settings.bungeecord` or `proxies.velocity.enabled` is on, so `settings.connection-throttle`
   in `config/bukkit.yml` is bypassed and the proxy owns connection rate limiting.
