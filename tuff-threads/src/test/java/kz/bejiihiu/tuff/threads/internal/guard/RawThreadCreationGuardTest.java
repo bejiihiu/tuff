@@ -155,6 +155,13 @@ class RawThreadCreationGuardTest {
             "tuff-server/src/main/java/kz/bejiihiu/tuff/compute/bootstrap/ComputeJfr.java",
             "server compute JFR helper, moves to the utmi event sink later"
         );
+        // the Kairos supervisor has no registered pool: it is not a pool owner, it is one control
+        // thread. Registering it needs a pool spec and a coverage decision, which is the observability
+        // package; until then the daemon is built here and visible in a thread dump by name
+        allowlist.put(
+            "tuff-server/src/main/java/kz/bejiihiu/tuff/threads/kairos/KairosScheduler.java",
+            "the Kairos supervisor control thread, no owning pool yet"
+        );
         return Map.copyOf(allowlist);
     }
 

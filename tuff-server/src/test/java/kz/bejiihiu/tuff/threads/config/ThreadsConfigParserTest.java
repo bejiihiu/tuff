@@ -251,16 +251,59 @@ class ThreadsConfigParserTest {
     void flattenCoversEveryKeyOfTheSection() throws IOException, InvalidConfigurationException {
         final Map<String, String> flat = ThreadsConfigParser.flatten(parse(template()).settings());
 
-        assertEquals(32, flat.size(), () -> "unexpected key count: " + flat.keySet());
+        assertEquals(36, flat.size(), () -> "unexpected key count: " + flat.keySet());
         assertEquals("true", flat.get("thread-management.enabled"));
         assertEquals("false", flat.get("thread-management.resources.load-shedding"));
         assertEquals("edf", flat.get("thread-management.region-execution.scheduler"));
         assertEquals("-1", flat.get("thread-management.region-execution.threads"));
+        assertEquals("false", flat.get("thread-management.region-execution.kairos.elastic"));
+        assertEquals("-1", flat.get("thread-management.region-execution.kairos.max-threads"));
+        assertEquals("30", flat.get("thread-management.region-execution.kairos.keep-alive-seconds"));
+        assertEquals("10", flat.get("thread-management.region-execution.kairos.spawn-rate-per-second"));
         assertEquals("true", flat.get("thread-management.execution-pools.network.preserve-specialization"));
         assertEquals("false", flat.get("thread-management.execution-pools.compute.managed"));
         assertEquals("false", flat.get("thread-management.async-compute.tick-pressure.enabled"));
         assertEquals("0.25", flat.get("thread-management.async-compute.tick-pressure.enter-lag-fraction"));
         assertEquals("19.5", flat.get("thread-management.async-compute.tick-pressure.exit-min-tps"));
+    }
+
+    @Test
+    void kairosFundLimitsMapOneToOne() {
+        final Parsed parsed = parse("""
+            thread-management:
+              region-execution:
+                scheduler: kairos
+                kairos-unstable: true
+                threads: 3
+                kairos:
+                  elastic: true
+                  max-threads: 7
+                  keep-alive-seconds: 5
+                  spawn-rate-per-second: 2
+            """);
+
+        assertTrue(parsed.problems().isEmpty(), () -> "unexpected problems: " + parsed.problems());
+        assertEquals(
+            new ThreadManagementSettings.RegionExecution.Kairos(true, 7, 5, 2),
+            parsed.settings().regionExecution().kairos()
+        );
+    }
+
+    @Test
+    void anImpossibleKairosCeilingRejectsTheSection() {
+        final Parsed parsed = parse("""
+            thread-management:
+              region-execution:
+                kairos:
+                  max-threads: 0
+            """);
+
+        assertEquals(
+            ThreadManagementSettings.RegionExecution.Kairos.defaults(),
+            parsed.settings().regionExecution().kairos()
+        );
+        assertEquals(1, parsed.problems().size(), () -> "expected one problem, got " + parsed.problems());
+        assertEquals("thread-management.region-execution.kairos", parsed.problems().getFirst().key());
     }
 
     private static YamlConfiguration template() throws IOException, InvalidConfigurationException {

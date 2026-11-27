@@ -217,6 +217,7 @@ public record ThreadManagementSettings(
      * @param gridExponent            region grid exponent, between zero and thirty one; restart only
      * @param kairosUnstable          opt in to the experimental Kairos scheduler; required for
      *                                {@link RegionScheduler#KAIROS} and never enabled implicitly
+     * @param kairos                  limits of the Kairos fund; only read while the scheduler is Kairos
      */
     public record RegionExecution(
         boolean managed,
@@ -224,18 +225,20 @@ public record ThreadManagementSettings(
         RegionScheduler scheduler,
         int threads,
         int gridExponent,
-        boolean kairosUnstable
+        boolean kairosUnstable,
+        Kairos kairos
     ) {
 
         /**
          * Validates the region execution settings.
          *
-         * @throws NullPointerException     if the scheduler is {@code null}
+         * @throws NullPointerException     if the scheduler or the Kairos section is {@code null}
          * @throws IllegalArgumentException if a count is out of range, Folia scheduling is disabled or
          *                                  Kairos is selected without the explicit opt in
          */
         public RegionExecution {
             Objects.requireNonNull(scheduler, "scheduler");
+            Objects.requireNonNull(kairos, "kairos");
             if (threads != -1 && threads < 1) {
                 throw new IllegalArgumentException("threads must be -1 or at least 1, got " + threads);
             }
@@ -255,12 +258,80 @@ public record ThreadManagementSettings(
         }
 
         /**
+         * Creates region settings without Kairos limits, keeping the fund fixed.
+         *
+         * <p>The six argument shape predates the elastic fund; a caller that does not mention the
+         * limits gets the fixed prototype of the scheduler.
+         *
+         * @param managed                 whether the region pool is registered at L2 instead of L1
+         * @param preserveFoliaScheduling must stay {@code true}
+         * @param scheduler               scheduler variant Folia runs
+         * @param threads                 fixed tick thread count, or {@code -1}
+         * @param gridExponent            region grid exponent
+         * @param kairosUnstable          opt in to Kairos
+         */
+        public RegionExecution(
+            final boolean managed,
+            final boolean preserveFoliaScheduling,
+            final RegionScheduler scheduler,
+            final int threads,
+            final int gridExponent,
+            final boolean kairosUnstable
+        ) {
+            this(managed, preserveFoliaScheduling, scheduler, threads, gridExponent, kairosUnstable, Kairos.defaults());
+        }
+
+        /**
          * Returns the default region execution settings.
          *
          * @return observe only, Folia EDF, automatic thread count, grid exponent four, Kairos off
          */
         public static RegionExecution defaults() {
-            return new RegionExecution(false, true, RegionScheduler.EDF, -1, 4, false);
+            return new RegionExecution(false, true, RegionScheduler.EDF, -1, 4, false, Kairos.defaults());
+        }
+
+        /**
+         * Limits of the Kairos fund.
+         *
+         * <p>The floor is the existing {@code region-execution.threads}; this section only describes
+         * what happens above it. {@code elastic} is a separate switch on purpose: a server that selects
+         * Kairos to test the port keeps the fixed fund of the first prototype, and only an operator who
+         * asks for elasticity gets a supervisor thread.
+         *
+         * @param elastic              whether the fund may grow and shrink
+         * @param maxThreads           ceiling of the fund, or {@code -1} for the core count rule
+         * @param keepAliveSeconds     how long a runner must sit idle before it may be retired
+         * @param spawnRatePerSecond   how many new tick threads the supervisor may start per second
+         */
+        public record Kairos(boolean elastic, int maxThreads, int keepAliveSeconds, int spawnRatePerSecond) {
+
+            /**
+             * Validates the Kairos limits.
+             *
+             * @throws IllegalArgumentException if a limit is out of range
+             */
+            public Kairos {
+                if (maxThreads != -1 && maxThreads < 1) {
+                    throw new IllegalArgumentException("maxThreads must be -1 or at least 1, got " + maxThreads);
+                }
+                if (keepAliveSeconds < 1) {
+                    throw new IllegalArgumentException("keepAliveSeconds must be at least 1, got " + keepAliveSeconds);
+                }
+                if (spawnRatePerSecond < 1) {
+                    throw new IllegalArgumentException(
+                        "spawnRatePerSecond must be at least 1, got " + spawnRatePerSecond
+                    );
+                }
+            }
+
+            /**
+             * Returns the shipped limits: fixed fund, ceiling from the core count, compute's keep alive.
+             *
+             * @return the default limits
+             */
+            public static Kairos defaults() {
+                return new Kairos(false, -1, 30, 10);
+            }
         }
     }
 

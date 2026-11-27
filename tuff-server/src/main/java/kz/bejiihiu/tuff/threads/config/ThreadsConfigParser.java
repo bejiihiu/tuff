@@ -48,7 +48,11 @@ final class ThreadsConfigParser {
     );
     private static final Set<String> LIFECYCLE_KEYS = Set.of("centralized-thread-factory", "monitor-threads");
     private static final Set<String> REGION_KEYS = Set.of(
-        "managed", "preserve-folia-scheduling", "scheduler", "threads", "grid-exponent", "kairos-unstable"
+        "managed", "preserve-folia-scheduling", "scheduler", "threads", "grid-exponent", "kairos-unstable", "kairos"
+    );
+    private static final String KAIROS_PATH = REGION_PATH + ".kairos";
+    private static final Set<String> KAIROS_KEYS = Set.of(
+        "elastic", "max-threads", "keep-alive-seconds", "spawn-rate-per-second"
     );
     private static final Set<String> ASYNC_COMPUTE_KEYS = Set.of("managed", "max-threads", "tick-pressure");
     private static final Set<String> TICK_PRESSURE_KEYS = Set.of(
@@ -135,6 +139,11 @@ final class ThreadsConfigParser {
         flat.put(REGION_PATH + ".threads", Integer.toString(region.threads()));
         flat.put(REGION_PATH + ".grid-exponent", Integer.toString(region.gridExponent()));
         flat.put(REGION_PATH + ".kairos-unstable", Boolean.toString(region.kairosUnstable()));
+        final ThreadManagementSettings.RegionExecution.Kairos kairos = region.kairos();
+        flat.put(KAIROS_PATH + ".elastic", Boolean.toString(kairos.elastic()));
+        flat.put(KAIROS_PATH + ".max-threads", Integer.toString(kairos.maxThreads()));
+        flat.put(KAIROS_PATH + ".keep-alive-seconds", Integer.toString(kairos.keepAliveSeconds()));
+        flat.put(KAIROS_PATH + ".spawn-rate-per-second", Integer.toString(kairos.spawnRatePerSecond()));
 
         final ThreadManagementSettings.AsyncCompute asyncCompute = settings.asyncCompute();
         flat.put(ASYNC_COMPUTE_PATH + ".managed", Boolean.toString(asyncCompute.managed()));
@@ -229,10 +238,42 @@ final class ThreadsConfigParser {
         final boolean kairos = readBoolean(
             section, "kairos-unstable", fallback.kairosUnstable(), REGION_PATH + ".kairos-unstable", problems
         );
+        final ThreadManagementSettings.RegionExecution.Kairos kairosLimits = parseKairos(
+            readSection(section, "kairos", KAIROS_PATH, problems), fallback.kairos(), problems
+        );
         try {
-            return new ThreadManagementSettings.RegionExecution(managed, preserve, scheduler, threads, gridExponent, kairos);
+            return new ThreadManagementSettings.RegionExecution(
+                managed, preserve, scheduler, threads, gridExponent, kairos, kairosLimits
+            );
         } catch (final IllegalArgumentException | NullPointerException ex) {
             problems.add(new ConfigProblem(REGION_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
+            return fallback;
+        }
+    }
+
+    private static ThreadManagementSettings.RegionExecution.Kairos parseKairos(
+        final @Nullable ConfigurationSection section,
+        final ThreadManagementSettings.RegionExecution.Kairos fallback,
+        final List<ConfigProblem> problems
+    ) {
+        if (section == null) {
+            return fallback;
+        }
+        final boolean elastic = readBoolean(section, "elastic", fallback.elastic(), KAIROS_PATH + ".elastic", problems);
+        final int maxThreads = readInt(
+            section, "max-threads", fallback.maxThreads(), KAIROS_PATH + ".max-threads", problems
+        );
+        final int keepAlive = readInt(
+            section, "keep-alive-seconds", fallback.keepAliveSeconds(), KAIROS_PATH + ".keep-alive-seconds", problems
+        );
+        final int spawnRate = readInt(
+            section, "spawn-rate-per-second", fallback.spawnRatePerSecond(),
+            KAIROS_PATH + ".spawn-rate-per-second", problems
+        );
+        try {
+            return new ThreadManagementSettings.RegionExecution.Kairos(elastic, maxThreads, keepAlive, spawnRate);
+        } catch (final IllegalArgumentException ex) {
+            problems.add(new ConfigProblem(KAIROS_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
             return fallback;
         }
     }
@@ -503,6 +544,10 @@ final class ThreadsConfigParser {
         reportUnknownIn(root.getConfigurationSection("resources"), RESOURCES_PATH, RESOURCE_KEYS, problems);
         reportUnknownIn(root.getConfigurationSection("lifecycle"), LIFECYCLE_PATH, LIFECYCLE_KEYS, problems);
         reportUnknownIn(root.getConfigurationSection("region-execution"), REGION_PATH, REGION_KEYS, problems);
+        final ConfigurationSection region = root.getConfigurationSection("region-execution");
+        if (region != null) {
+            reportUnknownIn(region.getConfigurationSection("kairos"), KAIROS_PATH, KAIROS_KEYS, problems);
+        }
         reportUnknownIn(root.getConfigurationSection("async-compute"), ASYNC_COMPUTE_PATH, ASYNC_COMPUTE_KEYS, problems);
         final ConfigurationSection asyncCompute = root.getConfigurationSection("async-compute");
         if (asyncCompute != null) {

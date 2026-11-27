@@ -54,7 +54,8 @@ class KairosPatchContractTest {
         assertEquals(1, count(source, "new kz.bejiihiu.tuff.threads.kairos.KairosScheduler("),
             "the facade builds one Kairos instance");
         assertEquals(1, count(source, "kairosScheduler.start()"), "start delegates to the fixed fund");
-        assertEquals(1, count(source, "kairosScheduler.setThreads(threads)"), "setThreads is an honest no op");
+        assertEquals(1, count(source, "kairosScheduler.setThreads(threads)"),
+            "setThreads delegates to the fund, which applies the floor");
         assertEquals(1, count(source, "this.scheduler = new EDFSchedulerThreadPool(initialThreads, threadFactory);"),
             "the EDF line must stay byte for byte the one Folia had");
         assertEquals(1, count(source, "public final long scheduledStart()"),

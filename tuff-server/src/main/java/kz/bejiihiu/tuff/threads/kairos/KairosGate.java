@@ -20,27 +20,50 @@ public final class KairosGate {
         "thread-management.region-execution.kairos-unstable: true in config/tuff.yml";
 
     private static volatile boolean armed;
+    private static volatile KairosTuning tuning = KairosTuning.fixed();
 
     private KairosGate() {
     }
 
     /**
-     * Records the operator's answer from {@code config/tuff.yml}.
+     * Records the operator's answer from {@code config/tuff.yml}, with a fixed fund.
+     *
+     * @param kairosUnstable whether {@code kairos-unstable} is true
+     */
+    public static void arm(final boolean kairosUnstable) {
+        arm(kairosUnstable, KairosTuning.fixed());
+    }
+
+    /**
+     * Records the operator's answer and the fund knobs from {@code config/tuff.yml}.
      *
      * <p>Called once per start, before the region scheduler starts. A value that could not be read
      * arrives here as {@code false}, which is the safe answer: no opt-in, no Kairos.
      *
      * @param kairosUnstable whether {@code kairos-unstable} is true
+     * @param fundTuning     the fund limits to use once the scheduler starts, never {@code null}
      */
-    public static void arm(final boolean kairosUnstable) {
+    public static void arm(final boolean kairosUnstable, final KairosTuning fundTuning) {
+        tuning = fundTuning;
         armed = kairosUnstable;
     }
 
     /**
-     * Forgets the opt-in. Used on shutdown and by tests so a stopped layer never leaves a stale yes.
+     * Forgets the opt-in and the fund knobs. Used on shutdown and by tests so a stopped layer never
+     * leaves a stale yes.
      */
     public static void disarm() {
         armed = false;
+        tuning = KairosTuning.fixed();
+    }
+
+    /**
+     * Returns the fund knobs that came with the last armed answer.
+     *
+     * @return the tuning to apply, never {@code null}; the fixed fund when nothing was armed
+     */
+    public static KairosTuning tuning() {
+        return tuning;
     }
 
     /**

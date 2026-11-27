@@ -133,7 +133,24 @@ class KairosSchedulerTest {
     }
 
     @Test
-    void setThreadsIsAnHonestNoOp() throws InterruptedException {
+    void aTickScheduledAfterThePoolWentIdleStillRuns() throws InterruptedException {
+        this.scheduler = this.scheduler(1);
+        this.scheduler.start();
+        final CountDownLatch first = new CountDownLatch(1);
+        this.scheduler.schedule(this.tick("first", System.nanoTime(), first));
+        assertTrue(first.await(5L, TimeUnit.SECONDS), "the first tick should run");
+
+        // the runner is parked now; a new arrival must find its permit again
+        Thread.sleep(100L);
+        final CountDownLatch second = new CountDownLatch(1);
+        this.scheduler.schedule(this.tick("second", System.nanoTime(), second));
+
+        assertTrue(second.await(5L, TimeUnit.SECONDS), "an idle runner must be handed the next tick");
+        assertEquals(List.of("first", "second"), this.order);
+    }
+
+    @Test
+    void setThreadsIsAnHonestNoOpWhileTheFundIsFixed() throws InterruptedException {
         this.scheduler = this.scheduler(2);
         this.scheduler.start();
         this.awaitAlive(2);

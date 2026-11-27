@@ -72,6 +72,19 @@ thread-management:
     # Explicit opt in for the experimental Kairos scheduler. Never enabled implicitly; turning it on
     # without its own A/B run is not supported.
     kairos-unstable: false
+    # Limits of the Kairos fund. The floor is threads above; everything here is about growing past it.
+    # Only read while scheduler is kairos. Restart only.
+    kairos:
+      # Let the fund add tick threads while regions wait and retire idle ones afterwards. Off keeps the
+      # fixed fund that was already load tested: min == max, no supervisor thread. Turn this on only
+      # together with a load test of your own.
+      elastic: false
+      # Ceiling of the fund, or -1 for "80% of the cores", the same rule the compute budget uses.
+      max-threads: -1
+      # How long a thread must sit idle before it may be retired. The floor is never retired.
+      keep-alive-seconds: 30
+      # How many new tick threads may be started per second while regions are waiting.
+      spawn-rate-per-second: 10
 
   async-compute:
     # Older spelling of execution-pools.compute.managed below: both keys describe one switch and

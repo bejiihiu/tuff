@@ -15,6 +15,7 @@ import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
 import kz.bejiihiu.tuff.threads.kairos.KairosGate;
+import kz.bejiihiu.tuff.threads.kairos.KairosTuning;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureMonitor;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
 import kz.bejiihiu.tuff.threads.probe.BackgroundPoolProbe;
@@ -141,8 +142,19 @@ public final class ThreadsBootstrap {
             try {
                 final ThreadsConfig.ThreadsLoadResult result = config.load();
                 // the region scheduler object already exists by the time this file is read, so the
-                // explicit Kairos opt-in has to travel from here to the scheduler's start()
-                KairosGate.arm(result.settings().regionExecution().kairosUnstable());
+                // explicit Kairos opt-in and the fund limits have to travel from here to start()
+                final ThreadManagementSettings.RegionExecution region = result.settings().regionExecution();
+                final ThreadManagementSettings.RegionExecution.Kairos kairos = region.kairos();
+                KairosGate.arm(
+                    region.kairosUnstable(),
+                    new KairosTuning(
+                        kairos.elastic(),
+                        kairos.maxThreads(),
+                        kairos.keepAliveSeconds() * 1000,
+                        kairos.spawnRatePerSecond(),
+                        1_000L
+                    )
+                );
                 if (result.missingFile()) {
                     // the thread layer starts before the compute engine, which is what writes the template
                     LOGGER.info("Thread config: {} does not exist yet; using the observe-only defaults",
