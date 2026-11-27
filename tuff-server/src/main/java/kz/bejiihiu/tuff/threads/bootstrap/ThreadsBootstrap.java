@@ -14,6 +14,7 @@ import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
 import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
+import kz.bejiihiu.tuff.threads.kairos.KairosGate;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureMonitor;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
 import kz.bejiihiu.tuff.threads.probe.BackgroundPoolProbe;
@@ -139,6 +140,9 @@ public final class ThreadsBootstrap {
             ThreadManagerRuntime created = null;
             try {
                 final ThreadsConfig.ThreadsLoadResult result = config.load();
+                // the region scheduler object already exists by the time this file is read, so the
+                // explicit Kairos opt-in has to travel from here to the scheduler's start()
+                KairosGate.arm(result.settings().regionExecution().kairosUnstable());
                 if (result.missingFile()) {
                     // the thread layer starts before the compute engine, which is what writes the template
                     LOGGER.info("Thread config: {} does not exist yet; using the observe-only defaults",
@@ -211,6 +215,7 @@ public final class ThreadsBootstrap {
             this.status = ThreadsStatus.notInitialised();
             // before the runtime stops: no new region body may be wrapped while the manager is going down
             RegionThreads.clear();
+            KairosGate.disarm();
             // flag + interrupt, no join: this runs in the window where the watchdog is still armed and
             // a blocking wait would look like a hung server. The thread is a daemon and exits on its own
             if (currentSampler != null) {

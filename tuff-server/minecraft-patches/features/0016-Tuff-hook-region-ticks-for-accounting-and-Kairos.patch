@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: xs <bungeepithub@gmail.com>
+Date: Fri, 27 Nov 2026 04:41:21 +0500
+Subject: [PATCH] Tuff: hook region ticks for accounting and Kairos
+
+
+diff --git a/io/papermc/paper/threadedregions/TickRegionScheduler.java b/io/papermc/paper/threadedregions/TickRegionScheduler.java
+index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd0dc6a15f403a140e1e5ab7765136bcd7e4bedc 100644
+--- a/io/papermc/paper/threadedregions/TickRegionScheduler.java
++++ b/io/papermc/paper/threadedregions/TickRegionScheduler.java
+@@ -53,7 +53,8 @@ public final class TickRegionScheduler {
+ 
+     public static enum SchedulerType {
+         EDF,
+-        WORK_STEALING;
++        WORK_STEALING,
++        KAIROS
+     }
+ 
+     public TickRegionScheduler(final SchedulerType schedulerType, final int initialThreads) {
+@@ -66,7 +67,7 @@ public final class TickRegionScheduler {
+ 
+             @Override
+             public Thread newThread(final Runnable run) {
+-                final Thread ret = new TickThreadRunner(this.threadGroup, run, "Folia Region Scheduler Thread #" + this.idGenerator.getAndIncrement());
++                final Thread ret = new TickThreadRunner(this.threadGroup, kz.bejiihiu.tuff.threads.bridge.RegionThreads.wrapBody(run), "Folia Region Scheduler Thread #" + this.idGenerator.getAndIncrement()); // Tuff - account region tick bodies
+                 ret.setUncaughtExceptionHandler(TickRegionScheduler.this::uncaughtException);
+                 return ret;
+             }
+@@ -84,6 +85,12 @@ public final class TickRegionScheduler {
+                 ((StealingScheduledThreadPool)this.scheduler).setFlags(StealingScheduledThreadPool.FLAG_SCHEDULE_EVENLY);
+                 break;
+             }
++            case KAIROS: {
++                this.scheduler = new kz.bejiihiu.tuff.threads.kairos.KairosScheduler(
++                    initialThreads, threadFactory, tick -> ((RegionScheduleHandle)tick).scheduledStart()
++                );
++                break;
++            }
+             default: {
+                 throw new IllegalStateException("Unknown scheduler type: " + schedulerType);
+             }
+@@ -93,6 +100,8 @@ public final class TickRegionScheduler {
+     public void start() {
+         if (this.scheduler instanceof EDFSchedulerThreadPool edfSchedulerThreadPool) {
+             edfSchedulerThreadPool.start();
++        } else if (this.scheduler instanceof kz.bejiihiu.tuff.threads.kairos.KairosScheduler kairosScheduler) {
++            kairosScheduler.start();
+         }
+     }
+ 
+@@ -121,6 +130,8 @@ public final class TickRegionScheduler {
+             }
+ 
+             stealingScheduledThreadPool.setThreadAllocation(threadAllocation, stealThresholdNS, taskTimeSliceNS);
++        } else if (this.scheduler instanceof kz.bejiihiu.tuff.threads.kairos.KairosScheduler kairosScheduler) {
++            kairosScheduler.setThreads(threads);
+         }
+     }
+ 
+@@ -340,6 +351,13 @@ public final class TickRegionScheduler {
+             this.tickSchedule.setLastPeriod(to == TimeUtil.DEADLINE_NOT_SET ? to : to - TIME_BETWEEN_TICKS);
+         }
+ 
++        /**
++         * Tuff start - the deadline is protected in leafpile, a scheduler outside that package reads it here.
++         */
++        public final long scheduledStart() {
++            return this.getScheduledStart();
++        }
++
+         public final void markNonSchedulable() {
+             this.cancelled.set(true);
+         }
