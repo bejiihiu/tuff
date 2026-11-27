@@ -16,21 +16,25 @@ import kz.bejiihiu.tuff.threads.PoolId;
  * }</pre>
  *
  * <p>{@code reserve} is the configured reserve floored at one, because a machine with no reserve left
- * for the kernel, GC and JIT does not become faster when a pool takes the last core. When the
+ * for the kernel, GC and JIT does not become faster when a pool takes the last core. {@code critical}
+ * is the part of the remainder held for the critical lanes that are not deducted as threads (the
+ * network minimum, plus any region minimum the thread deduction did not cover): the shared pools
+ * resolve against what is left after it, so their oversubscribed caps can never take it. When the
  * subtraction goes to zero or below, {@link #rawUsableCores()} keeps the negative number and
  * {@link #usableCores()} floors at one so the contract stays satisfied; the plan reports itself
  * degraded, which is the part an operator needs to see.
  *
- * @param availableProcessors processors the JVM may use, at least one
- * @param ceilingCores        threads the server as a whole should stay under, at least one
- * @param regionCores         tick threads already claimed by the region scheduler
- * @param chunkCores          chunk workers already claimed
- * @param ioCores             chunk IO threads already claimed
- * @param reservedCores       cores kept for GC, JIT, the kernel and small pools, at least one
- * @param rawUsableCores      the subtraction before the floor, may be zero or negative
- * @param usableCores         cores handed to the managed pools, at least one
- * @param pools               per pool budgets, in id order
- * @param degradedReasons     why the plan cannot be followed as written, empty when it can
+ * @param availableProcessors  processors the JVM may use, at least one
+ * @param ceilingCores         threads the server as a whole should stay under, at least one
+ * @param regionCores          tick threads already claimed by the region scheduler
+ * @param chunkCores           chunk workers already claimed
+ * @param ioCores              chunk IO threads already claimed
+ * @param reservedCores        cores kept for GC, JIT, the kernel and small pools, at least one
+ * @param criticalReserveCores cores held for the guaranteed minimum of the critical lanes
+ * @param rawUsableCores       the subtraction before the floor, may be zero or negative
+ * @param usableCores          cores handed to the managed pools, at least one
+ * @param pools                per pool budgets, in id order
+ * @param degradedReasons      why the plan cannot be followed as written, empty when it can
  */
 public record BudgetPlan(
     int availableProcessors,
@@ -39,6 +43,7 @@ public record BudgetPlan(
     int chunkCores,
     int ioCores,
     int reservedCores,
+    int criticalReserveCores,
     int rawUsableCores,
     int usableCores,
     List<PoolBudget> pools,
@@ -68,6 +73,11 @@ public record BudgetPlan(
         }
         if (reservedCores < 1) {
             throw new IllegalArgumentException("reservedCores must be at least 1, got " + reservedCores);
+        }
+        if (criticalReserveCores < 0) {
+            throw new IllegalArgumentException(
+                "criticalReserveCores must not be negative, got " + criticalReserveCores
+            );
         }
         if (usableCores < 1) {
             throw new IllegalArgumentException("usableCores must be at least 1, got " + usableCores);
@@ -119,8 +129,11 @@ public record BudgetPlan(
             .append(" = region ").append(this.regionCores)
             .append(" + chunk ").append(this.chunkCores)
             .append(" + io ").append(this.ioCores)
-            .append(" + reserve ").append(this.reservedCores)
-            .append(" + usable ").append(this.rawUsableCores);
+            .append(" + reserve ").append(this.reservedCores);
+        if (this.criticalReserveCores > 0) {
+            builder.append(" + critical ").append(this.criticalReserveCores);
+        }
+        builder.append(" + usable ").append(this.rawUsableCores);
         if (this.rawUsableCores != this.usableCores) {
             builder.append(" (floored to ").append(this.usableCores).append(')');
         }

@@ -2,6 +2,7 @@ package kz.bejiihiu.tuff.threads.internal.impl.controller;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -10,6 +11,7 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import kz.bejiihiu.tuff.threads.DegradedReason;
 import kz.bejiihiu.tuff.threads.ExecutionPoolRegistry;
 import kz.bejiihiu.tuff.threads.Lease;
 import kz.bejiihiu.tuff.threads.LeaseRequest;
@@ -19,6 +21,7 @@ import kz.bejiihiu.tuff.threads.PoolKind;
 import kz.bejiihiu.tuff.threads.PoolSpec;
 import kz.bejiihiu.tuff.threads.ResourceBudget;
 import kz.bejiihiu.tuff.threads.SaturationReport;
+import kz.bejiihiu.tuff.threads.SheddingReport;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import kz.bejiihiu.tuff.threads.ThreadResourceController;
 import kz.bejiihiu.tuff.threads.internal.impl.budget.BudgetDeductions;
@@ -62,8 +65,47 @@ import org.jspecify.annotations.Nullable;
  * ({@link ThreadManagementSettings.Resources#maxConcurrentTasks()}) limits background work as a whole;
  * region and network pools are exempt from it, because a cap meant to keep background work away from the
  * server must not be able to starve the server itself.
+ *
+ * <p>The critical lanes have a second guarantee on top of their own permits: the budget planner subtracts
+ * their minimum from the remainder the shared pools divide, so no combination of elastic compute caps can
+ * claim the cores a starving network loop or tick thread needs. A critical pool that is at its capacity
+ * with requests parked reports {@link DegradedReason#CRITICAL_POOL_PRESSURE}; the numbers are in
+ * {@link #sheddingReport()}.
+ *
+ * <p>Load shedding is the temporary half of that protection, and it is opt in
+ * ({@link ThreadManagementSettings.Resources#loadShedding()}). While a critical pool has a live parked
+ * request and every non critical managed pool is at its capacity, the controller withholds one core more
+ * from the non critical pools per cooldown period, lowest admission weight first, never below a pool's
+ * declared minimum. When the critical queue has been quiet for a few evaluations it gives one core back
+ * per cooldown, so a sawtooth cannot move the pools every second. Held permits are never revoked; only new
+ * leases are refused. The policy is restart only, like the rest of the section.
  */
 public final class ResourceControllerImpl implements ThreadResourceController {
+
+    /**
+     * Cores withheld per shedding decision.
+     *
+     * <p>One means a ramp, not a jump: an operator sees the reduction grow instead of losing half of the
+     * background capacity between two samples.
+     */
+    private static final int SHED_STEP_CORES = 1;
+
+    /**
+     * Consecutive calm evaluations needed before a shed core is given back.
+     *
+     * <p>One evaluation is one admission decision; three keeps a bursty critical queue from releasing and
+     * re-taking the core on every other request.
+     */
+    private static final int SHED_CALM_EVALUATIONS = 3;
+
+    /**
+     * Minimum time between two shedding changes.
+     *
+     * <p>Five seconds, so a ramp up or down costs at most one core per five seconds and a two core reserve
+     * is fully withheld in ten. This is the cooldown half of the hysteresis: without it, the calm counter
+     * alone would let a request storm move the pools several times per second.
+     */
+    private static final long SHED_COOLDOWN_NANOS = 5_000_000_000L;
 
     private final TopologyView topology;
     private final ExecutionPoolRegistry registry;
@@ -73,14 +115,19 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     private final ThreadEventSink events;
     private final MonotonicClock clock;
     private final int globalLimit;
+    private final boolean loadShedding;
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition permitFreed = this.lock.newCondition();
     private final List<Waiter> waiters = new ArrayList<>();
     private final Map<Thread, Integer> heldPermits = new HashMap<>();
     private final AtomicLong uids = new AtomicLong();
     private volatile Ledger ledger;
+    private volatile Map<PoolId, Integer> shedShares = Map.of();
     private long sequence;
     private int globalInUse;
+    private int shedCores;
+    private int calmEvaluations;
+    private long lastShedChangeNanos = Long.MIN_VALUE;
     private volatile boolean closed;
 
     /**
@@ -111,11 +158,12 @@ public final class ResourceControllerImpl implements ThreadResourceController {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.events = Objects.requireNonNull(events, "events");
         this.globalLimit = resources.maxConcurrentTasks();
+        this.loadShedding = resources.loadShedding();
         this.regionThreads = RegionThreadDetector.registered(
             Objects.requireNonNull(threads, "threads"),
             RegionThreadDetector.byThreadName()
         );
-        this.ledger = this.buildLedger(Map.of());
+        this.installLedger(this.buildLedger(Map.of()));
     }
 
     @Override
@@ -126,6 +174,63 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     @Override
     public String budgetLedger() {
         return this.ledger.plan().ledger();
+    }
+
+    @Override
+    public int criticalReserve() {
+        return this.ledger.plan().criticalReserveCores();
+    }
+
+    @Override
+    public SheddingReport sheddingReport() {
+        this.lock.lock();
+        try {
+            final Map<PoolId, Integer> shares = this.shedShares;
+            final List<PoolId> pools = shares.entrySet().stream()
+                .filter(entry -> entry.getValue() > 0)
+                .map(Map.Entry::getKey)
+                .sorted()
+                .toList();
+            return new SheddingReport(
+                this.ledger.plan().criticalReserveCores(),
+                this.loadShedding,
+                this.shedCores,
+                pools,
+                this.summaryLocked(pools)
+            );
+        } finally {
+            this.lock.unlock();
+        }
+    }
+
+    @Override
+    public List<DegradedReason> degradedReasons(final PoolId pool) {
+        Objects.requireNonNull(pool, "pool");
+        this.lock.lock();
+        try {
+            final @Nullable PoolState state = this.ledger.states().get(pool);
+            if (state == null) {
+                return List.of();
+            }
+            final List<DegradedReason> reasons = new ArrayList<>(2);
+            final Optional<PoolBudget> budget = this.ledger.plan().pool(pool);
+            if (state.critical) {
+                if (this.hasLiveWaiterLocked(state, this.clock.nanoTime())
+                    || !budget.map(PoolBudget::satisfied).orElse(true)) {
+                    reasons.add(DegradedReason.CRITICAL_POOL_PRESSURE);
+                }
+            } else {
+                if (this.shedShares.getOrDefault(pool, 0) > 0) {
+                    reasons.add(DegradedReason.LOAD_SHEDDING);
+                }
+                if (budget.isPresent() && !budget.get().satisfied()) {
+                    reasons.add(DegradedReason.BUDGET_EXHAUSTED);
+                }
+            }
+            return List.copyOf(reasons);
+        } finally {
+            this.lock.unlock();
+        }
     }
 
     @Override
@@ -140,7 +245,11 @@ public final class ResourceControllerImpl implements ThreadResourceController {
         if (state == null) {
             return Optional.empty();
         }
-        return Optional.of(ResourceBudget.fixed(state.capacity, Math.min(state.reservedCores, state.capacity)));
+        // the effective capacity, so a caller that asks "how much may I use right now" gets the number
+        // the ledger would grant; while load shedding is active that is below the declared budget, and
+        // the declared one stays readable through plan().pool(id)
+        final int capacity = this.capacityOf(state);
+        return Optional.of(ResourceBudget.fixed(capacity, Math.min(state.reservedCores, capacity)));
     }
 
     @Override
@@ -216,7 +325,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
         } finally {
             this.lock.unlock();
         }
-        final int capacity = state.capacity;
+        final int capacity = this.capacityOf(state);
         final double utilisation = capacity <= 0
             ? (inUse > 0 ? 1.0d : 0.0d)
             : Math.min(1.0d, inUse / (double) capacity);
@@ -256,7 +365,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     public void refresh() {
         this.lock.lock();
         try {
-            this.ledger = this.buildLedger(this.ledger.states());
+            this.installLedger(this.buildLedger(this.ledger.states()));
         } finally {
             this.lock.unlock();
         }
@@ -355,6 +464,8 @@ public final class ResourceControllerImpl implements ThreadResourceController {
             }
             this.heldPermits.computeIfPresent(holder, (ignored, count) -> count <= 1 ? null : count - 1);
             this.grantWaitersLocked();
+            // after the hand off, so a critical request that was just served does not count as pressure
+            this.evaluateSheddingLocked(this.clock.nanoTime());
         } finally {
             this.lock.unlock();
         }
@@ -386,7 +497,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
                 // somebody else rebuilt the ledger while this thread waited for the lock
                 return lockedState;
             }
-            this.ledger = this.buildLedger(locked.states());
+            this.installLedger(this.buildLedger(locked.states()));
             return this.ledger.states().get(pool);
         } finally {
             this.lock.unlock();
@@ -435,6 +546,20 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     }
 
     /**
+     * Publishes a rebuilt ledger and the withheld shares that belong to it.
+     *
+     * <p>The ledger is the only description of capacity, so the shares have to follow a rebuild: a pool
+     * that lost capacity or disappeared cannot keep a share that no longer exists. Called under the lock
+     * (or from the constructor before anything else can read the controller).
+     *
+     * @param rebuilt new ledger
+     */
+    private void installLedger(final Ledger rebuilt) {
+        this.ledger = rebuilt;
+        this.publishShedSharesLocked();
+    }
+
+    /**
      * Tries to grant a permit, parking the caller when it asked for a wait.
      *
      * @param state   pool state
@@ -459,6 +584,10 @@ public final class ResourceControllerImpl implements ThreadResourceController {
                     "the thread manager stopped while pool '" + state.id + "' was requesting a lease"
                 );
             }
+            // every admission decision is a chance to notice a starving critical lane and to give the
+            // withheld cores back once it has been quiet; the cooldown keeps this from moving on
+            // every request
+            this.evaluateSheddingLocked(now);
             final @Nullable LeaseImpl immediate = this.tryGrantLocked(state, request, now, caller);
             if (immediate != null) {
                 return Optional.of(immediate);
@@ -567,7 +696,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
      * @return {@code true} if the pool and the global cap both allow it
      */
     private boolean canGrantLocked(final PoolState state) {
-        if (state.inUse >= state.capacity) {
+        if (state.inUse >= this.capacityOf(state)) {
             return false;
         }
         return state.critical || this.globalLimit < 0 || this.globalInUse < this.globalLimit;
@@ -611,6 +740,237 @@ public final class ResourceControllerImpl implements ThreadResourceController {
         } catch (RuntimeException _) {
             // a sink is not allowed to turn a timeout into a crash; it is traced elsewhere
         }
+    }
+
+    /**
+     * Returns what a pool can actually grant right now.
+     *
+     * <p>The declared capacity minus the share load shedding is withholding from it. The share map is an
+     * immutable snapshot replaced under the lock, so this is a volatile read plus a map lookup on the
+     * grant path and never a walk over the ledger.
+     *
+     * @param state pool entry
+     * @return effective permits, never negative
+     */
+    private int capacityOf(final PoolState state) {
+        final int shed = this.shedShares.getOrDefault(state.id, 0);
+        return shed <= 0 ? state.capacity : Math.max(0, state.capacity - shed);
+    }
+
+    /**
+     * Runs one load shedding decision.
+     *
+     * <p>Called under the lock from admission and release, which is why the policy needs no thread of its
+     * own: with no traffic there is nothing to shed for. The state machine is deliberately tiny - pressure
+     * takes one core per cooldown, calm gives one back after {@link #SHED_CALM_EVALUATIONS} evaluations
+     * and a cooldown - because a policy that reacts instantly on both edges is a sawtooth, and the whole
+     * point is to keep the non critical pools from oscillating.
+     *
+     * @param now current monotonic time
+     */
+    private void evaluateSheddingLocked(final long now) {
+        if (!this.loadShedding) {
+            if (this.shedCores != 0 || !this.shedShares.isEmpty()) {
+                this.shedCores = 0;
+                this.calmEvaluations = 0;
+                this.publishShedSharesLocked();
+            }
+            return;
+        }
+        if (!this.criticalPressureLocked(now)) {
+            if (this.shedCores == 0) {
+                this.calmEvaluations = 0;
+                return;
+            }
+            this.calmEvaluations++;
+            if (this.calmEvaluations < SHED_CALM_EVALUATIONS || !this.cooldownElapsed(now)) {
+                return;
+            }
+            this.shedCores = Math.max(0, this.shedCores - SHED_STEP_CORES);
+            this.calmEvaluations = 0;
+            this.lastShedChangeNanos = now;
+            this.publishShedSharesLocked();
+            return;
+        }
+        this.calmEvaluations = 0;
+        if (!this.cooldownElapsed(now)) {
+            return;
+        }
+        final int headroom = this.shedHeadroomLocked();
+        if (headroom <= 0) {
+            return;
+        }
+        this.shedCores += Math.min(SHED_STEP_CORES, headroom);
+        this.lastShedChangeNanos = now;
+        this.publishShedSharesLocked();
+    }
+
+    /**
+     * Checks whether a critical lane is waiting while the background lanes are full.
+     *
+     * <p>Both halves are needed. A parked critical request alone is normal back pressure inside its own
+     * pool; it only becomes pressure on the machine when the non critical pools have taken every permit
+     * they have and the critical work is what has to run. Without the second half, shedding would take
+     * background capacity for a critical pool that is simply saturated on its own accounting.
+     *
+     * @param now current monotonic time
+     * @return {@code true} when a core should be withheld
+     */
+    private boolean criticalPressureLocked(final long now) {
+        boolean criticalWaits = false;
+        for (final Waiter waiter : this.waiters) {
+            if (waiter.lease == null && waiter.state.critical && now < waiter.waitDeadlineNanos) {
+                criticalWaits = true;
+                break;
+            }
+        }
+        if (!criticalWaits) {
+            return false;
+        }
+        boolean anyShared = false;
+        for (final PoolState state : this.ledger.states().values()) {
+            if (state.critical || !state.managed) {
+                continue;
+            }
+            anyShared = true;
+            if (state.inUse < this.capacityOf(state)) {
+                return false;
+            }
+        }
+        return anyShared;
+    }
+
+    /**
+     * Returns how many more cores the non critical pools could still give up.
+     *
+     * <p>The room of a pool is its capacity above the higher of its declared minimum and its declared
+     * reserve, minus what is already withheld from it. Zero means the shed already reaches the floor and
+     * the policy must stop rather than eat into a guarantee.
+     *
+     * @return cores that may still be withheld, never negative
+     */
+    private int shedHeadroomLocked() {
+        int headroom = -this.shedCores;
+        for (final PoolState state : this.ledger.states().values()) {
+            if (state.critical || !state.managed) {
+                continue;
+            }
+            headroom += roomOf(state);
+        }
+        return Math.max(0, headroom);
+    }
+
+    /**
+     * Returns how many cores may be withheld from a pool without breaking its floor.
+     *
+     * @param state pool entry
+     * @return cores above the pool's floor, never negative
+     */
+    private static int roomOf(final PoolState state) {
+        final int floor = Math.max(state.minCores, state.reservedCores);
+        return Math.max(0, state.capacity - floor);
+    }
+
+    /**
+     * Spreads the withheld cores over the non critical pools and publishes the result.
+     *
+     * <p>Lowest admission weight first (service, then virtual, then compute, then chunk and io), one core
+     * each per round, so the cheapest work is reduced before the work closest to the critical lanes. The
+     * map is replaced as a whole under the lock, which is what makes the shed state visible to readers
+     * without a second ledger.
+     *
+     * <p>When a refresh shrank the pools since the last decision, the requested amount can exceed the
+     * room left; the count is then clamped to what was actually applied, so the report never claims to
+     * withhold a core that nobody gave up.
+     */
+    private void publishShedSharesLocked() {
+        if (this.shedCores <= 0) {
+            this.shedShares = Map.of();
+            return;
+        }
+        final List<PoolState> candidates = new ArrayList<>();
+        for (final PoolState state : this.ledger.states().values()) {
+            if (!state.critical && state.managed && roomOf(state) > 0) {
+                candidates.add(state);
+            }
+        }
+        candidates.sort(Comparator.comparingInt((PoolState state) -> state.weight)
+            .thenComparing(state -> state.id));
+        final Map<PoolId, Integer> shares = new HashMap<>();
+        int remaining = this.shedCores;
+        boolean progress = true;
+        while (remaining > 0 && progress) {
+            progress = false;
+            for (final PoolState state : candidates) {
+                if (remaining <= 0) {
+                    break;
+                }
+                final int taken = shares.getOrDefault(state.id, 0);
+                if (taken >= roomOf(state)) {
+                    continue;
+                }
+                shares.put(state.id, taken + 1);
+                remaining--;
+                progress = true;
+            }
+        }
+        this.shedCores -= remaining;
+        this.shedShares = Map.copyOf(shares);
+    }
+
+    /**
+     * Checks whether enough time has passed for another shedding change.
+     *
+     * @param now current monotonic time
+     * @return {@code true} when the cooldown is over
+     */
+    private boolean cooldownElapsed(final long now) {
+        return this.lastShedChangeNanos == Long.MIN_VALUE
+            || now - this.lastShedChangeNanos >= SHED_COOLDOWN_NANOS;
+    }
+
+    /**
+     * Checks whether a pool has a parked request that has not timed out.
+     *
+     * @param state pool entry
+     * @param now   current monotonic time
+     * @return {@code true} when at least one live waiter belongs to the pool
+     */
+    private boolean hasLiveWaiterLocked(final PoolState state, final long now) {
+        for (final Waiter waiter : this.waiters) {
+            if (waiter.state == state && waiter.lease == null && now < waiter.waitDeadlineNanos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Builds the one printable line of the shedding report.
+     *
+     * @param pools pools currently reduced, in id order
+     * @return the summary, never blank
+     */
+    private String summaryLocked(final List<PoolId> pools) {
+        final int reserve = this.ledger.plan().criticalReserveCores();
+        final String held = reserve > 0
+            ? reserve + " core(s) held for the critical lanes"
+            : "no core held for the critical lanes";
+        if (!this.loadShedding) {
+            return held + "; load shedding off";
+        }
+        if (this.shedCores <= 0) {
+            return held + "; load shedding on, nothing withheld";
+        }
+        final StringBuilder names = new StringBuilder();
+        for (final PoolId pool : pools) {
+            if (!names.isEmpty()) {
+                names.append(", ");
+            }
+            names.append(pool.value());
+        }
+        return "load shedding withholding " + this.shedCores + " core(s) from " + names
+            + " while a critical pool waits; " + held;
     }
 
     /**
@@ -709,6 +1069,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
         private final PoolId id;
         private volatile PoolSpec spec;
         private volatile int capacity;
+        private volatile int minCores;
         private volatile int reservedCores;
         private int weight;
         private boolean critical;
@@ -724,6 +1085,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
             // spec is published last: a reader that sees the new spec through the volatile field also
             // sees the capacity and coverage that belong to it, so a mixed view is impossible
             this.capacity = budget.capacity();
+            this.minCores = budget.minCores();
             this.reservedCores = budget.reservedCores();
             this.weight = weightOf(budget.kind());
             this.critical = budget.critical();

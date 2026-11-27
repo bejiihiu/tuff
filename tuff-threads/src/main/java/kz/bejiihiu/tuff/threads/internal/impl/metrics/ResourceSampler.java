@@ -20,6 +20,7 @@ import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 import kz.bejiihiu.tuff.threads.ResourceBudget;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.SaturationReport;
+import kz.bejiihiu.tuff.threads.SheddingReport;
 import kz.bejiihiu.tuff.threads.ThreadResourceController;
 import kz.bejiihiu.tuff.threads.ThreadSnapshot;
 import kz.bejiihiu.tuff.threads.internal.impl.events.MetricsEventSink;
@@ -378,7 +379,7 @@ public final class ResourceSampler {
                 -1L,
                 -1.0d,
                 SaturationReport.unknown(spec.id()),
-                List.of()
+                this.controllerReasons(spec.id())
             ));
             total += alive;
             activeTotal += active;
@@ -404,7 +405,8 @@ public final class ResourceSampler {
             poolSnapshots,
             List.of(),
             Set.of(DegradedReason.METRICS_UNAVAILABLE),
-            Optional.of(this.budget.budgetLedger())
+            Optional.of(this.budget.budgetLedger()),
+            this.shedding()
         );
     }
 
@@ -495,7 +497,7 @@ public final class ResourceSampler {
             final SaturationReport saturation = saturation(
                 id, alive, active, queued, capacity, this.leaseWaitNanos(id)
             );
-            final List<DegradedReason> reasons = cpuSupported ? List.of() : List.of(DegradedReason.METRICS_UNAVAILABLE);
+            final List<DegradedReason> reasons = this.poolReasons(id, cpuSupported);
             // region data comes from the probe itself: the sampler has no region view of its own, and a
             // pool that does not tick regions simply has nothing here
             final Optional<RegionPoolMetrics> regionMetrics = observation == null
@@ -575,8 +577,64 @@ public final class ResourceSampler {
             poolSnapshots,
             publishedThreads,
             degraded,
-            Optional.of(this.budget.budgetLedger())
+            Optional.of(this.budget.budgetLedger()),
+            this.shedding()
         );
+    }
+
+    /**
+     * Returns the reasons a pool carries after this pass.
+     *
+     * <p>Two sources on purpose: the measurement (CPU accounting unsupported) and the controller (budget
+     * exhausted, a critical pool under pressure, capacity withheld by load shedding). Neither knows the
+     * other's reason, and an operator needs both to tell "we cannot measure it" from "we decided not to
+     * give it capacity".
+     *
+     * @param pool         pool id
+     * @param cpuSupported whether the JVM exposes per thread CPU time
+     * @return an immutable reason list, empty when everything is fine
+     */
+    private List<DegradedReason> poolReasons(final PoolId pool, final boolean cpuSupported) {
+        final Set<DegradedReason> reasons = new LinkedHashSet<>(2);
+        if (!cpuSupported) {
+            reasons.add(DegradedReason.METRICS_UNAVAILABLE);
+        }
+        reasons.addAll(this.controllerReasons(pool));
+        return List.copyOf(reasons);
+    }
+
+    /**
+     * Asks the controller why it is not giving a pool its full capacity.
+     *
+     * <p>A broken controller is treated as "nothing to say" rather than failing the whole pass; the
+     * numbers it owns are still guarded separately.
+     *
+     * @param pool pool id
+     * @return the controller's reasons, empty when it has none or cannot answer
+     */
+    private List<DegradedReason> controllerReasons(final PoolId pool) {
+        try {
+            return this.budget.degradedReasons(pool);
+        } catch (RuntimeException _) {
+            return List.of();
+        }
+    }
+
+    /**
+     * Returns the controller's critical reserve and shedding state.
+     *
+     * <p>Read once per snapshot so the report and the snapshot describe the same moment. A controller
+     * that cannot answer reports nothing held rather than failing the pass; that is the same trade the
+     * ledger line makes.
+     *
+     * @return the report, never {@code null}
+     */
+    private SheddingReport shedding() {
+        try {
+            return this.budget.sheddingReport();
+        } catch (RuntimeException _) {
+            return SheddingReport.none();
+        }
     }
 
     private void updateRates(final boolean windowed, final double elapsedSeconds, final long now) {

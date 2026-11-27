@@ -286,6 +286,69 @@ class BudgetPlannerTest {
     }
 
     @Test
+    void networkMinimumIsHeldBackFromTheSharedRemainder() {
+        final PoolSpec network = new PoolSpec(
+            PoolId.NETWORK, PoolKind.NETWORK, "netty", "event loops", 3, -1, CoverageLevel.L3,
+            ResourceBudget.fixed(3, 0)
+        );
+
+        final BudgetPlan plan = plan(16, foliaDefaults(16), List.of(network, compute(1)));
+
+        assertEquals(12, plan.ceilingCores());
+        assertEquals(3, plan.criticalReserveCores(), "the network minimum is a guarantee, not a wish");
+        assertEquals(1, plan.rawUsableCores(), "4 cores were left by the deductions, 3 are reserved");
+        assertEquals(3, plan.pool(PoolId.NETWORK).orElseThrow().capacity());
+        assertEquals(1, plan.pool(PoolId.COMPUTE).orElseThrow().capacity(),
+            "an elastic compute pool must only see what is left after the critical reserve");
+        assertTrue(plan.ledger().contains("+ critical 3"), plan.ledger());
+    }
+
+    @Test
+    void criticalReserveMayTakeTheWholeRemainder() {
+        final PoolSpec network = new PoolSpec(
+            PoolId.NETWORK, PoolKind.NETWORK, "netty", "event loops", 5, -1, CoverageLevel.L3,
+            ResourceBudget.fixed(5, 0)
+        );
+
+        final BudgetPlan plan = plan(16, foliaDefaults(16), List.of(network, compute(1)));
+
+        assertEquals(5, plan.criticalReserveCores());
+        assertEquals(-1, plan.rawUsableCores());
+        assertEquals(0, plan.pool(PoolId.COMPUTE).orElseThrow().capacity(),
+            "a shared pool gets zero rather than a core the ledger does not have");
+        assertTrue(
+            plan.degradedReasons().stream().anyMatch(reason -> reason.contains("non critical pools get none")),
+            () -> "expected the critical reserve to be explained, got " + plan.degradedReasons()
+        );
+    }
+
+    @Test
+    void regionMinimumAboveItsThreadDeductionIsReserved() {
+        final PoolSpec region = new PoolSpec(
+            PoolId.REGION_EXECUTION, PoolKind.REGION_EXECUTION, "folia", "ticks", 3, -1, CoverageLevel.L3,
+            ResourceBudget.elastic(1.0d, 0)
+        );
+
+        final BudgetPlan plan = plan(16, new BudgetDeductions(1, 4, 1), List.of(region, compute(1)));
+
+        // one tick thread is already deducted, the other two of the declared minimum are not
+        assertEquals(2, plan.criticalReserveCores());
+        assertEquals(3, plan.pool(PoolId.REGION_EXECUTION).orElseThrow().capacity());
+    }
+
+    @Test
+    void aDeclaredCriticalReserveCountsAsWell() {
+        final PoolSpec network = new PoolSpec(
+            PoolId.NETWORK, PoolKind.NETWORK, "netty", "event loops", 1, -1, CoverageLevel.L3,
+            ResourceBudget.elastic(1.0d, 2)
+        );
+
+        final BudgetPlan plan = plan(16, foliaDefaults(16), List.of(network, compute(1)));
+
+        assertEquals(2, plan.criticalReserveCores(), "the larger of the minimum and the reserve is the promise");
+    }
+
+    @Test
     void budgetForUnknownPoolIsEmpty() {
         final BudgetPlan plan = plan(16, foliaDefaults(16), List.of(compute(2)));
 

@@ -106,6 +106,19 @@ public record ThreadManagementSettings(
     }
 
     /**
+     * Returns the tick pressure policy of the compute pool.
+     *
+     * <p>The policy is nested in the compute section because it is a compute decision: the pool gives
+     * cores back while regions lag and takes them back when the regions are calm. It is a convenience
+     * accessor, not a second setting.
+     *
+     * @return the tick pressure policy, never {@code null}
+     */
+    public AsyncCompute.TickPressure tickPressure() {
+        return this.asyncCompute.tickPressure();
+    }
+
+    /**
      * Processor topology, reserve and global limits.
      *
      * @param cpuAware           whether sizing uses the platform's actual processor count and container
@@ -114,8 +127,13 @@ public record ThreadManagementSettings(
      *                           unexpected work; zero is legal but risky on small machines
      * @param maxConcurrentTasks global cap on concurrently executing leased tasks, or {@code -1} for no
      *                           explicit cap; pools still apply their own limits on top
+     * @param loadShedding       whether a starving critical pool may temporarily reduce the capacity of
+     *                           the non critical pools. Off by default: it is a policy that takes
+     *                           background capacity away, so it is opt in. The step, the calm window and
+     *                           the cooldown are fixed policy of the controller, documented in the
+     *                           configuration page; only the switch is a key
      */
-    public record Resources(boolean cpuAware, int reserveCores, int maxConcurrentTasks) {
+    public record Resources(boolean cpuAware, int reserveCores, int maxConcurrentTasks, boolean loadShedding) {
 
         /**
          * Validates the resource settings.
@@ -134,12 +152,26 @@ public record ThreadManagementSettings(
         }
 
         /**
+         * Creates resource settings without a load shedding policy.
+         *
+         * <p>The three argument shape predates the shedding switch; a caller that does not mention it gets
+         * the safe default, which is off.
+         *
+         * @param cpuAware           whether sizing is topology aware
+         * @param reserveCores       cores kept out of the managed budget
+         * @param maxConcurrentTasks global cap on concurrent leased tasks, or {@code -1}
+         */
+        public Resources(final boolean cpuAware, final int reserveCores, final int maxConcurrentTasks) {
+            this(cpuAware, reserveCores, maxConcurrentTasks, false);
+        }
+
+        /**
          * Returns the default resource settings.
          *
-         * @return topology aware sizing, one reserved core and no global task cap
+         * @return topology aware sizing, one reserved core, no global task cap, load shedding off
          */
         public static Resources defaults() {
-            return new Resources(true, 1, -1);
+            return new Resources(true, 1, -1, false);
         }
     }
 
@@ -263,32 +295,140 @@ public record ThreadManagementSettings(
      * capacity it may take and when it has to yield. Virtual thread limits stay in the existing
      * {@code async-compute} section; this record does not duplicate them.
      *
-     * @param managed    whether the compute pool is registered as managed capacity; the compute
-     *                   adapter is what delivers it, so without one the configuration is reported
-     *                   as {@link DegradedReason#CONFIG_CONFLICT} instead of applied. The same switch
-     *                   lives at {@code execution-pools.compute.managed}; either key turns it on
-     * @param maxThreads explicit ceiling, or {@code -1} to keep the engine's own configured maximum
+     * @param managed      whether the compute pool is registered as managed capacity; the compute
+     *                     adapter is what delivers it, so without one the configuration is reported
+     *                     as {@link DegradedReason#CONFIG_CONFLICT} instead of applied. The same switch
+     *                     lives at {@code execution-pools.compute.managed}; either key turns it on
+     * @param maxThreads   explicit ceiling, or {@code -1} to keep the engine's own configured maximum
+     * @param tickPressure whether the pool yields cores while regions lag
      */
-    public record AsyncCompute(boolean managed, int maxThreads) {
+    public record AsyncCompute(boolean managed, int maxThreads, TickPressure tickPressure) {
 
         /**
          * Validates the compute settings.
          *
+         * @throws NullPointerException     if {@code tickPressure} is {@code null}
          * @throws IllegalArgumentException if the ceiling is neither {@code -1} nor positive
          */
         public AsyncCompute {
             if (maxThreads != -1 && maxThreads < 1) {
                 throw new IllegalArgumentException("maxThreads must be -1 or at least 1, got " + maxThreads);
             }
+            Objects.requireNonNull(tickPressure, "tickPressure");
+        }
+
+        /**
+         * Creates compute settings with the default tick pressure policy.
+         *
+         * @param managed    whether the pool is managed
+         * @param maxThreads explicit ceiling, or {@code -1}
+         */
+        public AsyncCompute(final boolean managed, final int maxThreads) {
+            this(managed, maxThreads, TickPressure.defaults());
         }
 
         /**
          * Returns the default compute settings.
          *
-         * @return not managed, engine maximum kept
+         * @return not managed, engine maximum kept, tick pressure off
          */
         public static AsyncCompute defaults() {
-            return new AsyncCompute(false, -1);
+            return new AsyncCompute(false, -1, TickPressure.defaults());
+        }
+
+        /**
+         * Policy of the compute pool under region pressure.
+         *
+         * <p>The signal is the region summary the thread layer already samples: the share of regions
+         * below 18 TPS, the slowest region's TPS and the worst single tick. While regions lag the
+         * compute budget is lowered by {@code reserve} cores, step by step; when the regions are calm
+         * for {@code exitWindows} consecutive samples the reserve is released one step at a time.
+         *
+         * <p>The defaults are deliberately conservative and the feature is <b>off</b>. Every window is
+         * the refresh interval of the thread sampler (one second), so the times below are approximate.
+         *
+         * @param enabled           whether the pool yields cores to lagging regions at all
+         * @param enterLagFraction  share of regions that must be below {@code LAG_TPS} to enter
+         *                          pressure, in {@code (0, 1]}; a single lagging region of four is
+         *                          {@code 0.25}
+         * @param enterMinTps       slowest region TPS below which pressure starts even when the lag
+         *                          share is zero
+         * @param exitMinTps        slowest region TPS at or above which a sample counts as calm; must
+         *                          not be below {@code enterMinTps}, the gap is the hysteresis band
+         * @param exitWindows       consecutive calm samples needed before the reserve is released
+         * @param cooldownSeconds   minimum time between two reserve changes, so a sawtooth cannot move
+         *                          the pool every second
+         * @param maxReserveCores   most cores the pool may give up, before the owner's own floor
+         * @param stepCores         cores moved per decision; one means a ramp, not a jump
+         */
+        public record TickPressure(
+            boolean enabled,
+            double enterLagFraction,
+            double enterMinTps,
+            double exitMinTps,
+            int exitWindows,
+            int cooldownSeconds,
+            int maxReserveCores,
+            int stepCores
+        ) {
+
+            /**
+             * Validates the pressure policy.
+             *
+             * @throws IllegalArgumentException if a threshold is outside its range or the band is
+             *                                  inverted
+             */
+            public TickPressure {
+                if (!(enterLagFraction > 0.0d) || enterLagFraction > 1.0d) {
+                    throw new IllegalArgumentException(
+                        "enterLagFraction must be in (0, 1], got " + enterLagFraction
+                    );
+                }
+                if (!(enterMinTps > 0.0d) || enterMinTps > 20.0d) {
+                    throw new IllegalArgumentException("enterMinTps must be in (0, 20], got " + enterMinTps);
+                }
+                if (!(exitMinTps > 0.0d) || exitMinTps > 20.0d) {
+                    throw new IllegalArgumentException("exitMinTps must be in (0, 20], got " + exitMinTps);
+                }
+                if (exitMinTps < enterMinTps) {
+                    throw new IllegalArgumentException(
+                        "exitMinTps must not be below enterMinTps: " + exitMinTps + " < " + enterMinTps
+                    );
+                }
+                if (exitWindows < 1) {
+                    throw new IllegalArgumentException("exitWindows must be at least 1, got " + exitWindows);
+                }
+                if (cooldownSeconds < 1) {
+                    throw new IllegalArgumentException("cooldownSeconds must be at least 1, got " + cooldownSeconds);
+                }
+                if (maxReserveCores < 1) {
+                    throw new IllegalArgumentException("maxReserveCores must be at least 1, got " + maxReserveCores);
+                }
+                if (stepCores < 1 || stepCores > maxReserveCores) {
+                    throw new IllegalArgumentException(
+                        "stepCores must be in [1, " + maxReserveCores + "], got " + stepCores
+                    );
+                }
+            }
+
+            /**
+             * Returns the shipped policy.
+             *
+             * @return disabled, a quarter of the regions lagging or a region below 19 TPS starts it,
+             *     three calm samples at 19.5 TPS release it, at most two cores move one at a time
+             */
+            public static TickPressure defaults() {
+                return new TickPressure(false, 0.25d, 19.0d, 19.5d, 3, 5, 2, 1);
+            }
+
+            /**
+             * Returns the minimum time between two reserve changes.
+             *
+             * @return the cooldown in nanoseconds
+             */
+            public long cooldownNanos() {
+                return this.cooldownSeconds * 1_000_000_000L;
+            }
         }
     }
 

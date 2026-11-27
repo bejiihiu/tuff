@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import kz.bejiihiu.tuff.threads.DegradedReason;
 import kz.bejiihiu.tuff.threads.ExecutionPoolRegistry;
 import kz.bejiihiu.tuff.threads.Lease;
 import kz.bejiihiu.tuff.threads.LeaseRequest;
@@ -20,6 +21,7 @@ import kz.bejiihiu.tuff.threads.PoolSnapshot;
 import kz.bejiihiu.tuff.threads.PoolSpec;
 import kz.bejiihiu.tuff.threads.ResourceBudget;
 import kz.bejiihiu.tuff.threads.SaturationReport;
+import kz.bejiihiu.tuff.threads.SheddingReport;
 import kz.bejiihiu.tuff.threads.ThreadResourceController;
 import kz.bejiihiu.tuff.threads.ThreadSnapshot;
 import kz.bejiihiu.tuff.threads.internal.impl.events.MetricsEventSink;
@@ -338,7 +340,9 @@ final class MetricsFixtures {
     static final class FakeLeaseController implements ThreadResourceController {
 
         private final Map<PoolId, SaturationReport> reports = new HashMap<>();
+        private final Map<PoolId, List<DegradedReason>> reasons = new HashMap<>();
         private final int usable;
+        private SheddingReport shedding = SheddingReport.none();
 
         FakeLeaseController() {
             this(1);
@@ -352,9 +356,32 @@ final class MetricsFixtures {
             this.reports.put(report.pool(), report);
         }
 
+        void reasons(final PoolId pool, final DegradedReason... values) {
+            this.reasons.put(pool, List.of(values));
+        }
+
+        void shedding(final SheddingReport report) {
+            this.shedding = report;
+        }
+
         @Override
         public int usableCores() {
             return this.usable;
+        }
+
+        @Override
+        public int criticalReserve() {
+            return this.shedding.criticalReserveCores();
+        }
+
+        @Override
+        public SheddingReport sheddingReport() {
+            return this.shedding;
+        }
+
+        @Override
+        public List<DegradedReason> degradedReasons(final PoolId pool) {
+            return this.reasons.getOrDefault(pool, List.of());
         }
 
         @Override

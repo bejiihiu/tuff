@@ -47,7 +47,8 @@ public final class ThreadManagerImpl implements UnifiedThreadManager {
      *
      * <p>Everything else is either a coverage statement ({@code OBSERVE_ONLY}, {@code FEATURE_DISABLED})
      * or a measurement gap ({@code METRICS_UNAVAILABLE}, {@code NUMA_UNAVAILABLE}); those belong in the
-     * snapshot, not in the state.
+     * snapshot, not in the state. Load shedding is not in this set: it is the policy working as configured,
+     * and the reason it fired ({@code CRITICAL_POOL_PRESSURE}) is what moves the state.
      */
     private static final Set<DegradedReason> DEGRADING = Set.of(
         DegradedReason.BUDGET_EXHAUSTED,
@@ -55,7 +56,8 @@ public final class ThreadManagerImpl implements UnifiedThreadManager {
         DegradedReason.SCHEDULER_LIMITATION,
         DegradedReason.THREAD_CREATION_FAILED,
         DegradedReason.POOL_UNRESPONSIVE,
-        DegradedReason.CONFIG_CONFLICT
+        DegradedReason.CONFIG_CONFLICT,
+        DegradedReason.CRITICAL_POOL_PRESSURE
     );
 
     private final ThreadManagementSettings settings;
@@ -156,7 +158,8 @@ public final class ThreadManagerImpl implements UnifiedThreadManager {
             poolSnapshots,
             measured.threads(),
             allReasons,
-            measured.budgetLedger()
+            measured.budgetLedger(),
+            measured.shedding()
         );
     }
 

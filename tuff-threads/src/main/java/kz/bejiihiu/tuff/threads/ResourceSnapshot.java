@@ -23,6 +23,12 @@ import java.util.Set;
  * {@link ThreadResourceController#usableCores()}. The raw subtraction before the floor, which may be
  * zero or negative, is visible in {@link #budgetLedger()}.
  *
+ * <p>{@link #shedding()} carries the two numbers that explain a pool smaller than its configuration: the
+ * cores held back for the critical lanes and the cores withheld from the non critical pools by load
+ * shedding. The same facts reach {@link #degradedReasons()} as
+ * {@link DegradedReason#CRITICAL_POOL_PRESSURE} and {@link DegradedReason#LOAD_SHEDDING}, so "degraded"
+ * never appears without "why".
+ *
  * @param capturedAt               moment the snapshot was taken
  * @param usableCores              cores left to managed pools by the budget ledger, at least one
  * @param reservedCores            cores kept out of the managed budget, as configured, at least zero
@@ -40,6 +46,7 @@ import java.util.Set;
  * @param degradedReasons          union of the reasons reported by all pools
  * @param budgetLedger             the controller's one line budget ledger, or empty when the sampler has
  *                                 no ledger to read
+ * @param shedding                 critical reserve and load shedding as the controller sees them
  */
 public record ResourceSnapshot(
     Instant capturedAt,
@@ -55,7 +62,8 @@ public record ResourceSnapshot(
     List<PoolSnapshot> pools,
     List<ThreadSnapshot> threads,
     Set<DegradedReason> degradedReasons,
-    Optional<String> budgetLedger
+    Optional<String> budgetLedger,
+    SheddingReport shedding
 ) {
 
     /**
@@ -70,6 +78,7 @@ public record ResourceSnapshot(
         Objects.requireNonNull(threads, "threads");
         Objects.requireNonNull(degradedReasons, "degradedReasons");
         Objects.requireNonNull(budgetLedger, "budgetLedger");
+        Objects.requireNonNull(shedding, "shedding");
         if (usableCores < 1) {
             throw new IllegalArgumentException("usableCores must be at least 1, got " + usableCores);
         }
@@ -144,7 +153,65 @@ public record ResourceSnapshot(
             pools,
             threads,
             degradedReasons,
-            Optional.empty()
+            Optional.empty(),
+            SheddingReport.none()
+        );
+    }
+
+    /**
+     * Creates a snapshot without a budget ledger or a shedding report.
+     *
+     * <p>The shape call sites used before the ledger and the sharing report existed. Both are additive:
+     * a hand-built snapshot is not incomplete, it just has nothing to say about the budget or the reserve,
+     * and {@link SheddingReport#none()} states exactly that ("nothing is held").
+     *
+     * @param capturedAt               moment the snapshot was taken
+     * @param usableCores              cores left to managed pools by the budget ledger, at least one
+     * @param reservedCores            cores kept out of the managed budget, as configured, at least zero
+     * @param totalThreads             live registered threads
+     * @param activeThreads            registered threads that are runnable
+     * @param idleThreads              registered threads waiting for work
+     * @param peakThreads              highest number of live registered threads since start
+     * @param creationRatePerSecond    threads created per second over the last sampling window
+     * @param terminationRatePerSecond threads terminated per second over the last sampling window
+     * @param processCpuLoad           process wide CPU share, or {@code -1} when unavailable
+     * @param pools                    per pool snapshots, in id order
+     * @param threads                  per thread snapshots
+     * @param degradedReasons          union of the reasons reported by all pools
+     * @param shedding                 critical reserve and shedding report
+     */
+    public ResourceSnapshot(
+        final Instant capturedAt,
+        final int usableCores,
+        final int reservedCores,
+        final int totalThreads,
+        final int activeThreads,
+        final int idleThreads,
+        final int peakThreads,
+        final double creationRatePerSecond,
+        final double terminationRatePerSecond,
+        final double processCpuLoad,
+        final List<PoolSnapshot> pools,
+        final List<ThreadSnapshot> threads,
+        final Set<DegradedReason> degradedReasons,
+        final SheddingReport shedding
+    ) {
+        this(
+            capturedAt,
+            usableCores,
+            reservedCores,
+            totalThreads,
+            activeThreads,
+            idleThreads,
+            peakThreads,
+            creationRatePerSecond,
+            terminationRatePerSecond,
+            processCpuLoad,
+            pools,
+            threads,
+            degradedReasons,
+            Optional.empty(),
+            shedding
         );
     }
 
@@ -182,6 +249,18 @@ public record ResourceSnapshot(
      */
     public boolean degraded() {
         return !this.degradedReasons.isEmpty();
+    }
+
+    /**
+     * Returns the cores held for the critical lanes.
+     *
+     * <p>Shortcut for {@code shedding().criticalReserveCores()}: it is the number an operator checks
+     * first when a background pool looks smaller than its configuration says.
+     *
+     * @return reserved cores, at least zero
+     */
+    public int criticalReserveCores() {
+        return this.shedding.criticalReserveCores();
     }
 
     /**

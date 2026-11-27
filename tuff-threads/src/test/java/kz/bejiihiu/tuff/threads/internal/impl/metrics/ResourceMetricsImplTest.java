@@ -16,6 +16,7 @@ import kz.bejiihiu.tuff.threads.PoolSpec;
 import kz.bejiihiu.tuff.threads.ResourceBudget;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.SaturationReport;
+import kz.bejiihiu.tuff.threads.SheddingReport;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import kz.bejiihiu.tuff.threads.ThreadSnapshot;
 import kz.bejiihiu.tuff.threads.internal.impl.budget.BudgetDeductions;
@@ -462,6 +463,36 @@ class ResourceMetricsImplTest {
         assertEquals(List.of(3L, 9L), snapshot.threads().stream().map(ThreadSnapshot::threadId).toList());
         assertNotNull(snapshot.capturedAt());
         assertEquals(Set.of(), snapshot.degradedReasons());
+    }
+
+    @Test
+    void theSheddingReportAndItsReasonsReachTheSnapshot() {
+        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
+        final MetricsFixtures.FakeLeaseController controller = new MetricsFixtures.FakeLeaseController(2);
+        final SheddingReport report = new SheddingReport(
+            1, true, 1, List.of(COMPUTE), "load shedding withholding 1 core(s) from compute"
+        );
+        controller.shedding(report);
+        controller.reasons(COMPUTE, DegradedReason.LOAD_SHEDDING);
+        final ResourceSampler sampler = new ResourceSampler(
+            pools,
+            this.registry,
+            PoolProbeSource.empty(),
+            this.counters,
+            this.clock,
+            this.sink,
+            MetricsConfig.defaults(),
+            0,
+            controller
+        );
+
+        final ResourceSnapshot snapshot = sampler.sampleNow();
+
+        assertEquals(report, snapshot.shedding());
+        assertEquals(1, snapshot.criticalReserveCores());
+        assertEquals(List.of(DegradedReason.LOAD_SHEDDING), snapshot.pool(COMPUTE).orElseThrow().degradedReasons());
+        assertTrue(snapshot.degradedReasons().contains(DegradedReason.LOAD_SHEDDING),
+            "the top level union must not lose the controller's reason");
     }
 
     private ResourceMetricsImpl metrics(final MetricsFixtures.FakePools pools, final MetricsConfig config) {

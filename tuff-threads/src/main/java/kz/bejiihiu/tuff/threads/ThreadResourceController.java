@@ -1,5 +1,6 @@
 package kz.bejiihiu.tuff.threads;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -50,6 +51,50 @@ public interface ThreadResourceController {
      *     {@code cores 16: ceiling 12 = region 2 + chunk 0 + io 0 + reserve 1 + usable 9}
      */
     String budgetLedger();
+
+    /**
+     * Returns the cores kept out of the shared budget for the critical lanes.
+     *
+     * <p>This is the guaranteed part of {@code region-execution} and {@code network}: the cores they may
+     * always lease, whatever the non critical pools declare, and the part load shedding never touches.
+     * It is already subtracted from the base the shared pools resolve their budgets against, so a compute
+     * burst cannot take it even when the compute caps add up to more than the machine has.
+     *
+     * <p>Zero is a normal answer: region threads are usually deducted from the headroom as threads rather
+     * than cores, and an unmanaged network pool guarantees nothing. The number is a count of cores of the
+     * current ledger, not of the machine.
+     *
+     * @return reserved cores, at least zero
+     */
+    int criticalReserve();
+
+    /**
+     * Returns how much of the budget is currently withheld from non critical pools.
+     *
+     * <p>Empty of shed cores in the normal case. When load shedding is configured and a critical pool's
+     * queue grows while the shared capacity is exhausted, the controller reduces the capacity of the non
+     * critical pools - never below their declared minimum - and reports the pools and the core count here
+     * until the critical queue has been calm long enough to give the cores back. Held permits are never
+     * revoked; only new leases are refused.
+     *
+     * @return the report, never {@code null}
+     */
+    SheddingReport sheddingReport();
+
+    /**
+     * Returns the reasons the controller reports for one pool.
+     *
+     * <p>Complements the reasons a measurement adds: the controller knows about budget exhaustion, a
+     * critical pool whose queue is growing ({@link DegradedReason#CRITICAL_POOL_PRESSURE}) and a pool
+     * whose capacity is temporarily reduced ({@link DegradedReason#LOAD_SHEDDING}). An unknown pool
+     * answers with an empty list rather than throwing, because a command may print an id that was
+     * unregistered a moment ago.
+     *
+     * @param pool pool id
+     * @return an immutable list of reasons, possibly empty
+     * @throws NullPointerException if {@code pool} is {@code null}
+     */
+    List<DegradedReason> degradedReasons(PoolId pool);
 
     /**
      * Returns the total budget the controller may divide.

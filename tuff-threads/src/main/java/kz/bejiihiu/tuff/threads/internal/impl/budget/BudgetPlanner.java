@@ -127,23 +127,35 @@ public final class BudgetPlanner {
         final int available = Math.max(1, this.topology.availableProcessors());
         final int ceiling = Math.max(1, (int) Math.floor(available * USABLE_CORE_FRACTION));
         final int reserve = this.reserveCores();
-        final int rawUsable = ceiling
-            - this.deductions.regionThreads()
-            - this.deductions.chunkThreads()
-            - this.deductions.ioThreads()
-            - reserve;
-        final int usable = Math.max(1, rawUsable);
 
         final List<PoolSpec> ordered = specs.stream()
             .sorted(Comparator.comparing(PoolSpec::id))
             .toList();
         final Set<PoolId> seen = new HashSet<>();
-        final List<PoolBudget> requested = new ArrayList<>(ordered.size());
         for (final PoolSpec spec : ordered) {
             if (!seen.add(spec.id())) {
                 throw new IllegalArgumentException("duplicate pool spec for id '" + spec.id() + "'");
             }
-            requested.add(this.budgetFor(spec, ceiling, usable));
+        }
+
+        // critical minimums that the thread deductions did not already pay for come out of the shared
+        // remainder first: that is the part a compute burst can never take, even when its caps add up
+        // to more than the machine has
+        final int criticalReserve = criticalReserve(ordered, this.deductions);
+        final int beforeCritical = ceiling
+            - this.deductions.regionThreads()
+            - this.deductions.chunkThreads()
+            - this.deductions.ioThreads()
+            - reserve;
+        final int rawUsable = beforeCritical - criticalReserve;
+        final int usable = Math.max(1, rawUsable);
+        // what the pools that share the remainder may actually divide; zero is a legal answer and the
+        // only honest one when the critical lanes hold everything that is left
+        final int shared = Math.max(0, rawUsable);
+
+        final List<PoolBudget> requested = new ArrayList<>(ordered.size());
+        for (final PoolSpec spec : ordered) {
+            requested.add(this.budgetFor(spec, ceiling, shared));
         }
 
         final List<String> reasons = new ArrayList<>();
@@ -151,9 +163,9 @@ public final class BudgetPlanner {
             .filter(budget -> !budget.critical())
             .mapToInt(PoolBudget::reservedCores)
             .sum();
-        if (reservedTotal > usable) {
+        if (reservedTotal > shared) {
             reasons.add(
-                "pool reserves reach " + reservedTotal + " cores but only " + usable
+                "pool reserves reach " + reservedTotal + " cores but only " + shared
                     + " are usable; not overcommitting them"
             );
         }
@@ -163,12 +175,12 @@ public final class BudgetPlanner {
             .mapToInt(PoolBudget::maxCores)
             .sum();
         final List<PoolBudget> budgets;
-        if (sharedDemand > usable) {
+        if (sharedDemand > shared) {
             reasons.add(
-                "shared pool caps reach " + sharedDemand + " cores but only " + usable
+                "shared pool caps reach " + sharedDemand + " cores but only " + shared
                     + " are usable; dividing the remainder proportionally instead of overcommitting"
             );
-            budgets = divideUsable(requested, sharedDemand, usable);
+            budgets = divideUsable(requested, sharedDemand, shared);
         } else {
             budgets = requested;
         }
@@ -178,13 +190,18 @@ public final class BudgetPlanner {
             }
         }
 
-        if (rawUsable <= 0) {
+        if (beforeCritical <= 0) {
             reasons.add(
                 "no headroom: region " + this.deductions.regionThreads()
                     + " + chunk " + this.deductions.chunkThreads()
                     + " + io " + this.deductions.ioThreads()
                     + " + reserve " + reserve
-                    + " leaves " + rawUsable + " of the " + ceiling + " thread ceiling"
+                    + " leaves " + beforeCritical + " of the " + ceiling + " thread ceiling"
+            );
+        } else if (criticalReserve > 0 && rawUsable <= 0) {
+            reasons.add(
+                "critical pools hold " + criticalReserve + " of the " + beforeCritical
+                    + " cores left by the deductions, so the non critical pools get none"
             );
         }
 
@@ -195,6 +212,7 @@ public final class BudgetPlanner {
             this.deductions.chunkThreads(),
             this.deductions.ioThreads(),
             reserve,
+            criticalReserve,
             rawUsable,
             usable,
             budgets,
@@ -203,21 +221,64 @@ public final class BudgetPlanner {
     }
 
     /**
+     * Sums the guaranteed minimum of the critical lanes that is not already deducted as threads.
+     *
+     * <p>Region tick threads are subtracted from the headroom as threads, so only a declared minimum
+     * above that count needs cores of its own. Netty threads are not deducted anywhere yet, which makes
+     * the whole network minimum a reserve. The guarantee of one pool is the larger of its declared
+     * minimum and its declared reserve, because both are promises the pool already makes. Anything a
+     * critical pool asks for above its guarantee is best effort and is not held back from the others - a
+     * guarantee that grows with the request is not a guarantee.
+     *
+     * @param specs      registered pools, in id order
+     * @param deductions threads already claimed outside the managed budget
+     * @return cores to keep out of the shared remainder, at least zero
+     */
+    private static int criticalReserve(final List<PoolSpec> specs, final BudgetDeductions deductions) {
+        int reserve = 0;
+        for (final PoolSpec spec : specs) {
+            final int guarantee = Math.max(spec.minThreads(), spec.budget().reservedCores());
+            if (spec.kind() == PoolKind.REGION_EXECUTION) {
+                reserve += Math.max(0, guarantee - deductions.regionThreads());
+            } else if (spec.kind() == PoolKind.NETWORK) {
+                reserve += guarantee;
+            }
+        }
+        return reserve;
+    }
+
+    /**
      * Resolves one pool's declared budget against the right base.
      *
      * @param spec    pool description
      * @param ceiling thread ceiling of the whole server
-     * @param usable  cores left for the pools that share the remainder
+     * @param shared  cores left for the pools that share the remainder, may be zero
      * @return the pool budget
      */
-    private PoolBudget budgetFor(final PoolSpec spec, final int ceiling, final int usable) {
-        final int base = this.baseFor(spec.kind(), ceiling, usable);
+    private PoolBudget budgetFor(final PoolSpec spec, final int ceiling, final int shared) {
+        final int base = this.baseFor(spec.kind(), ceiling, shared);
         final int resolved = spec.budget().resolveCores(base);
         final int capped = spec.maxThreads() == -1 ? resolved : Math.min(resolved, spec.maxThreads());
         final boolean critical = spec.kind() == PoolKind.REGION_EXECUTION || spec.kind() == PoolKind.NETWORK;
-        final int capacity = critical ? Math.max(capped, spec.minThreads()) : capped;
+        final int capacity = critical ? Math.max(capped, spec.minThreads()) : clampToShared(capped, shared);
         final int reserved = Math.min(spec.budget().reservedCores(), capacity);
         return new PoolBudget(spec.id(), spec.kind(), spec.minThreads(), capped, reserved);
+    }
+
+    /**
+     * Keeps a shared pool from claiming a remainder that is not there.
+     *
+     * <p>An elastic budget resolves to at least one core so a registered pool can make progress; when
+     * the critical reserve ate the whole remainder that one core would be an invented core, exactly the
+     * overcommit the ledger exists to prevent. Zero permits is a legal answer for a pool, and the plan
+     * says why.
+     *
+     * @param capacity resolved capacity
+     * @param shared   cores actually left for the shared pools
+     * @return the capacity the pool may hold
+     */
+    private static int clampToShared(final int capacity, final int shared) {
+        return Math.max(0, Math.min(capacity, shared));
     }
 
     /**
@@ -230,17 +291,17 @@ public final class BudgetPlanner {
      *
      * @param kind    pool kind
      * @param ceiling thread ceiling of the whole server
-     * @param usable  cores left for the pools that share the remainder
+     * @param shared  cores left for the pools that share the remainder, may be zero
      * @return the base, at least one
      */
-    private int baseFor(final PoolKind kind, final int ceiling, final int usable) {
+    private int baseFor(final PoolKind kind, final int ceiling, final int shared) {
         return switch (kind) {
             case REGION_EXECUTION -> Math.max(1, this.deductions.regionThreads());
             case CHUNK -> Math.max(1, this.deductions.chunkThreads());
             case IO -> Math.max(1, this.deductions.ioThreads());
             // netty threads are not deducted yet, so the ceiling is the only honest base for now
             case NETWORK -> ceiling;
-            case COMPUTE, SERVICE, VIRTUAL -> usable;
+            case COMPUTE, SERVICE, VIRTUAL -> Math.max(1, shared);
         };
     }
 

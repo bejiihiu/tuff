@@ -87,6 +87,26 @@ public enum DegradedReason {
     METRICS_UNAVAILABLE,
 
     /**
+     * A critical pool (region execution or network) is short of its guaranteed share.
+     *
+     * <p>Two situations produce it: the pool's lease queue is growing while every permit it owns is
+     * taken, or the arithmetic could only honour its declared minimum by overcommitting the ledger. The
+     * guarantee itself is not renegotiated - the controller keeps the minimum and, when load shedding is
+     * on, takes the missing cores back from the non critical pools. The numbers live in
+     * {@link SheddingReport#summary()} and in the pool's saturation, the enum only names the state.
+     */
+    CRITICAL_POOL_PRESSURE,
+
+    /**
+     * The pool's capacity is temporarily reduced to keep a critical lane alive.
+     *
+     * <p>Only non critical pools get this reason, only while load shedding is active, and never below
+     * the pool's declared minimum. It is a policy action, not a failure: the pool keeps its threads and
+     * its held permits, it just stops taking new work until the critical queue drains.
+     */
+    LOAD_SHEDDING,
+
+    /**
      * The manager has not been started yet or has already stopped.
      *
      * <p>Reads still work and return the last known snapshot, but no new leases or registrations are
