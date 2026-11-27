@@ -72,7 +72,7 @@ class ThreadsSamplerTest {
         try {
             final ThreadsSampler.Sample sample = sampler.sample();
             assertNotNull(sample, "start warms the cache so the first command is not empty");
-            assertEquals(7, sample.snapshot().pools().size(), "the canonical pool set is measured");
+            assertEquals(9, sample.snapshot().pools().size(), "the canonical pool set is measured");
             assertTrue(sample.unknownThreads() >= 0, "the refresher measures the unaccounted threads");
             assertTrue(sample.ageMillis() < 60_000L, "the first sample is fresh");
         } finally {

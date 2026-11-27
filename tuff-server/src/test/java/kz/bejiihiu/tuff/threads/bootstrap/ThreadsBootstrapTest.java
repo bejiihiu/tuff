@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -288,6 +289,81 @@ class ThreadsBootstrapTest {
         );
 
         assertEquals(1, ThreadsSampler.countUnknown(unregistered, snapshot));
+    }
+
+    @Test
+    void everyObservedPoolIsRegisteredWithItsOwnCoverage() throws IOException {
+        final ThreadsBootstrap bootstrap = new ThreadsBootstrap();
+        bootstrap.startWith(new ThreadsConfig(this.write("""
+            thread-management:
+              enabled: true
+            """)));
+        try {
+            final ResourceSnapshot snapshot = bootstrap.currentStatus().snapshot();
+            assertNotNull(snapshot, "a running layer must publish the canonical pool set");
+            final Set<PoolId> ids = new HashSet<>();
+            for (final PoolSnapshot pool : snapshot.pools()) {
+                ids.add(pool.id());
+            }
+            assertEquals(Set.of(
+                PoolId.REGION_EXECUTION,
+                PoolId.COMPUTE,
+                PoolId.COMPUTE_VIRTUAL,
+                PoolId.CHUNK_WORKER,
+                PoolId.CHUNK_IO,
+                PoolId.NETWORK,
+                PoolId.CHAT,
+                PoolId.BACKGROUND,
+                PoolId.SERVICE
+            ), ids, "every observed pool has a spec, so the command can print it");
+            for (final PoolId id : Set.of(
+                PoolId.CHUNK_WORKER, PoolId.CHUNK_IO, PoolId.NETWORK, PoolId.CHAT, PoolId.BACKGROUND
+            )) {
+                final PoolSnapshot pool = snapshot.pool(id).orElseThrow();
+                assertEquals(CoverageLevel.L1, pool.coverage(), id + " is observed only");
+                assertEquals(0, pool.spec().minThreads(), id + " claims no managed floor");
+            }
+        } finally {
+            bootstrap.shutdown();
+        }
+    }
+
+    @Test
+    void everyObservedPoolAccountsForItsOwnThreadsInTheUnknownCount() {
+        final List<ThreadSnapshot> observed = List.of(
+            new ThreadSnapshot(11L, "Netty NIO IO #0", PoolId.NETWORK,
+                Thread.State.RUNNABLE, false, Thread.NORM_PRIORITY, -1L),
+            new ThreadSnapshot(12L, "Tuff Common Worker #0", PoolId.CHUNK_WORKER,
+                Thread.State.RUNNABLE, true, Thread.NORM_PRIORITY, -1L),
+            new ThreadSnapshot(13L, "Tuff I/O Worker #0", PoolId.CHUNK_IO,
+                Thread.State.WAITING, true, Thread.NORM_PRIORITY, -1L),
+            new ThreadSnapshot(14L, "Async Chat Thread - #0", PoolId.CHAT,
+                Thread.State.RUNNABLE, true, Thread.NORM_PRIORITY, -1L),
+            new ThreadSnapshot(15L, "Worker-Main-1", PoolId.BACKGROUND,
+                Thread.State.TIMED_WAITING, true, Thread.NORM_PRIORITY, -1L)
+        );
+        final ResourceSnapshot snapshot = new ResourceSnapshot(
+            Instant.EPOCH, 1, 0, 1, 1, 0, 1, 0.0d, 0.0d, -1.0d,
+            List.of(),
+            observed,
+            Set.of(),
+            Optional.empty()
+        );
+        final List<ThreadSnapshot> unregistered = List.of(
+            new ThreadSnapshot(11L, "Netty NIO IO #0", PoolId.of("unregistered"),
+                Thread.State.RUNNABLE, false, Thread.NORM_PRIORITY, -1L),
+            new ThreadSnapshot(12L, "Tuff Common Worker #0", PoolId.of("unregistered"),
+                Thread.State.RUNNABLE, true, Thread.NORM_PRIORITY, -1L),
+            new ThreadSnapshot(13L, "Tuff I/O Worker #0", PoolId.of("unregistered"),
+                Thread.State.WAITING, true, Thread.NORM_PRIORITY, -1L),
+            new ThreadSnapshot(14L, "Async Chat Thread - #0", PoolId.of("unregistered"),
+                Thread.State.RUNNABLE, true, Thread.NORM_PRIORITY, -1L),
+            new ThreadSnapshot(15L, "Worker-Main-1", PoolId.of("unregistered"),
+                Thread.State.TIMED_WAITING, true, Thread.NORM_PRIORITY, -1L)
+        );
+
+        assertEquals(0, ThreadsSampler.countUnknown(unregistered, snapshot),
+            "a thread listed by any probe is accounted, not unknown");
     }
 
     private Path write(final String contents) throws IOException {

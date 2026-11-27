@@ -27,14 +27,16 @@ counts such as threads and unknown threads vary with the JVM and the load:
 
 ```
 Tuff thread layer: running, some pools managed
-  cores: 11 usable after the reserve, 1 reserved; 8 registered thread(s) (peak 8)
+  cores: 11 usable after the reserve, 1 reserved; 4 registered thread(s) (peak 4)
   sample: taken 412 ms ago
-  pools: 7 registered
-    chunk-io          L1  alive 0  active 0  idle 0  cpu 0%
-    chunk-worker      L1  alive 0  active 0  idle 0  cpu 0%
+  pools: 9 registered
+    background        L1  alive 3  active 1  idle 2  cpu 0%
+    chat              L1  alive 0  active 0  idle 0  cpu 0%
+    chunk-io          L1  alive 1  active 0  idle 1  cpu 0%
+    chunk-worker      L1  alive 4  active 2  idle 2  cpu 0%
     compute           L1  alive 4  active 0  idle 3  cpu 0%
     compute-virtual   L1  alive 1  active 0  idle 0  cpu 0%
-    network           L1  alive 0  active 0  idle 0  cpu 0%
+    network           L1  alive 4  active 0  idle 4  cpu 0%
     region-execution  L2  alive 2  active 0  idle 2  cpu 0%
       regions 1 / avg MSPT 0.5 ms / min TPS 20.0 / lag 0% (0 of 1)
       ticks: 5s max 1.1 ms, 15s avg 0.8 ms max 32.5 ms; entities 0 / players 0 / chunks 25
@@ -92,8 +94,8 @@ How to read it:
   `THREAD_CREATION_FAILED` move the manager state to `DEGRADED`.
 - **`unknown threads:`** is a count, `n/a (no sample yet)` before the first pass, or
   `n/a (metrics collection is disabled)` when metrics are off. The report does not list their names;
-  the snapshot does. Every thread a probe lists — region and compute — is already accounted, so it
-  never lands in this count.
+  the snapshot does. Every thread a probe lists - region, chunk, netty, chat, background and compute -
+  is already accounted, so it never lands in this count.
 - **`settings:`** repeats the three values that most often explain a surprise: the reserve, the region
   scheduler and the configured region thread count (`unknown` when the config says "auto"). Every key of
   the section needs a restart.

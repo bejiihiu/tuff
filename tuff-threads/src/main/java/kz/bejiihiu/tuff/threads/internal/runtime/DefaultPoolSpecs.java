@@ -40,13 +40,15 @@ final class DefaultPoolSpecs {
      * @return the pool descriptions, in id order when sorted by the registry
      */
     static List<PoolSpec> collect(final ThreadManagementSettings settings) {
-        final List<PoolSpec> specs = new ArrayList<>(7);
+        final List<PoolSpec> specs = new ArrayList<>(9);
         specs.add(regionExecution(settings));
         specs.add(compute(settings));
         specs.add(computeVirtual());
         specs.add(chunkWorker(settings));
         specs.add(chunkIo(settings));
         specs.add(network(settings));
+        specs.add(chat());
+        specs.add(background());
         specs.add(service());
         return List.copyOf(specs);
     }
@@ -153,6 +155,32 @@ final class DefaultPoolSpecs {
             -1,
             coverage,
             budgetFor(coverage)
+        );
+    }
+
+    private static PoolSpec chat() {
+        return new PoolSpec(
+            PoolId.CHAT,
+            PoolKind.SERVICE,
+            "paper",
+            "chat decoration executor",
+            0,
+            -1,
+            CoverageLevel.L1,
+            budgetFor(CoverageLevel.L1)
+        );
+    }
+
+    private static PoolSpec background() {
+        return new PoolSpec(
+            PoolId.BACKGROUND,
+            PoolKind.SERVICE,
+            "paper",
+            "generic background worker pool",
+            0,
+            -1,
+            CoverageLevel.L1,
+            budgetFor(CoverageLevel.L1)
         );
     }
 

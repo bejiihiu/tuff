@@ -56,6 +56,21 @@ public record PoolId(String value) implements Comparable<PoolId> {
     public static final PoolId NETWORK = new PoolId("network");
 
     /**
+     * Canonical id of the chat decoration executor.
+     *
+     * <p>Paper owns the {@code ThreadPoolExecutor}; UTMI only observes its size and its threads.
+     */
+    public static final PoolId CHAT = new PoolId("chat");
+
+    /**
+     * Canonical id of the generic background worker pool.
+     *
+     * <p>{@code Util.backgroundExecutor} is Paper's fork-join pool for anti-xray, structure placement
+     * and other non-tick work. UTMI observes it and never touches its queue or sizing.
+     */
+    public static final PoolId BACKGROUND = new PoolId("background");
+
+    /**
      * Canonical id of the catch all pool for short lived server services that do not deserve a pool
      * kind of their own.
      */

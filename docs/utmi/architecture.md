@@ -114,7 +114,7 @@ wrapped thread's class, name, group, daemon flag and exception handler stay the 
 | `COMPUTE` | `compute` | Elastic. Yields capacity first |
 | `CHUNK`, `IO` | `chunk-worker`, `chunk-io` | Specialised. Ordering and shutdown order belong to the chunk system |
 | `NETWORK` | `network` | Critical. Event loops own their channels and cannot be parked |
-| `SERVICE`, `VIRTUAL` | `service`, `compute-virtual` | Small / blocking lanes; virtual threads add no CPU parallelism |
+| `SERVICE`, `VIRTUAL` | `chat`, `background`, `service`, `compute-virtual` | Small / blocking lanes; virtual threads add no CPU parallelism |
 
 ## Current matrix
 
@@ -125,14 +125,16 @@ What the running layer actually registers and measures in this build:
 | `region-execution` | `REGION_EXECUTION` | L1; L2 when `region-execution.managed: true` | Yes, through the probe | No; at L2 their bodies are wrapped for accounting | No |
 | `compute` | `COMPUTE` | L1; L4 when `execution-pools.compute.managed: true` (or the older `async-compute.managed`) | Yes, through the engine probe | Yes at L4, through the compute adapter | Yes at L4; the controller's budget is the engine's single source |
 | `compute-virtual` | `VIRTUAL` | L1; L2 with the same compute flag | Yes, through the engine probe | The lane creates its virtual threads; their bodies are wrapped | No |
-| `chunk-worker` | `CHUNK` | L1; L2 claim when `execution-pools.chunk-system.managed: true` | No: `alive 0` | No | No |
-| `chunk-io` | `IO` | Same flag as `chunk-worker` | No | No | No |
-| `network` | `NETWORK` | L1; L2 claim when `execution-pools.network.managed: true` | No | No | No |
+| `chunk-worker` | `CHUNK` | L1; L2 claim when `execution-pools.chunk-system.managed: true` | Yes, through the Moonrise pool probe (`alive`, `core`) | No | No |
+| `chunk-io` | `IO` | Same flag as `chunk-worker` | Yes, through the Moonrise IO probe (`alive`, `core`) | No | No |
+| `network` | `NETWORK` | L1; L2 claim when `execution-pools.network.managed: true` | Yes, through the netty name scan (`alive`, `active`, `idle`) | No | No |
+| `chat` | `SERVICE` | L1 | Yes, through executor counters and the thread name scan | No | No |
+| `background` | `SERVICE` | L1 | Yes, through the `ForkJoinPool` counters and the thread name scan | No | No |
 | `service` | `SERVICE` | L2 for the registered pool; only the sampler is in it | Yes, the sampler thread | Yes, one daemon | No |
 
-`region-execution` is the only pool with tick-health data. Every other specialised pool is registered
-but unmeasured, so a printed `alive 0` is a real statement about the registry, not a failed read. Queue
-depths are still `-1` where the owner does not expose one, so a printed `unknown` is a real statement too.
+`region-execution` is the only pool with tick-health data. Every other specialised pool has its own
+cheap probe; `service` is accounted through the registry (the refresher thread), not a probe. Queue
+depths are still `-1` where the owner does not expose one, so a printed `unknown` is a real statement.
 
 `region-execution` at L2 is the one place where "threads created through the provider" is read as
 "bodies wrapped by the provider": Folia constructs and owns the `TickThreadRunner` because the tick
@@ -140,10 +142,10 @@ class is checked on every tick, and only the runnable it runs is passed through
 `ThreadFactoryProvider.wrap`. Accounting and lifecycle visibility are what L2 buys here; the thread
 itself never leaves Folia.
 
-The `chunk-worker`, `chunk-io` and `network` flags only raise the registered level. No owner hands a
-factory or a body to the manager yet, so nothing is created or wrapped; treat those entries as a
-registration claim, not as proof of accounting. [`coverage.md`](coverage.md) keeps the per-pool map
-with the reason each pool stops where it does.
+The `chunk-worker`, `chunk-io` and `network` flags only raise the registered level. The probes are
+attached at L1 regardless, so the numbers are real either way; no owner hands a factory or a body to
+the manager yet, so treat the deeper level as a registration claim, not as proof of accounting.
+[`coverage.md`](coverage.md) keeps the per-pool map with the reason each pool stops where it does.
 
 ## Region bridge and installation order
 

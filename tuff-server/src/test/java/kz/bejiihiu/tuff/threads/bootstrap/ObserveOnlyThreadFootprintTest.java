@@ -88,7 +88,7 @@ class ObserveOnlyThreadFootprintTest {
         assertTrue(this.layer.regionPoolRegistered(), "observe-only still registers the region pool");
         final ResourceSnapshot snapshot = running.snapshot();
         assertNotNull(snapshot, "a running layer publishes the first sample before start returns");
-        assertEquals(7, snapshot.pools().size(), "the canonical pool set is described, not created");
+        assertEquals(9, snapshot.pools().size(), "the canonical pool set is described, not created");
 
         final Map<Long, String> added = newOurThreads(before);
         assertEquals(1, added.size(), "the refresher is the only thread the layer creates: " + added);
@@ -139,7 +139,7 @@ class ObserveOnlyThreadFootprintTest {
 
         final ThreadsStatus status = this.layer.currentStatus();
         assertEquals(ThreadsStatus.State.RUNNING, status.state());
-        assertEquals(7, status.snapshot().pools().size(), "a repeated start must not register a second pool set");
+        assertEquals(9, status.snapshot().pools().size(), "a repeated start must not register a second pool set");
         assertEquals(1, newOurThreads(before).size(), "a repeated start must not spawn a second refresher");
 
         this.layer.shutdown();
@@ -154,7 +154,7 @@ class ObserveOnlyThreadFootprintTest {
         assertEquals(ThreadsStatus.State.RUNNING, this.layer.currentStatus().state(),
             "a stopped layer must start again instead of silently ignoring the request");
         assertTrue(this.layer.regionPoolRegistered(), "the fresh runtime registers the canonical pools");
-        assertEquals(7, this.layer.currentStatus().snapshot().pools().size());
+        assertEquals(9, this.layer.currentStatus().snapshot().pools().size());
         assertEquals(1, newOurThreads(before).size(), "the restart brings exactly one refresh thread back");
 
         this.layer.shutdown();
@@ -171,7 +171,7 @@ class ObserveOnlyThreadFootprintTest {
         runtime.start();
         runtime.start();
         assertEquals(UnifiedThreadManager.State.RUNNING, manager.state());
-        assertEquals(7, manager.pools().ids().size(), "a second start must not add pools");
+        assertEquals(9, manager.pools().ids().size(), "a second start must not add pools");
 
         runtime.shutdown(Duration.ZERO);
         runtime.shutdown(Duration.ZERO);

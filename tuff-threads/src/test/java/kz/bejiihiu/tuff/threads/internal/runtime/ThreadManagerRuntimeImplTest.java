@@ -66,6 +66,8 @@ class ThreadManagerRuntimeImplTest {
                 PoolId.CHUNK_WORKER,
                 PoolId.CHUNK_IO,
                 PoolId.NETWORK,
+                PoolId.CHAT,
+                PoolId.BACKGROUND,
                 PoolId.SERVICE
             ),
             manager.pools().ids()
@@ -80,7 +82,7 @@ class ThreadManagerRuntimeImplTest {
         assertTrue(manager.resources().usableCores() >= 1);
 
         final ResourceSnapshot snapshot = this.sample(manager);
-        assertEquals(7, snapshot.pools().size());
+        assertEquals(9, snapshot.pools().size());
         assertEquals(0, snapshot.totalThreads());
         assertEquals(manager.resources().usableCores(), snapshot.usableCores(),
             "the manager snapshot must publish the controller's usable");
@@ -99,7 +101,7 @@ class ThreadManagerRuntimeImplTest {
         runtime.start();
 
         assertEquals(UnifiedThreadManager.State.RUNNING, manager.state());
-        assertEquals(7, manager.pools().ids().size());
+        assertEquals(9, manager.pools().ids().size());
         assertEquals(0, this.sample(manager).totalThreads());
         assertEquals(0, this.sink.created().size());
         assertEquals(0, this.sink.terminated().size());

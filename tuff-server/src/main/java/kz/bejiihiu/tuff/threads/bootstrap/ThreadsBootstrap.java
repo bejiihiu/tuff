@@ -12,7 +12,12 @@ import kz.bejiihiu.tuff.threads.UnifiedThreadManager;
 import kz.bejiihiu.tuff.threads.bridge.RegionThreads;
 import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
 import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
+import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
+import kz.bejiihiu.tuff.threads.probe.BackgroundPoolProbe;
+import kz.bejiihiu.tuff.threads.probe.ChatPoolProbe;
+import kz.bejiihiu.tuff.threads.probe.ChunkPoolProbe;
+import kz.bejiihiu.tuff.threads.probe.NetworkPoolProbe;
 import kz.bejiihiu.tuff.threads.probe.RegionPoolProbe;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -155,6 +160,7 @@ public final class ThreadsBootstrap {
                 // the probe is attached after start, because start is what registers the pools; attaching
                 // earlier would be rejected by the probe registry with "pool is not registered"
                 created.attachProbe(new RegionPoolProbe());
+                attachObservedPools(created);
                 // every heavy read (region walk, thread table, probes) happens on this thread from now
                 // on: the console command is itself on a region tick thread in Folia and must not do it
                 final ThreadsSampler createdSampler = ThreadsSampler.start(created);
@@ -305,6 +311,31 @@ public final class ThreadsBootstrap {
                 LOGGER.error("Tuff compute cannot use the thread layer; the engine keeps its own threads and budget", ex);
                 return null;
             }
+        }
+    }
+
+    /**
+     * Attaches a probe to every remaining observed pool.
+     *
+     * <p>Each probe is independent and optional: one that cannot be attached leaves its pool registered
+     * and visible, just without numbers, while the rest of the layer keeps working. The region probe
+     * stays on the startup path because tick health is the one reading the report must not lose.
+     *
+     * @param runtime running thread manager
+     */
+    private static void attachObservedPools(final ThreadManagerRuntime runtime) {
+        attach(runtime, new NetworkPoolProbe());
+        attach(runtime, ChunkPoolProbe.worker());
+        attach(runtime, ChunkPoolProbe.io());
+        attach(runtime, new ChatPoolProbe());
+        attach(runtime, new BackgroundPoolProbe());
+    }
+
+    private static void attach(final ThreadManagerRuntime runtime, final PoolProbe probe) {
+        try {
+            runtime.attachProbe(probe);
+        } catch (RuntimeException | LinkageError ex) {
+            LOGGER.warn("Could not attach the {} pool probe; the pool stays registered without one", probe.pool(), ex);
         }
     }
 

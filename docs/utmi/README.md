@@ -35,14 +35,17 @@ not execution.
   existing compute startup hook, before the compute engine and before Folia's region scheduler is
   constructed. It is stopped at the bottom of the compute stop hook, after the compute engine is down
   and before the world save starts.
-- Seven canonical pools are registered at startup: `region-execution`, `compute`, `compute-virtual`,
-  `chunk-worker`, `chunk-io`, `network`, `service`. Every registered pool has an entry in
-  `/tuff threads` (unless per-pool publication is switched off), a coverage level and a budget.
+- Nine canonical pools are registered at startup: `region-execution`, `compute`, `compute-virtual`,
+  `chunk-worker`, `chunk-io`, `network`, `chat`, `background`, `service`. Every registered pool has an
+  entry in `/tuff threads` (unless per-pool publication is switched off), a coverage level and a budget.
 - `region-execution` is observed through a probe: live thread count from Folia's region scheduler, the
   thread list from its thread group, active and idle derived from `Thread.getState()`, CPU time per
   thread from `ThreadMXBean`. With `region-execution.managed: true` the same pool is raised to L2 and
   the `RegionThreads` bridge wraps each tick body, so Folia's threads are accounted while they run
   without changing their class, name, group, daemon flag or handler.
+- Every other specialised pool has a cheap L1 probe: chunk worker and IO from the Moonrise pool
+  arrays, netty event loops by name, the chat executor from its `ThreadPoolExecutor` counters, and the
+  background worker pool from its `ForkJoinPool` counters. None of them is resized, parked or replaced.
 - The CPU ledger is computed once from the processor topology, the configured reserve and the
   deductions, and re-derived whenever the registered pool set changes. It reports itself degraded when
   the arithmetic cannot cover what the pools declared.
@@ -63,7 +66,7 @@ but do not execute yet, and why.
 | --- | --- | --- |
 | Region threads at L2 (bodies wrapped) | With `region-execution.managed: true` the pool is registered at L2 and each tick body goes through `ThreadFactoryProvider.wrap`, so region threads are accounted while they run. Folia still creates its own `TickThreadRunner` objects: the class, name, group, daemon flag and uncaught handler stay Folia's | L2 is the deepest honest level here. Creating the threads elsewhere needs a replacement scheduler, not a wrapper: ownership checks, `AsyncCatcher` and the shutdown contract all key off the concrete tick thread class |
 | Compute at L4 | Only with `execution-pools.compute.managed: true` (or its older spelling). Off, `compute` and `compute-virtual` are registered at L1 and the engine keeps its own threads, queue and sizing | The adapter exists, but management is a separate reviewed step; the safe default is observation. With the flag on, the engine takes its workers and processor budget from the thread layer and keeps its queue |
-| Probes for chunk, netty, IO and service pools | These pools appear with `alive 0` and unknown queue depth; nothing is measured for them | Their owners expose no read-only observation yet. Moonrise has thread counts, but queue depth and busy state have no getters |
+| Queue depth for chunk, netty, chat and background pools | Snapshots report `queued = -1` for them, and `active` can be a state approximation | Moonrise has no queue-depth getter, netty keeps its internal queues private, and the chat executor's cached handoff queue is always zero by design; the counters that do exist are reported as they are |
 | Region queue depth and tick-start latency | Snapshots report `queued = -1` for the region pool | `RegionTaskQueueData.hasTasks()` is a boolean and the prioritised queues have no public size; `startOvershoot` is not exposed by the tick report |
 | Per-region tick breakdown | The region lines are one aggregate over all regions; there is no per-region row, and only the 5 s and 15 s windows are read | Per-region windows belong to the region handle and are updated per tick; `/tps` remains the region view, see [observability](observability.md) |
 | Live reload of `thread-management` | Every key is restart-only and `/tuff reload` says so | The runtime bakes its pool set and sampling policy in at start; a live change would be a promise the manager cannot keep |
