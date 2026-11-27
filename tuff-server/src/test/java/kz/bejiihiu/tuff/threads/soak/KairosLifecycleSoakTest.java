@@ -191,10 +191,13 @@ class KairosLifecycleSoakTest {
         for (int index = 0; index < 4; ++index) {
             this.rig.tick("post-halt-" + index, System.nanoTime(), 0, 0L, 0L, never, null);
         }
-        Thread.sleep(300L);
-
-        assertEquals(created, this.rig.threads().created().size(), "a halted fund must not allocate a thread");
-        assertEquals(starts, this.rig.threads().starts(), "a halted fund must not start a thread");
+        // bounded observation, not a sleep: a thread that appears at any point fails immediately
+        final long watchUntil = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300L);
+        while (System.nanoTime() - watchUntil < 0L) {
+            assertEquals(created, this.rig.threads().created().size(), "a halted fund must not allocate a thread");
+            assertEquals(starts, this.rig.threads().starts(), "a halted fund must not start a thread");
+            Thread.onSpinWait();
+        }
         for (final SoakFixtures.SoakTick tick : this.rig.ticks()) {
             assertEquals(0, tick.runs(), "nothing scheduled after halt may execute");
         }
