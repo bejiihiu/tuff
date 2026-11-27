@@ -208,12 +208,21 @@ oversubscribing the machine. It is computed once per ledger and has a one-line p
 `cores N: ceiling C = region R + chunk K + io I + reserve V + usable U`.
 
 ```
-ceiling = floor(availableProcessors × 0.8)
-usable  = max(1, ceiling − regionThreads − chunkThreads − ioThreads − max(1, reserveCores))
+ceiling  = max(1, floor(availableProcessors × 0.8))
+rawUsable = ceiling − regionThreads − chunkThreads − ioThreads
+                     − max(1, reserveCores) − criticalReserve
+usable   = max(1, rawUsable)     # printed as `cores:` by /tuff threads
+shared   = max(0, rawUsable)     # what compute, service and virtual may divide
 ```
 
+`criticalReserve` is the part of the critical lanes' guaranteed minimum that the thread deductions
+did not already cover: a region minimum above the configured deduction, plus the whole network
+minimum. It is subtracted whether or not `resources.load-shedding` is on, and it can take `shared` to
+zero while `usable` stays at one for the arithmetic.
+
 - `availableProcessors` comes from the platform topology view, container aware, never from a static
-  table. `cpu-aware: false` is a diagnostic, not a sizing mode.
+  table. `resources.cpu-aware` is recorded in the model but does not change the probe in this build:
+  sizing always reads the detected topology.
 - The reserve is floored at one core. A machine with nothing left for the kernel, GC and JIT does not
   get faster when a pool takes the last core. The configured value is reported as given; the floor is
   visible in the plan.
@@ -308,7 +317,7 @@ sequenceDiagram
     CB->>TB: start() — first
     TB->>TB: read thread-management from config/tuff.yml
     TB->>RT: create(settings) + start()
-    RT->>RT: register 7 pool specs, refresh the ledger
+    RT->>RT: register 9 pool specs, refresh the ledger
     TB->>BR: install(manager) — only when managed is on and the pool is L2
     TB->>RT: attach RegionPoolProbe
     CB->>CB: start the compute engine

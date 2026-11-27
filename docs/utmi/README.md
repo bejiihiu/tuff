@@ -54,8 +54,8 @@ not execution.
   shutdown.
 - `/tuff threads` prints the state, the pools, their coverage and degraded reasons, the unknown-thread
   count and the settings that need a restart.
-- Seven `tuff.threads.*` JFR events describe pool state, thread creation and termination, saturation,
-  budget changes, lease timeouts and unaccounted threads.
+- Eight `tuff.threads.*` JFR events describe pool state, thread creation and termination, saturation,
+  budget changes, lease timeouts, unaccounted threads and the compute pool's tick pressure decisions.
 
 ## What is not included yet
 
@@ -66,7 +66,7 @@ but do not execute yet, and why.
 | --- | --- | --- |
 | Region threads at L2 (bodies wrapped) | With `region-execution.managed: true` the pool is registered at L2 and each tick body goes through `ThreadFactoryProvider.wrap`, so region threads are accounted while they run. Folia still creates its own `TickThreadRunner` objects: the class, name, group, daemon flag and uncaught handler stay Folia's | L2 is the deepest honest level here. Creating the threads elsewhere needs a replacement scheduler, not a wrapper: ownership checks, `AsyncCatcher` and the shutdown contract all key off the concrete tick thread class |
 | Compute at L4 | Only with `execution-pools.compute.managed: true` (or its older spelling). Off, `compute` and `compute-virtual` are registered at L1 and the engine keeps its own threads, queue and sizing | The adapter exists, but management is a separate reviewed step; the safe default is observation. With the flag on, the engine takes its workers and processor budget from the thread layer and keeps its queue |
-| Queue depth for chunk, netty, chat and background pools | Snapshots report `queued = -1` for them, and `active` can be a state approximation | Moonrise has no queue-depth getter, netty keeps its internal queues private, and the chat executor's cached handoff queue is always zero by design; the counters that do exist are reported as they are |
+| Queue depth for the chunk, netty, chat and background pools | Chunk worker, chunk IO and netty report `queued = -1`; the chat executor reports its own queue size (always zero for its cached handoff queue) and the background pool reports the `ForkJoinPool` queued task count. `active` can be a state approximation | Moonrise has no queue-depth getter and netty keeps its internal queues private; the chat and background executors do expose counters, and they are reported as they are |
 | Region queue depth and tick-start latency | Snapshots report `queued = -1` for the region pool | `RegionTaskQueueData.hasTasks()` is a boolean and the prioritised queues have no public size; `startOvershoot` is not exposed by the tick report |
 | Per-region tick breakdown | The region lines are one aggregate over all regions; there is no per-region row, and only the 5 s and 15 s windows are read | Per-region windows belong to the region handle and are updated per tick; `/tps` remains the region view, see [observability](observability.md) |
 | Live reload of `thread-management` | Every key is restart-only and `/tuff reload` says so | The runtime bakes its pool set and sampling policy in at start; a live change would be a promise the manager cannot keep |
@@ -110,6 +110,9 @@ given.
   what stays outside UTMI by design.
 - [Observability](observability.md) — `/tuff threads`, what a snapshot contains, `tuff.threads.*` JFR
   events, unknown threads and why server-wide tick metrics do not exist on Folia.
+- [Tuning](tuning.md) — presets for real server types, the arithmetic behind thread counts and
+  budgets, what is restart-only, how to verify a change, and
+  [running the server behind a proxy](tuning.md#running-behind-a-proxy).
 
 ## Quick start
 

@@ -52,8 +52,10 @@ their probes; "L0" would mean no registry entry at all, which is not their state
 The level is the registered spec, so a level can be ahead of the accounting. That is deliberate and
 worth knowing before trusting a line:
 
-- **L1** is backed by a probe. Region and compute report live threads; other pools print `alive 0`
-  because the registry is empty, which is a measured zero.
+- **L1** is backed by a probe. Every canonical pool except `service` has one: region and compute from
+  their own engines, chunk worker and IO from the Moonrise pool arrays, network from the event-loop
+  names, chat and background from their executor counters. `alive 0` is a measured zero - the owner
+  has no live thread right now - not a missing probe.
 - **L2 for `region-execution`** is backed by the bridge: patch `0016` calls `RegionThreads.wrapBody`
   in the one region thread factory, and the provider registers the thread while the body runs. The
   `/tuff threads` count is `max(registry, probe)`, so it looks identical with `managed: false`; the

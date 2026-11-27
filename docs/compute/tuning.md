@@ -12,16 +12,23 @@ for the live numbers. Change one value at a time and keep a baseline.
 ### Platform workers
 
 The platform lane is the CPU pool. `workers.threads: -1` sizes it from the processor budget the server
-computes after its own threads exist (`ComputeThreadBudget`). A fixed `threads` value is clamped by
-`max-threads`, which is the budget unless you set `max-threads` explicitly.
+computes after its own threads exist (`ComputeThreadBudget`). A fixed `threads` value is sized once, at
+startup, against the provisional startup budget (the same 80% rule minus the fixed network reserve) and
+is then left alone; the live region, chunk and IO deduction is only applied to automatic sizing.
 
 - Leave `threads: -1` unless you have measured a problem. The budget already subtracts region, chunk, IO
   threads and a network reserve.
-- `max-threads` is the hard ceiling for growth and for adaptive concurrency. An explicit value is taken as
-  written, so you can deliberately oversubscribe the budget; leaving it at `-1` makes the budget the
-  ceiling. Set it below the budget when tick time must be protected from compute bursts.
+- `max-threads` is the hard ceiling for growth and for adaptive concurrency. With `threads: -1` the count
+  starts at `budget - 1`, so a ceiling above the budget never binds; leaving it at `-1` makes the budget
+  the ceiling. Set it below the budget when tick time must be protected from compute bursts.
 - `min-threads` is the idle floor. The default of `2` is why an idle server shows two workers; that is
-  normal, not a leak.
+  normal, not a leak. It is absolute: a budget smaller than the floor still runs the floor, so lower it
+  to `1` on a machine whose budget is one core.
+- A fixed `threads` is the oversubscription knob, not a cap. The server logs
+  `fixed worker count N, the server processor budget is not applied`, because a pinned count skips
+  `applyRegionBudget`; the live region/chunk/IO deduction never reaches it. With `max-threads: -1` the
+  startup budget is its ceiling; an explicit `max-threads` at least as large as `threads` lets the
+  pinned count through. Use one only when you have measured the machine.
 - More workers than the budget do not add throughput; they add context switches for the tick threads.
 - `scheduling.idle-wait-millis` is not a latency cap: a submission signals an idle worker. Leave it at the
   default unless you are measuring idle recheck behaviour; lowering it only adds wake-ups.
@@ -53,15 +60,18 @@ See [Benchmarks § Execution lanes](benchmarks.md#execution-lanes).
 
 ## Presets
 
-Only the keys that differ from the shipped defaults are shown. Consumer ids such as `my-plugin` are
-placeholders: the engine ships no built-in consumers, so replace them with the ids your plugins actually
-use. An explicit `max-threads` is taken as written and is not clamped to the budget; keep it at or below the
-budget unless you intend to oversubscribe. Any `lanes.*` change needs a restart; only consumer policies can
-be reloaded live.
+Only the keys a preset changes are shown; where a shipped default is repeated it is there for
+readability and can be omitted. Consumer ids such as `my-plugin` are placeholders: the engine ships no
+built-in consumers, so replace them with the ids your plugins actually use. A `max-threads` ceiling above the budget never binds while `threads: -1`; keep it at the budget as a
+guard. Only a fixed `threads` can go above the live budget, and it does so by skipping the live budget
+entirely. Any `lanes.*` change needs a restart; consumer policies are the only keys a reload applies to
+an already registered consumer, together with `queue.overflow-policy` where it feeds them.
 
 ### Small VPS or home server (2–4 cores)
 
-The budget is usually one or two processors. Protect the tick thread and let IO work use the lane.
+The budget is one processor on this size: `floor(cores × 0.8)` minus the region thread and the fixed
+network reserve leaves nothing, and the result floors at one. Protect the tick thread and let IO work
+use the lane.
 
 ```yaml
 async-compute:
@@ -89,14 +99,16 @@ async-compute:
 
 ### Medium SMP (8–12 cores)
 
-Normal server load: a few plugins, some background computation, a little IO.
+Normal server load: a few plugins, some background computation, a little IO. On this size the
+processor budget is usually one to four cores, so the two-worker floor is often the real pool size and
+the ceiling matters only at the upper end.
 
 ```yaml
 async-compute:
   workers:
     threads: -1
     min-threads: 2
-    max-threads: 8
+    max-threads: 4
     keep-alive-seconds: 30
   queue:
     capacity: 4096
@@ -118,7 +130,7 @@ async-compute:
       max-queue-wait-seconds: 60
 ```
 
-### Large dedicated server (16+ cores)
+### Large dedicated server (32+ cores)
 
 CPU headroom exists, but the budget still excludes region, chunk and IO threads. Keep the ceiling explicit
 and let adaptive concurrency find the live limit.
@@ -152,8 +164,9 @@ async-compute:
 ```
 
 `max-concurrency` equal to `max-threads` keeps the controller from growing past the ceiling the
-administrator chose. An explicit `max-threads` is not clamped to the budget; leave it at `-1` or set it at
-or below the budget you expect. `/tuff` shows the live count and the startup settings.
+administrator chose. Neither key raises the automatic worker count above the budget: with `threads: -1`
+the count is `max(min-threads, budget - 1)`, and `max-threads` only lowers it. `/tuff` shows the live
+count and the startup settings, including whether the processor budget was applied.
 
 ### Skyblock or mini-games (many regions, short ticks)
 
@@ -232,7 +245,7 @@ Size `max-concurrent` to the database or HTTP pool, not to CPU. `spill-queue-dep
 trigger, so only age (`spill-wait-millis`) opens spill; with `normal-spill: false` the lane carries `LOW`
 work only. Per-consumer quotas keep one plugin from filling the shared queue.
 
-### Maps, rendering and structure search
+### Maps, rendering and structure search (32+ cores)
 
 These are CPU-bound. Keep them on the platform lane and leave `normal-spill` off for them, so virtual threads
 do not pick the work up.
@@ -340,8 +353,9 @@ to remove `NORMAL` spill entirely. `HIGH` and `CRITICAL` never spill regardless 
 
 ## Verifying a configuration
 
-1. Restart after changing `workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*` or `lanes.*`;
-   only consumer policies reload live. `/tuff compute reload` prints the deferred keys.
+1. Restart after changing `workers.*`, `queue.*`, `scheduling.*`, `metrics.*`, `adaptive.*` or `lanes.*`.
+   Only consumer policies (and `queue.overflow-policy` where it feeds them) reach an already registered
+   consumer on a reload; `/tuff compute reload` prints the deferred keys.
 2. Apply representative load, not an idle server. Run `/tuff` several times and look at the lane line, queue
    depth, rejects, expired tasks, queue wait and throughput.
 3. `/tuff compute consumers` to see which consumer is at its `active / limit` or queue bound.

@@ -99,7 +99,7 @@ with their coverage level and the reason a pool is not managed yet; the configur
 `thread-management` section of `config/tuff.yml`. Start with
 [`docs/utmi/`](docs/utmi/README.md): [architecture](docs/utmi/architecture.md),
 [configuration](docs/utmi/configuration.md), [coverage](docs/utmi/coverage.md),
-[observability](docs/utmi/observability.md).
+[observability](docs/utmi/observability.md), [tuning](docs/utmi/tuning.md).
 
 ## Region threading (the Folia part)
 

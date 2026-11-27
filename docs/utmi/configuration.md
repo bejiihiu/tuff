@@ -68,7 +68,7 @@ thread-management:
 | Key | Type | Default | Reload | What it does |
 | --- | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | restart | Master switch. `false` creates no runtime at all: no pool registered, no probe attached, no metrics sampled, no thread started. `/tuff threads` still answers and says where the switch is |
-| `resources.cpu-aware` | boolean | `true` | restart | Size from the platform's real processor count and container limits instead of a static table. Keep it on; `false` is a diagnostic for a wrong topology reading |
+| `resources.cpu-aware` | boolean | `true` | restart | Model field for topology-aware sizing. The runtime always reads the detected processor topology (`TopologyProbe`), so `false` does not switch that off in this build; keep it `true` and treat the value as descriptive |
 | `resources.reserve-cores` | integer, ≥ 0 | `1` | restart | Processors never handed to managed pools, kept for GC, JIT, the kernel and unexpected work. The budget floors the effective reserve at one core; zero is legal but risky on small machines |
 | `resources.max-concurrent-tasks` | integer, `-1` or ≥ 1 | `-1` | restart | Global cap on concurrently leased tasks across pools. critical pools (`region-execution`, `network`) bypass it by policy; `-1` disables the cap and leaves only per-pool permits |
 | `resources.load-shedding` | boolean | `false` | restart | Let a starving critical pool take capacity back from the non critical ones. While a critical pool has a request parked and every non critical pool is at its capacity, one core is withheld per cooldown (never below the pool's declared minimum) and given back after the critical queue has been calm. Held work is never interrupted; only new leases are refused. Off keeps the budget fixed whatever happens; the critical reserve itself does not depend on this key |
@@ -76,19 +76,23 @@ thread-management:
 | `lifecycle.monitor-threads` | boolean | `true` | restart | Sample thread states, CPU time and creation/termination rates. Combined with `metrics.enabled` with AND: either switch off leaves the layer running with a structural snapshot (registered pools and registry-known thread counts, no measured values) |
 | `region-execution.managed` | boolean | `false` | restart | Registers the region pool at L2 instead of L1 and binds the `RegionThreads` bridge, so every region tick body goes through `ThreadFactoryProvider.wrap`. What changes: the pool spec (`min 1`, elastic budget), per-thread registration for the duration of each body, the printed level, and `SCHEDULER_LIMITATION` under EDF (L2 is the deepest an unresizable scheduler can promise). What stays Folia's: thread creation, class (`TickThreadRunner`), name, group, daemon flag, uncaught handler, tick order and region ownership. Restart only: the bridge is installed before the region scheduler is constructed; see [architecture](architecture.md#region-bridge-and-installation-order) |
 | `region-execution.preserve-folia-scheduling` | boolean | `true` | n/a | Must stay `true`. Folia owns tick order, catch-up and region ownership. `false` is rejected at startup instead of being silently ignored |
-| `region-execution.scheduler` | `edf` \| `work-stealing` \| `kairos` | `edf` | restart | Region scheduler variant the configuration describes. `kairos` additionally requires `kairos-unstable: true` |
-| `region-execution.threads` | integer, `-1` or ≥ 1 | `-1` | restart | Tick thread count used by the pool spec and the budget deduction. It is **not** the number Folia runs: Folia reads `threaded-regions.threads` from `paper-global.yml` (or its own auto formula). `-1` leaves the deduction at zero |
-| `region-execution.grid-exponent` | integer, 0–31 | `4` | restart | Region grid exponent, clamped to `[0, 31]` like the platform key. Modelled and validated; it does not reshape the live regioniser |
+| `region-execution.scheduler` | `edf` \| `work-stealing` \| `kairos` | `edf` | restart | Region scheduler variant the layer reports and models. This key does not select the live scheduler: that is `paper-global.yml: threaded-regions.scheduler` and a restart. `kairos` additionally requires `kairos-unstable: true` |
+| `region-execution.threads` | integer, `-1` or ≥ 1 | `-1` | restart | Tick thread count used by the pool spec, the budget deduction and the floor of an elastic Kairos fund. It is **not** the number Folia runs: Folia reads `threaded-regions.threads` from `paper-global.yml` (or its own auto formula). `-1` leaves the deduction at zero |
+| `region-execution.grid-exponent` | integer, 0–31 | `4` | restart | Region grid exponent, clamped to `[0, 31]` like the platform key. Recorded and validated; no runtime path reads it, and the live regioniser uses `paper-global.yml: threaded-regions.grid-exponent`, fixed at first initialisation |
 | `region-execution.kairos-unstable` | boolean | `false` | restart | Explicit opt-in for the experimental Kairos scheduler. Never enabled implicitly. Selecting `kairos` without it rejects the whole region section |
+| `region-execution.kairos.elastic` | boolean | `false` | restart | Let the fund grow above `threads` and retire idle runners. Off keeps a fixed fund: no supervisor thread, no growth, no retire. Only read while the scheduler is Kairos |
+| `region-execution.kairos.max-threads` | integer, `-1` or ≥ 1 | `-1` | restart | Ceiling of the fund. `-1` uses the thread layer's budget while it runs, otherwise Folia's `floor(cores × 0.8)` rule. An explicit value always wins |
+| `region-execution.kairos.keep-alive-seconds` | integer, ≥ 1 | `30` | restart | How long a runner must sit idle above the floor before it may be retired |
+| `region-execution.kairos.spawn-rate-per-second` | integer, ≥ 1 | `10` | restart | How many new tick threads the supervisor may start per second |
 | `async-compute.managed` | boolean | `false` | restart | Older spelling of `execution-pools.compute.managed`; either key turns compute management on. With it on, the compute adapter registers the platform pool at L4 and the virtual lane at L2, and the engine takes its threads and processor budget from the thread layer. Off keeps the engine's own factory and `ComputeThreadBudget`; the pool is observed through its probe either way |
-| `async-compute.max-threads` | integer, `-1` or ≥ 1 | `-1` | restart | Ceiling for the registered compute pool only. `-1` keeps the engine's own `max-threads`. The engine's queue and priorities are untouched either way |
+| `async-compute.max-threads` | integer, `-1` or ≥ 1 | `-1` | restart | Ceiling recorded on the observe-only compute spec. The compute adapter re-registers the managed pool with `async-compute.workers.max-threads`, so this key does not bound a managed pool; size that one with `async-compute.workers.max-threads` |
 | `async-compute.tick-pressure.enabled` | boolean | `false` | restart | Let the compute pool yield cores while regions lag. The decision is made from the region summary the sampler already publishes; on a change the compute adapter re-applies the processor budget through `applyProcessorBudget`, the same entry point the startup budget uses. Only a managed pool (`execution-pools.compute.managed` or `async-compute.managed`) can apply it; otherwise decisions are logged and shown by `/tuff threads` but nothing is resized. Off by default |
 | `async-compute.tick-pressure.enter-lag-fraction` | number, `(0, 1]` | `0.25` | restart | Share of regions below 18 TPS that starts pressure; `0.25` is one lagging region out of four. Ignored while the slowest region already trips `enter-min-tps` |
 | `async-compute.tick-pressure.enter-min-tps` | number, `(0, 20]` | `19.0` | restart | Slowest region TPS below which one core is yielded even when the lag share is zero |
 | `async-compute.tick-pressure.exit-min-tps` | number, `(0, 20]` | `19.5` | restart | Slowest region TPS at or above which a sample counts as calm. Must not be below `enter-min-tps`; the gap is the hysteresis band where nothing moves |
 | `async-compute.tick-pressure.exit-windows` | integer, ≥ 1 | `3` | restart | Consecutive calm one-second samples before a core is returned. One more step follows each cooldown, so the ramp down is as gradual as the ramp up |
 | `async-compute.tick-pressure.cooldown-seconds` | integer, ≥ 1 | `5` | restart | Minimum time between two reserve changes. A sawtooth signal cannot resize the pool every second |
-| `async-compute.tick-pressure.max-reserve-cores` | integer, ≥ 1 | `2` | restart | Most cores the pool may give up. The adapter lowers this further so the pool's `min-threads` still fits in the budget; a pool that cannot yield reports the ceiling as its reason |
+| `async-compute.tick-pressure.max-reserve-cores` | integer, ≥ 1 | `2` | restart | Most cores the pool may give up. The effective value is lowered further so the pool budget still covers `min-threads` plus the relief reserve when `async-compute.relief.enabled: true`; a pool that cannot yield reports the ceiling as its reason |
 | `async-compute.tick-pressure.step-cores` | integer, `[1, max-reserve-cores]` | `1` | restart | Cores moved per decision. One means a ramp rather than a jump |
 | `execution-pools.compute.managed` | boolean | `false` | restart | The preferred spelling of the compute switch. Same effect as `async-compute.managed`, and the one `ThreadManagementSettings.computeManaged()` reads first |
 | `execution-pools.network.managed` | boolean | `false` | restart | Raises the network pool's registered coverage. Netty keeps its event loops, sizing and affinity |
@@ -100,6 +104,12 @@ thread-management:
 | `metrics.per-pool` | boolean | `true` | restart | Publish per-pool entries, saturation and their JFR events |
 | `metrics.per-thread` | boolean | `true` | restart | Publish the per-thread list. Disabling keeps pool totals but removes individual threads from the snapshot |
 
+The `region-execution.kairos` block in the shipped template also carries the tick-level knobs -
+`catch-up.cap-ticks`, `catch-up.budget-millis`, `steal.threshold-millis`, `affinity.local-queue-size`
+and `lease.timeout-seconds`. They are read through the scheduler's opt-in gate instead of the settings
+record; each default and range is documented on [Kairos](../scheduler/kairos.md#configuration). The
+fund's floor is `region-execution.threads`, but the platform key is still what Folia starts.
+
 ## What changing a key does not do
 
 This list matters more than the table above, because several of these keys are forward-looking model
@@ -107,10 +117,12 @@ fields rather than levers that move threads today.
 
 | You change | What actually happens |
 | --- | --- |
+| `resources.cpu-aware: false` | Nothing. The runtime always sizes against the detected processor topology; the flag is recorded and printed but no sizing path consults it in this build |
 | `region-execution.threads` | The registered pool spec and the budget deduction change. Folia's tick thread count does not: it comes from `paper-global.yml: threaded-regions.threads`, and under EDF it cannot change without a restart anyway |
-| `region-execution.scheduler` | The configured and reported scheduler variant changes. It does not switch Folia's live scheduler; that happens only through the platform key and a restart, and `kairos` has no implementation yet |
-| `region-execution.grid-exponent` | The model value changes. The regioniser's shift is fixed at the first initialisation |
+| `region-execution.scheduler` | The configured and reported scheduler variant changes. It does not switch Folia's live scheduler; that happens only through `paper-global.yml: threaded-regions.scheduler` and a restart. `kairos` also needs `kairos-unstable: true`, and the key alone does not start the scheduler |
+| `region-execution.grid-exponent` | The recorded value changes. The regioniser's shift comes from `paper-global.yml: threaded-regions.grid-exponent` and is fixed at the first initialisation |
 | `execution-pools.chunk-system.managed` or `network.managed` | The pool is registered with coverage L2 instead of L1, and `/tuff threads` prints the deeper level. No thread is created or wrapped, because no owner hands its factory or its bodies over yet. The manager does not flag this as a conflict for these kinds — treat the printed level as a registration claim, not proof of accounting. `region-execution.managed` is different: that pool's bodies are really wrapped |
+| `async-compute.max-threads` | The observe-only compute spec records the value, but nothing is sized from it: the engine reads `async-compute.workers.max-threads`, and the adapter registers a managed pool with that same worker key |
 | `execution-pools.compute.managed` (or `async-compute.managed`) | The compute adapter registers `compute` at L4 and `compute-virtual` at L2, and the engine creates its platform workers through the provider and reads its budget from the resource controller. The engine's queue, priorities and fairness are unchanged |
 | `async-compute.tick-pressure.enabled: true` without a managed compute pool | Nothing is resized. The controller still evaluates every one-second pass, logs each change with its reason and publishes the reserve for `/tuff threads`; the sink is simply not bound. This is the documented behaviour on an observe-only server, not a silent failure |
 | `metrics.per-pool: false` | Pool entries disappear from the snapshot and `/tuff threads`. Degradation reasons are still collected at the top level; measurement continues |
@@ -122,9 +134,9 @@ These are properties of the platform, not tunables of this layer. They explain w
 restart-only or do less than their name suggests.
 
 - **Region threads cannot be resized while the scheduler is EDF** (the default). The EDF scheduler
-  fixes its thread arrays at construction and its `setThreads` is a silent no-op. Only `work-stealing`
-  supports a live resize, and that path recreates thread identities. A tick thread count change is a
-  restart.
+  fixes its thread arrays at construction and its `setThreads` is a silent no-op. `work-stealing`
+  supports a live resize and recreates thread identities when it happens; the experimental Kairos fund
+  moves its floor live while `elastic: true`. Under EDF a tick thread count change is a restart.
 - **Thread priorities are close to a no-op on Linux** unless the JVM is started with
   `-XX:ThreadPriorityPolicy=1`, and even then they are a hint to the OS scheduler. `ThreadSpec.priority`
   is recorded and printed; it is not a scheduling guarantee.
@@ -205,7 +217,8 @@ Every decision that moves the reserve is one log line with its reason and one `t
 event; a pass that could not read the regions keeps the current reserve instead of guessing. The budget
 is applied through the compute adapter and `applyProcessorBudget`, the same single writer the startup
 budget uses, so there is no second sizing path. That number is `pool budget - reserve`, floored at
-`min-threads`; `/tuff threads` prints it as `budget N applied of M pool core(s)` and the ledger's
+`min-threads` (or at `min-threads` plus the relief reserve when `async-compute.relief.enabled: true`);
+`/tuff threads` prints it as `budget N applied of M pool core(s)` and the ledger's
 `usable` next to it, because the pool may be capped by `max-threads` or by load shedding. With the pool
 unmanaged the decisions are still logged and printed, but nothing changes.
 
@@ -284,7 +297,7 @@ thread-management:
 | `gridExponent must be in [0, 31]` | Out of range | The platform clamps the same range |
 | `preserveFoliaScheduling must stay true` | Someone tried to disable Folia's ownership | Set it back; this is an architectural invariant, not a setting |
 | `preserveSpecialization must stay true` | Attempt to make a specialised pool mergeable | Set it back |
-| `Kairos is experimental; set kairosUnstable to true` | `scheduler: kairos` alone | Add the opt-in, and expect EDF behaviour: the scheduler is not implemented |
+| `Kairos is experimental; set kairosUnstable to true to opt in explicitly` | `scheduler: kairos` alone | Add `kairos-unstable: true`. The live scheduler is still selected by `paper-global.yml: threaded-regions.scheduler: kairos`, and it refuses to start without the opt-in |
 | `expected true or false, got '…'` | String instead of a boolean | Use literal `true` / `false` |
 | `enterLagFraction must be in (0, 1]` | A share outside the range, e.g. `1.5` or `0` | Use a fraction such as `0.25` |
 | `exitMinTps must not be below enterMinTps` | Inverted hysteresis band | Keep `exit-min-tps` at or above `enter-min-tps` |

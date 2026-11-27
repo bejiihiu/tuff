@@ -115,7 +115,7 @@ How to read it:
   scheduler and the configured region thread count (`unknown` when the config says "auto"). Every key of
   the section needs a restart.
 - **`pressure:`** is the compute pool's tick pressure decision. `disabled` names the switch. With the
-  feature on it prints the state (`normal` or `pressure`), the reserve against its ceiling, the budget
+  feature on it prints the state (`normal` or `yielding`), the reserve against its ceiling, the budget
   against the ledger's usable cores, and the signal the decision was made from: lag share, slowest
   region TPS, worst tick and the reason (`LAG_ENTER`, `LAG_STEP_UP`, `CALM_STEP_DOWN`, `CALM_EXIT`,
   `CEILING_REACHED`). `waiting for a region reading` means the feature is on but no pass has seen a
@@ -123,10 +123,10 @@ How to read it:
   when the compute pool is managed; an observed pool shows the same numbers, with nothing resized.
 - **`scheduler:`** is the region scheduler and, under Kairos, its fund in one line: fixed or elastic,
   `live/max` with the floor and target, queued ticks, overdue ticks, the supervisor state and the fund
-  status. Under EDF or `WORK_STEALING` it says `no fund telemetry (Kairos only)` together with the
-  configured thread count: those schedulers have no fund, supervisor or readable wait queue, and a
-  made-up number would be worse than the sentence. `/tuff scheduler` prints the same facts with the
-  tick wait ages, the last fund decision and the degraded reasons.
+  status. Under EDF or `WORK_STEALING` it says `no fund telemetry (Kairos only)`: those schedulers have
+  no fund, supervisor or readable wait queue, and a made-up number would be worse than the sentence.
+  `/tuff scheduler` prints the same facts with the tick wait ages, the last fund decision and the
+  degraded reasons, and adds the configured thread count for the schedulers that have no fund.
 
 ## What a snapshot contains
 
@@ -341,12 +341,12 @@ writing an integration that reads this data, obey the same rule.
 
 | Symptom | Likely cause | Where to look |
 | --- | --- | --- |
-| Most pools show `alive 0` | Only the region and compute pools have probes; the rest are registered but unmeasured | Expected; see [architecture](architecture.md#current-matrix) |
+| Most pools show `alive 0` | The pool has no live thread the probe can see: netty event loops appear on the first connection, the chat executor on first use. A zero on region, chunk or compute means the owner has not started or has halted | Expected for the lazy pools; see [architecture](architecture.md#current-matrix) |
 | `region-execution alive 0` on a running server | The region scheduler does not exist yet (very early startup) or already halted (shutdown) | Lifecycle, not a leak |
 | `warming up (no sample yet)` for longer than a second | The refresher thread did not start; the log has the reason under the `Tuff/Threads` logger | Look for `Tuff Threads Sampler` in a thread dump |
 | `unknown threads` in the hundreds | Normal for observe-only: Folia, netty and plugin threads are not registered | The number drops as pools reach L2 |
-| `degraded:` lists reasons while the layer says running | `OBSERVE_ONLY` and `FEATURE_DISABLED` are coverage statements | Only `BUDGET_EXHAUSTED`, `CONFIG_CONFLICT`, `SCHEDULER_LIMITATION` and creation failures mean degraded |
-| `queued` unknown on every pool | No probe is attached | Expected; queue depth needs an owner getter |
+| `degraded:` lists reasons while the layer says running | `OBSERVE_ONLY`, `FEATURE_DISABLED`, `METRICS_UNAVAILABLE` and `NUMA_UNAVAILABLE` are coverage or measurement statements | `BUDGET_EXHAUSTED`, `TOPOLOGY_UNKNOWN`, `SCHEDULER_LIMITATION`, `THREAD_CREATION_FAILED`, `POOL_UNRESPONSIVE`, `CONFIG_CONFLICT` and `CRITICAL_POOL_PRESSURE` are the reasons that move the state to `DEGRADED` |
+| `queued` unknown on a pool | That owner has no queue-depth getter | Expected for region, chunk worker, chunk IO and netty; chat and background do report a depth |
 | No region lines under `region-execution` | No region is loaded (empty server, no chunks, no players), the read failed this pass, or the scheduler is gone | Force one with `forceload add 0 0`; nothing is printed rather than a fake zero |
 | `region-execution` prints `L2` but `unknown threads` is unchanged | Expected: `alive` is `max(registry, probe)` and the count of unaccounted threads is dominated by Folia, netty and plugins | Prove the wrap with the bridge unit test, not with the console |
 | Region TPS disagrees with `/tps` | `/tuff threads` shows the slowest region and a mean over regions; `/tps` shows per-region windows, including 1 m and beyond | Different aggregates, both honest |
