@@ -3,18 +3,25 @@ package kz.bejiihiu.tuff.threads.bootstrap;
 import java.time.Duration;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.compute.bootstrap.ComputeUtmiAdapter;
 import kz.bejiihiu.tuff.compute.config.ConfigProblem;
 import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
+import kz.bejiihiu.tuff.threads.ThreadSpec;
 import kz.bejiihiu.tuff.threads.UnifiedThreadManager;
 import kz.bejiihiu.tuff.threads.bridge.RegionThreads;
 import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
 import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
+import kz.bejiihiu.tuff.threads.kairos.KairosBudgetPort;
 import kz.bejiihiu.tuff.threads.kairos.KairosGate;
+import kz.bejiihiu.tuff.threads.kairos.KairosScheduler;
+import kz.bejiihiu.tuff.threads.kairos.KairosServices;
+import kz.bejiihiu.tuff.threads.kairos.KairosSnapshot;
+import kz.bejiihiu.tuff.threads.kairos.KairosSupervisorSource;
 import kz.bejiihiu.tuff.threads.kairos.KairosTuning;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureMonitor;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
@@ -76,6 +83,7 @@ public final class ThreadsBootstrap {
     private volatile @Nullable ThreadsSampler sampler;
     private volatile @Nullable TickPressureMonitor pressure;
     private volatile @Nullable ComputeUtmiAdapter computeAdapter;
+    private volatile KairosServices kairosServices = KairosServices.none();
     private boolean started;
 
     /**
@@ -188,6 +196,10 @@ public final class ThreadsBootstrap {
                 this.sampler = createdSampler;
                 this.pressure = createdPressure;
                 this.status = ThreadsStatus.running(settings);
+                // the scheduler starts later than this hook, so the seams are published now: the fund
+                // reads its ceiling from the controller and its supervisor thread from the service pool
+                this.kairosServices = kairosServices(created);
+                KairosGate.services(this.kairosServices);
                 logStarted(created.manager());
             } catch (final Throwable ex) {
                 this.runtime = null;
@@ -228,6 +240,7 @@ public final class ThreadsBootstrap {
             // before the runtime stops: no new region body may be wrapped while the manager is going down
             RegionThreads.clear();
             KairosGate.disarm();
+            this.kairosServices = KairosServices.none();
             // flag + interrupt, no join: this runs in the window where the watchdog is still armed and
             // a blocking wait would look like a hung server. The thread is a daemon and exits on its own
             if (currentSampler != null) {
@@ -294,13 +307,41 @@ public final class ThreadsBootstrap {
             return base;
         }
         final TickPressureSnapshot pressure = this.pressure == null ? null : this.pressure.snapshot();
+        final KairosSnapshot kairos = KairosScheduler.activeSnapshot();
         final ThreadsSampler current = this.sampler;
         final ThreadsSampler.@Nullable Sample sample = current == null ? null : current.sample();
         if (sample == null) {
-            return base.withPressure(pressure);
+            return base.withPressure(pressure).withKairos(kairos);
         }
         return base.withSnapshot(sample.snapshot(), sample.unknownThreads(), sample.ageMillis())
-            .withPressure(pressure);
+            .withPressure(pressure)
+            .withKairos(kairos);
+    }
+
+    /**
+     * Builds the Kairos runtime seams from a running thread layer.
+     *
+     * <p>The budget answer is the controller's own ledger: usable cores plus the region threads the
+     * ledger already deducted for this lane. Adding them back is what keeps the floor from being
+     * subtracted twice; the reserve is already inside {@code usable} and is never removed here again.
+     * The supervisor is created through the provider, under the {@code service} pool the sampler
+     * registered at L2, so it is accounted like any other Tuff thread.
+     *
+     * @param runtime running thread manager
+     * @return the seams, never {@code null}
+     */
+    static KairosServices kairosServices(final ThreadManagerRuntime runtime) {
+        final UnifiedThreadManager manager = runtime.manager();
+        return new KairosServices(new UtmiBudgetPort(manager), new UtmiSupervisorSource(manager));
+    }
+
+    /**
+     * Returns the Kairos seams of the running layer.
+     *
+     * @return the seams, or {@link KairosServices#none()} when no layer runs
+     */
+    KairosServices kairosServices() {
+        return this.kairosServices;
     }
 
     /**
@@ -397,6 +438,69 @@ public final class ThreadsBootstrap {
             policy.enterMinTps(), Math.round(policy.enterLagFraction() * 100.0d), policy.maxReserveCores(),
             policy.stepCores(), policy.exitWindows(), policy.exitMinTps(), policy.cooldownSeconds());
         return new TickPressureMonitor(policy, () -> runtime.manager().resources().usableCores());
+    }
+
+    /**
+     * Budget port backed by the thread layer's controller.
+     *
+     * <p>The controller's {@code usableCores()} is already net of the deducted lanes and the reserve.
+     * The region threads it deducted are added back because they are this very lane: without that, the
+     * floor would be charged twice and the fund would lose headroom it actually owns.
+     *
+     * @param manager running thread manager
+     */
+    private record UtmiBudgetPort(UnifiedThreadManager manager) implements KairosBudgetPort {
+
+        @Override
+        public int ceiling(final int floor) {
+            final int usable = Math.max(1, this.manager.resources().usableCores());
+            final int regionThreads = Math.max(0, this.manager.settings().regionExecution().threads());
+            return Math.max(floor, usable + regionThreads);
+        }
+
+        @Override
+        public String describe() {
+            return "utmi budget (usable cores plus the deducted region threads)";
+        }
+    }
+
+    /**
+     * Supervisor source that creates the thread through the thread layer's provider.
+     *
+     * <p>The sampler already registered {@code service} at L2, so the provider accepts the thread and
+     * the registry accounts it. A refusal is logged once and the scheduler falls back to a plain daemon:
+     * losing the supervisor would freeze the fund, which is worse than an unaccounted control thread.
+     */
+    private static final class UtmiSupervisorSource implements KairosSupervisorSource {
+
+        private final UnifiedThreadManager manager;
+        private final AtomicBoolean warned = new AtomicBoolean();
+
+        private UtmiSupervisorSource(final UnifiedThreadManager manager) {
+            this.manager = manager;
+        }
+
+        @Override
+        public @Nullable Thread create(
+            final String name,
+            final Runnable body,
+            final Thread.UncaughtExceptionHandler handler
+        ) {
+            try {
+                return this.manager.threadFactory().newThread(ThreadSpec.of(PoolId.SERVICE, name, handler), body);
+            } catch (final RuntimeException failure) {
+                if (this.warned.compareAndSet(false, true)) {
+                    LOGGER.warn("Kairos: the thread layer refused the supervisor thread; it stays a plain daemon",
+                        failure);
+                }
+                return null;
+            }
+        }
+
+        @Override
+        public String describe() {
+            return "the service pool refused the thread";
+        }
     }
 
     private static void shutdownQuietly(final ThreadManagerRuntime runtime) {

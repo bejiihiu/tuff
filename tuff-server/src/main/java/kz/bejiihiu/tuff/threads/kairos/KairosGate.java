@@ -21,6 +21,7 @@ public final class KairosGate {
 
     private static volatile boolean armed;
     private static volatile KairosTuning tuning = KairosTuning.fixed();
+    private static volatile KairosServices services = KairosServices.none();
 
     private KairosGate() {
     }
@@ -44,8 +45,51 @@ public final class KairosGate {
      * @param fundTuning     the fund limits to use once the scheduler starts, never {@code null}
      */
     public static void arm(final boolean kairosUnstable, final KairosTuning fundTuning) {
+        arm(kairosUnstable, fundTuning, KairosServices.none());
+    }
+
+    /**
+     * Records the operator's answer, the fund knobs and the runtime seams from {@code config/tuff.yml}.
+     *
+     * <p>The services arrive after the thread layer is up: the budget port reads its controller and the
+     * supervisor source reads its factory, neither of which exists while the configuration is being
+     * parsed. Passing {@link KairosServices#none()} is the honest "no runtime" answer - the fund then
+     * uses the core count rule and a plain daemon supervisor.
+     *
+     * @param kairosUnstable whether {@code kairos-unstable} is true
+     * @param fundTuning     the fund limits to use once the scheduler starts, never {@code null}
+     * @param runtime        budget and supervisor sources, never {@code null}
+     */
+    public static void arm(
+        final boolean kairosUnstable,
+        final KairosTuning fundTuning,
+        final KairosServices runtime
+    ) {
         tuning = fundTuning;
+        services = runtime;
         armed = kairosUnstable;
+    }
+
+    /**
+     * Records the runtime seams of a thread layer that just started.
+     *
+     * <p>Called separately from {@link #arm(boolean, KairosTuning)} because the layer is built after the
+     * opt-in is read. A layer that failed to start leaves the previous answer in place; {@code arm}
+     * resets it to {@link KairosServices#none()} on the next start.
+     *
+     * @param runtime budget and supervisor sources, never {@code null}
+     */
+    public static void services(final KairosServices runtime) {
+        services = runtime;
+    }
+
+    /**
+     * Returns the runtime seams of the last armed answer.
+     *
+     * @return the services to use, never {@code null}
+     */
+    public static KairosServices services() {
+        return services;
     }
 
     /**
@@ -55,6 +99,7 @@ public final class KairosGate {
     public static void disarm() {
         armed = false;
         tuning = KairosTuning.fixed();
+        services = KairosServices.none();
     }
 
     /**

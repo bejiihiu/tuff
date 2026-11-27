@@ -3,8 +3,13 @@ package kz.bejiihiu.tuff.compute.bootstrap;
 import io.papermc.paper.threadedregions.RegionizedServer;
 import java.util.List;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
+import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import kz.bejiihiu.tuff.threads.bootstrap.ThreadsBootstrap;
 import kz.bejiihiu.tuff.threads.bootstrap.ThreadsReport;
+import kz.bejiihiu.tuff.threads.bootstrap.ThreadsStatus;
+import kz.bejiihiu.tuff.threads.kairos.KairosReport;
+import kz.bejiihiu.tuff.threads.kairos.KairosScheduler;
+import kz.bejiihiu.tuff.threads.kairos.KairosSnapshot;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
@@ -39,6 +44,13 @@ public final class TuffCommand extends Command implements TabCompleter {
     public static final String PERMISSION = "tuff.command.compute";
 
     /**
+     * Permission required to read the scheduler report. Granted to operators by default and kept apart
+     * from the compute permission so a server can hand the diagnostics to a wider group without also
+     * handing over reload and JFR.
+     */
+    public static final String SCHEDULER_PERMISSION = "tuff.command.scheduler";
+
+    /**
      * Creates the command and registers its permission when that has not happened yet.
      *
      * @return a command ready to be registered in the command map
@@ -57,7 +69,7 @@ public final class TuffCommand extends Command implements TabCompleter {
 
     @Override
     public boolean execute(final CommandSender sender, final String commandLabel, final String[] args) {
-        if (!this.testPermissionSilent(sender)) {
+        if (!this.allowed(sender)) {
             sender.sendMessage(Component.text(
                 "You do not have permission to use the Tuff command.", NamedTextColor.RED));
             return true;
@@ -77,6 +89,7 @@ public final class TuffCommand extends Command implements TabCompleter {
             case CONSUMERS -> this.send(sender, ComputeReport.consumers(ComputeBootstrap.status()));
             case TASKS -> this.send(sender, ComputeReport.tasks(ComputeBootstrap.status(), request.limit()));
             case THREADS -> this.send(sender, ThreadsReport.overview(ThreadsBootstrap.status()));
+            case SCHEDULER -> this.sendScheduler(sender);
             case RELOAD -> this.reload(sender);
             case JFR_START -> this.startRecording(sender);
             case JFR_STOP, JFR_DUMP -> this.controlRecording(sender, action == ComputeCommand.Action.JFR_STOP);
@@ -90,7 +103,7 @@ public final class TuffCommand extends Command implements TabCompleter {
         final String alias,
         final String[] args
     ) throws IllegalArgumentException {
-        if (!this.testPermissionSilent(sender)) {
+        if (!this.allowed(sender)) {
             return List.of();
         }
         return ComputeCommand.completions(args);
@@ -111,6 +124,21 @@ public final class TuffCommand extends Command implements TabCompleter {
         final String[] args
     ) {
         return this.tabComplete(sender, label, args);
+    }
+
+    private void sendScheduler(final CommandSender sender) {
+        final ThreadsStatus status = ThreadsBootstrap.status();
+        final KairosSnapshot kairos = KairosScheduler.activeSnapshot();
+        final ThreadManagementSettings settings = status.settings();
+        final String scheduler = kairos != null
+            ? "KAIROS"
+            : settings == null ? null : settings.regionExecution().scheduler().name();
+        final int configured = settings == null ? -1 : settings.regionExecution().threads();
+        this.send(sender, KairosReport.overview(scheduler, configured, kairos));
+    }
+
+    private boolean allowed(final CommandSender sender) {
+        return this.testPermissionSilent(sender) || sender.hasPermission(SCHEDULER_PERMISSION);
     }
 
     private void reload(final CommandSender sender) {
@@ -186,13 +214,22 @@ public final class TuffCommand extends Command implements TabCompleter {
 
     private static void registerPermission() {
         final PluginManager pluginManager = Bukkit.getPluginManager();
-        if (pluginManager == null || pluginManager.getPermission(PERMISSION) != null) {
+        if (pluginManager == null) {
             return;
         }
-        pluginManager.addPermission(new Permission(
-            PERMISSION,
-            "Allows inspecting, reloading and profiling the Tuff compute engine and thread layer.",
-            PermissionDefault.OP
-        ));
+        if (pluginManager.getPermission(PERMISSION) == null) {
+            pluginManager.addPermission(new Permission(
+                PERMISSION,
+                "Allows inspecting, reloading and profiling the Tuff compute engine and thread layer.",
+                PermissionDefault.OP
+            ));
+        }
+        if (pluginManager.getPermission(SCHEDULER_PERMISSION) == null) {
+            pluginManager.addPermission(new Permission(
+                SCHEDULER_PERMISSION,
+                "Allows reading the Tuff region scheduler report.",
+                PermissionDefault.OP
+            ));
+        }
     }
 }

@@ -43,6 +43,7 @@ Tuff thread layer: running, some pools managed
       ticks: 5s max 1.1 ms, 15s avg 0.8 ms max 32.5 ms; entities 0 / players 0 / chunks 25
     service           L2  alive 1  active 0  idle 0  cpu 0%
   pressure: disabled (thread-management.async-compute.tick-pressure.enabled: false)
+  scheduler: edf - no fund telemetry (Kairos only)
   degraded: FEATURE_DISABLED, OBSERVE_ONLY, SCHEDULER_LIMITATION
   unknown threads: 32
   settings: reserve 1 core(s), region scheduler edf, region threads unknown; changes take effect after a restart
@@ -120,6 +121,12 @@ How to read it:
   `CEILING_REACHED`). `waiting for a region reading` means the feature is on but no pass has seen a
   region summary yet, which is normal on a server with no loaded regions. The reserve is only applied
   when the compute pool is managed; an observed pool shows the same numbers, with nothing resized.
+- **`scheduler:`** is the region scheduler and, under Kairos, its fund in one line: fixed or elastic,
+  `live/max` with the floor and target, queued ticks, overdue ticks, the supervisor state and the fund
+  status. Under EDF or `WORK_STEALING` it says `no fund telemetry (Kairos only)` together with the
+  configured thread count: those schedulers have no fund, supervisor or readable wait queue, and a
+  made-up number would be worse than the sentence. `/tuff scheduler` prints the same facts with the
+  tick wait ages, the last fund decision and the degraded reasons.
 
 ## What a snapshot contains
 

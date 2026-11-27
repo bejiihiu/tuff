@@ -22,7 +22,9 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.LongSupplier;
 import java.util.function.ToLongFunction;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -80,8 +82,35 @@ public final class KairosScheduler extends Scheduler {
      */
     private static final long ERROR_LOG_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(60L);
 
+    private static final String SUPERVISOR_NAME = "Tuff Kairos Supervisor";
+
+    /**
+     * How long a tick may sit in the wait queue before R5 starts caring. Two periods at 20 TPS: a tick
+     * that is a whole tick late is starvation, a tick that is a few hundred microseconds late is noise.
+     */
+    private static final long OVERDUE_THRESHOLD_NANOS = TimeUnit.MILLISECONDS.toNanos(100L);
+
+    /**
+     * At most one overdue warning per this window. The detector still counts the suppressed passes so
+     * the next warning can say how many it swallowed; without the quiet window a starving server would
+     * write a line per second and bury the reason.
+     */
+    private static final long OVERDUE_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10L);
+
+    /**
+     * The scheduler that is actually running, so the console can report the fund without a server
+     * reference. Set by {@link #start()} and cleared by {@link #halt()}.
+     */
+    private static final AtomicReference<@Nullable KairosScheduler> ACTIVE = new AtomicReference<>();
+
     private final ToLongFunction<SchedulableTick> scheduledStart;
     private final ThreadFactory threadFactory;
+
+    /**
+     * Monotonic time used by the supervisor, the stale-tick detector and the snapshot. Production
+     * always reads {@link System#nanoTime()}; tests supply a clock they can move.
+     */
+    private final LongSupplier clock;
 
     private final LinkedSortedSet<ScheduledState> awaiting;
     private final PriorityQueue<ScheduledState> queued;
@@ -120,6 +149,21 @@ public final class KairosScheduler extends Scheduler {
     private int peakDemand;
 
     private volatile @Nullable Thread supervisor;
+
+    /** Fund size the last supervisor pass asked for. Read by the snapshot; writer is the supervisor. */
+    private volatile int targetThreads;
+
+    /** Where the resolved ceiling came from, printed by the command and the startup line. */
+    private volatile String budgetSource = "not started";
+
+    /** What the last supervisor pass did, with the numbers behind it. */
+    private volatile FundDecision lastDecision;
+
+    /** Supervisor only: not before this instant may the next overdue warning be written. */
+    private long lastOverdueWarnNanos;
+
+    /** Supervisor only: overdue passes that the quiet window swallowed since the last warning. */
+    private long suppressedOverdueWarns;
 
     private volatile int minThreads;
 
@@ -162,11 +206,34 @@ public final class KairosScheduler extends Scheduler {
         final ThreadFactory threadFactory,
         final ToLongFunction<SchedulableTick> scheduledStart
     ) {
+        this(threads, threadFactory, scheduledStart, System::nanoTime);
+    }
+
+    /**
+     * Creates the fund with a clock the tests can move.
+     *
+     * <p>The clock drives the supervisor, the stale-tick detector and the snapshot only. Parking a
+     * runner still uses real time, because a deadline comes from Folia's handle and must not be
+     * reinterpreted through a fake clock.
+     *
+     * @param threads        initial floor of the fund
+     * @param threadFactory  factory owned by the caller
+     * @param scheduledStart reader for a tick's current deadline, in nanoseconds
+     * @param clock          monotonic time source, never {@code null}
+     * @throws IllegalArgumentException if {@code threads} is not positive
+     */
+    KairosScheduler(
+        final int threads,
+        final ThreadFactory threadFactory,
+        final ToLongFunction<SchedulableTick> scheduledStart,
+        final LongSupplier clock
+    ) {
         if (threads <= 0) {
             throw new IllegalArgumentException("threads must be positive, got " + threads);
         }
         this.threadFactory = Objects.requireNonNull(threadFactory, "threadFactory");
         this.scheduledStart = Objects.requireNonNull(scheduledStart, "scheduledStart");
+        this.clock = Objects.requireNonNull(clock, "clock");
 
         final Comparator<ScheduledState> byDeadline = (final ScheduledState s1, final ScheduledState s2) -> {
             final SchedulableTick t1 = s1.tick;
@@ -197,6 +264,8 @@ public final class KairosScheduler extends Scheduler {
 
         this.minThreads = threads;
         this.maxThreads = threads;
+        this.targetThreads = threads;
+        this.lastDecision = new FundDecision(KairosSnapshot.Decision.IDLE, threads, threads, threads);
     }
 
     /**
@@ -211,6 +280,7 @@ public final class KairosScheduler extends Scheduler {
     public void start() {
         KairosGate.requireOptIn();
         final KairosTuning fundTuning = KairosGate.tuning();
+        final KairosServices services = KairosGate.services();
         synchronized (this.lifecycleLock) {
             if (this.halted) {
                 throw new IllegalStateException("Kairos was halted before it started");
@@ -221,9 +291,18 @@ public final class KairosScheduler extends Scheduler {
             this.tuning = fundTuning;
             this.elastic = fundTuning.elastic();
             final int floor = this.minThreads;
-            this.maxThreads = this.elastic ? resolveMax(floor, fundTuning.maxThreads()) : floor;
+            // one source for the ceiling: the thread layer's controller when it runs, the documented
+            // core fraction otherwise. the port already accounts for the reserve, so nothing here
+            // subtracts it again
+            this.maxThreads = this.elastic
+                ? this.resolveMax(floor, fundTuning.maxThreads(), services.budget())
+                : floor;
+            if (!this.elastic) {
+                this.budgetSource = "fixed fund (elasticity is off)";
+            }
+            this.targetThreads = floor;
             this.started = true;
-            this.floorChangedNanos = System.nanoTime();
+            this.floorChangedNanos = this.clock.getAsLong();
 
             for (final Runner runner : this.slots) {
                 runner.thread.start();
@@ -231,14 +310,23 @@ public final class KairosScheduler extends Scheduler {
             }
 
             if (this.elastic && this.maxThreads > floor) {
-                final Thread created = new Thread(this::supervisorLoop, "Tuff Kairos Supervisor");
-                created.setDaemon(true);
-                created.setUncaughtExceptionHandler((final Thread thread, final Throwable failure) ->
-                    LOGGER.error("The Kairos supervisor died; the fund keeps its current size", failure)
-                );
+                final Thread.UncaughtExceptionHandler failureHandler =
+                    (final Thread thread, final Throwable failure) ->
+                        LOGGER.error("The Kairos supervisor died; the fund keeps its current size", failure);
+                Thread created = services.supervisors().create(SUPERVISOR_NAME, this::supervisorLoop, failureHandler);
+                if (created == null) {
+                    LOGGER.info(
+                        "Kairos: the supervisor is a plain daemon because {}; thread dumps show it by name",
+                        services.supervisors().describe()
+                    );
+                    created = new Thread(this::supervisorLoop, SUPERVISOR_NAME);
+                    created.setDaemon(true);
+                    created.setUncaughtExceptionHandler(failureHandler);
+                }
                 this.supervisor = created;
                 created.start();
             }
+            ACTIVE.set(this);
             this.logStart(floor);
         }
     }
@@ -277,7 +365,7 @@ public final class KairosScheduler extends Scheduler {
             raise = threads > this.minThreads;
             final int previousMax = this.maxThreads;
             this.minThreads = threads;
-            this.floorChangedNanos = System.nanoTime();
+            this.floorChangedNanos = this.clock.getAsLong();
             if (this.maxThreads < threads) {
                 this.maxThreads = threads;
                 LOGGER.warn(
@@ -350,6 +438,143 @@ public final class KairosScheduler extends Scheduler {
     }
 
     /**
+     * Takes a snapshot of the active scheduler.
+     *
+     * <p>The command path calls this; it is safe on any thread and cheap enough for a tick thread: it
+     * reads counters and walks the two tick queues under the schedule lock, never a region.
+     *
+     * @return the snapshot, or {@code null} when Kairos never started or was halted
+     */
+    public static @Nullable KairosSnapshot activeSnapshot() {
+        final KairosScheduler current = ACTIVE.get();
+        return current == null ? null : current.snapshot();
+    }
+
+    /**
+     * Takes one consistent snapshot of this fund.
+     *
+     * <p>The queue walk happens under {@link #scheduleLock}; the queues hold at most one entry per
+     * region, so the pass is small even on a loaded server. The method never reads a tick body and
+     * never waits for a runner.
+     *
+     * @return the snapshot, never {@code null}
+     */
+    public KairosSnapshot snapshot() {
+        final long now = this.clock.getAsLong();
+        int awaiting = 0;
+        int executing = 0;
+        int queued = 0;
+        int overdue = 0;
+        long oldestOverdue = 0L;
+        long totalAge = 0L;
+        long longestAge = 0L;
+        int aged = 0;
+        synchronized (this.scheduleLock) {
+            for (final Runner runner : this.slots) {
+                if (runner == null || !runner.thread.isAlive()) {
+                    continue;
+                }
+                final int state = runner.state.state;
+                if (state == Runner.STATE_AWAITING_TICK) {
+                    ++awaiting;
+                } else if (state == Runner.STATE_EXECUTING_TICK) {
+                    ++executing;
+                }
+            }
+            for (final ScheduledState state : this.queued) {
+                final long age = this.waitAge(now, state);
+                ++queued;
+                if (age > 0L) {
+                    totalAge += age;
+                    longestAge = Math.max(longestAge, age);
+                    ++aged;
+                }
+                if (age >= OVERDUE_THRESHOLD_NANOS) {
+                    ++overdue;
+                    oldestOverdue = Math.max(oldestOverdue, age);
+                }
+            }
+            for (final ScheduledState state : this.awaiting) {
+                final long age = this.waitAge(now, state);
+                if (age > 0L) {
+                    totalAge += age;
+                    longestAge = Math.max(longestAge, age);
+                    ++aged;
+                }
+            }
+        }
+        final double averageMillis = aged == 0 ? 0.0d : totalAge / (double) aged / 1_000_000.0d;
+        return new KairosSnapshot(
+            this.elastic,
+            this.minThreads,
+            this.maxThreads,
+            this.live.get(),
+            this.targetThreads,
+            queued,
+            awaiting,
+            executing,
+            overdue,
+            TimeUnit.NANOSECONDS.toMillis(oldestOverdue),
+            averageMillis,
+            longestAge / 1_000_000.0d,
+            TimeUnit.NANOSECONDS.toMillis(OVERDUE_THRESHOLD_NANOS),
+            this.supervisorState(),
+            this.lastDecision.kind(),
+            this.lastDecision.describe(),
+            this.spawnCount.get(),
+            this.retireCount.get(),
+            this.budgetSource,
+            this.degradedReasons(overdue)
+        );
+    }
+
+    private KairosSnapshot.SupervisorState supervisorState() {
+        if (!this.elastic) {
+            return KairosSnapshot.SupervisorState.OFF;
+        }
+        if (!this.started) {
+            return KairosSnapshot.SupervisorState.NOT_STARTED;
+        }
+        if (this.halted) {
+            return KairosSnapshot.SupervisorState.STOPPED;
+        }
+        final Thread created = this.supervisor;
+        if (created == null) {
+            // no ceiling above the floor is the only legal reason to run without one
+            return this.maxThreads <= this.minThreads
+                ? KairosSnapshot.SupervisorState.OFF
+                : KairosSnapshot.SupervisorState.NOT_STARTED;
+        }
+        return created.isAlive() ? KairosSnapshot.SupervisorState.RUNNING : KairosSnapshot.SupervisorState.DEAD;
+    }
+
+    private List<KairosSnapshot.Degraded> degradedReasons(final int overdue) {
+        final List<KairosSnapshot.Degraded> reasons = new ArrayList<>(3);
+        if (this.elastic && this.maxThreads <= this.minThreads) {
+            reasons.add(KairosSnapshot.Degraded.NO_HEADROOM);
+        }
+        if (this.elastic && this.started && !this.halted) {
+            final Thread created = this.supervisor;
+            if (created != null && !created.isAlive()) {
+                reasons.add(KairosSnapshot.Degraded.SUPERVISOR_DEAD);
+            }
+        }
+        if (overdue > 0) {
+            reasons.add(KairosSnapshot.Degraded.QUEUED_OVERDUE);
+        }
+        return List.copyOf(reasons);
+    }
+
+    private long waitAge(final long now, final ScheduledState state) {
+        final long start = this.scheduledStart.applyAsLong(state.tick);
+        if (start == TimeUtil.DEADLINE_NOT_SET || start <= 0L) {
+            return 0L;
+        }
+        final long age = now - start;
+        return Math.max(0L, age);
+    }
+
+    /**
      * Returns the live threads of the fund, including any that are still finishing a tick.
      *
      * @return a fresh array, never {@code null}
@@ -391,6 +616,7 @@ public final class KairosScheduler extends Scheduler {
     @Override
     public void halt() {
         this.halted = true;
+        ACTIVE.compareAndSet(this, null);
         for (final Thread thread : this.everCreated) {
             // force a response even when the runner is parked
             LockSupport.unpark(thread);
@@ -774,9 +1000,12 @@ public final class KairosScheduler extends Scheduler {
 
     /**
      * One fund decision: grow while ticks want permits, retire idle surplus, never both in one pass.
+     *
+     * <p>After the decision the stale-tick detector runs with the size the pass actually reached, so a
+     * warning says "saturated" only when growth was truly unavailable in this pass.
      */
     private void superviseOnce() {
-        final long now = System.nanoTime();
+        final long now = this.clock.getAsLong();
         final int target;
         synchronized (this.scheduleLock) {
             int busy = 0;
@@ -796,29 +1025,178 @@ public final class KairosScheduler extends Scheduler {
             final int demand = Math.max(busy + this.queued.size(), peak);
             target = Math.max(this.minThreads, Math.min(this.maxThreads, demand));
         }
+        this.targetThreads = target;
 
         final int before = this.live.get();
+        boolean grew = false;
         if (before < target && this.refillSpawnTokens(now) && this.spawn()) {
             this.spawnTokens -= 1.0d;
+            grew = true;
             // the runner is counted in live immediately, so the intended size is exact
             final int after = before + 1;
+            this.recordDecision(KairosSnapshot.Decision.GROW, before, after, target);
             if (after >= this.maxThreads) {
                 LOGGER.info("Kairos: fund reached its ceiling of {} tick thread(s) under load", after);
             } else {
                 LOGGER.debug("Kairos: fund {} -> {} tick thread(s), target {}", before, after, target);
             }
-            // one fund decision per pass: a spawn never races a retire in the same second
+        }
+        if (!grew) {
+            final int liveNow = this.live.get();
+            if (liveNow > this.minThreads && this.retireOne(target, now)) {
+                // the parked runner may need a moment to leave its loop, so the intended size is logged
+                final int after = liveNow - 1;
+                this.recordDecision(KairosSnapshot.Decision.SHRINK, liveNow, after, target);
+                if (after <= this.minThreads) {
+                    LOGGER.info("Kairos: fund is back to its floor of {} tick thread(s)", after);
+                } else {
+                    LOGGER.debug("Kairos: fund {} -> {} tick thread(s), target {}", liveNow, after, target);
+                }
+            } else {
+                this.recordDecision(KairosSnapshot.Decision.IDLE, liveNow, liveNow, target);
+            }
+        }
+        this.warnQueuedOverdue(now);
+    }
+
+    /**
+     * Keeps the last decision for the command, without allocating a record per idle pass.
+     *
+     * @param kind   what the pass decided
+     * @param before fund size before the decision
+     * @param after  intended fund size after it
+     * @param target size the demand asked for
+     */
+    private void recordDecision(
+        final KairosSnapshot.Decision kind,
+        final int before,
+        final int after,
+        final int target
+    ) {
+        final FundDecision previous = this.lastDecision;
+        if (kind == KairosSnapshot.Decision.IDLE
+            && previous.kind() == KairosSnapshot.Decision.IDLE
+            && previous.target() == target) {
             return;
         }
-        final int liveNow = this.live.get();
-        if (liveNow > this.minThreads && this.retireOne(target, now)) {
-            // the parked runner may need a moment to leave its loop, so the intended size is logged
-            final int after = liveNow - 1;
-            if (after <= this.minThreads) {
-                LOGGER.info("Kairos: fund is back to its floor of {} tick thread(s)", after);
-            } else {
-                LOGGER.debug("Kairos: fund {} -> {} tick thread(s), target {}", liveNow, after, target);
+        this.lastDecision = new FundDecision(kind, before, after, target);
+    }
+
+    /**
+     * Warns about ticks that have been waiting past the threshold, at most once per quiet window.
+     *
+     * <p>This is risk R5: the Folia watchdog only sees a tick that already started, so a region whose
+     * permit never arrives looks like a healthy server to it. The detector separates the two honest
+     * cases - the fund has room and is still growing, or the fund is already at its ceiling and the
+     * machine cannot help - because the operator's next action is different. Suppressed passes are
+     * counted, not logged, and the next warning reports how many it swallowed.
+     *
+     * @param now supervisor clock at the start of the pass
+     */
+    private void warnQueuedOverdue(final long now) {
+        int overdue = 0;
+        long oldestAge = 0L;
+        long oldestRegion = -1L;
+        long oldestTick = -1L;
+        synchronized (this.scheduleLock) {
+            for (final ScheduledState state : this.queued) {
+                final long age = this.waitAge(now, state);
+                if (age < OVERDUE_THRESHOLD_NANOS) {
+                    continue;
+                }
+                ++overdue;
+                if (age > oldestAge) {
+                    oldestAge = age;
+                    oldestRegion = regionId(state.tick);
+                    oldestTick = state.tick.id;
+                }
             }
+        }
+        if (overdue == 0) {
+            return;
+        }
+        if (this.lastOverdueWarnNanos != 0L
+            && now - this.lastOverdueWarnNanos < OVERDUE_WARN_INTERVAL_NANOS) {
+            ++this.suppressedOverdueWarns;
+            return;
+        }
+        final long suppressed = this.suppressedOverdueWarns;
+        this.suppressedOverdueWarns = 0L;
+        this.lastOverdueWarnNanos = now;
+
+        final int liveNow = this.live.get();
+        final boolean saturated = liveNow >= this.maxThreads;
+        final long ageMillis = TimeUnit.NANOSECONDS.toMillis(oldestAge);
+        final String oldest = oldestRegion >= 0L
+            ? "region " + oldestRegion
+            : "region unknown (tick " + oldestTick + ')';
+        final String quiet = suppressed == 0L
+            ? ""
+            : " (" + suppressed + " more overdue pass(es) suppressed since the last warning)";
+        if (saturated) {
+            LOGGER.warn(
+                "Kairos: tick queue is saturated: {} queued tick(s) are past the {} ms wait threshold, "
+                    + "oldest {} waited {} ms; the fund is at its ceiling {}/{}{}",
+                overdue,
+                TimeUnit.NANOSECONDS.toMillis(OVERDUE_THRESHOLD_NANOS),
+                oldest,
+                ageMillis,
+                liveNow,
+                this.maxThreads,
+                quiet
+            );
+        } else {
+            LOGGER.warn(
+                "Kairos: tick starvation: {} queued tick(s) are past the {} ms wait threshold, "
+                    + "oldest {} waited {} ms; the fund is at {}/{} thread(s) and can still grow{}",
+                overdue,
+                TimeUnit.NANOSECONDS.toMillis(OVERDUE_THRESHOLD_NANOS),
+                oldest,
+                ageMillis,
+                liveNow,
+                this.maxThreads,
+                quiet
+            );
+        }
+        KairosQueuedOverdueEvent.emit(
+            oldestRegion, ageMillis, overdue, liveNow, this.maxThreads, saturated
+        );
+    }
+
+    /**
+     * Reads the region id of a queued tick without linking the scheduler to Folia's classes.
+     *
+     * <p>The facade patch is deliberately limited to the deadline accessor, so the region is read from
+     * the public field Folia already exposes. This only runs on a rate-limited warning and never on the
+     * tick path; an unknown tick answers {@code -1} and the warning says so.
+     *
+     * @param tick queued tick
+     * @return the region id, or {@code -1} when this tick is not a region handle
+     */
+    private static long regionId(final SchedulableTick tick) {
+        try {
+            final Object data = tick.getClass().getField("region").get(tick);
+            return data == null ? -1L : data.getClass().getField("id").getLong(data);
+        } catch (ReflectiveOperationException | RuntimeException _) {
+            return -1L;
+        }
+    }
+
+    /**
+     * One supervisor decision, with the numbers behind it.
+     *
+     * @param kind   what the pass did
+     * @param before fund size before the decision
+     * @param after  intended fund size after it
+     * @param target size the demand asked for
+     */
+    private record FundDecision(KairosSnapshot.Decision kind, int before, int after, int target) {
+
+        private String describe() {
+            if (this.kind == KairosSnapshot.Decision.IDLE) {
+                return "target " + this.target;
+            }
+            return this.before + " -> " + this.after + ", target " + this.target;
         }
     }
 
@@ -931,37 +1309,44 @@ public final class KairosScheduler extends Scheduler {
         }
         if (this.maxThreads <= floor) {
             LOGGER.warn(
-                "Kairos: fund is fixed at {} tick thread(s): the ceiling {} gives no headroom",
+                "Kairos: fund is fixed at {} tick thread(s): the ceiling {} gives no headroom ({})",
                 floor,
-                this.maxThreads
+                this.maxThreads,
+                this.budgetSource
             );
             return;
         }
-        final int cores = Runtime.getRuntime().availableProcessors();
-        final String ceilingSource = this.tuning.maxThreads() > 0
-            ? "kairos.max-threads " + this.tuning.maxThreads()
-            : "floor(" + cores + " cores * 0.8)";
         LOGGER.info(
             "Kairos: elastic fund min {}, max {} ({}), keep-alive {}s, spawn rate {}/s",
             floor,
             this.maxThreads,
-            ceilingSource,
+            this.budgetSource,
             this.tuning.keepAliveMillis() / 1000L,
             this.tuning.spawnRatePerSecond()
         );
     }
 
     /**
-     * Resolves the default ceiling from the core count, using the same 80% rule as the compute budget.
-     * A budget aware ceiling (chunk, IO and compute threads subtracted) is a later package; until then
-     * the core count is the honest bound, and the operator can pick a number.
+     * Resolves the ceiling of the fund without a second copy of the processor arithmetic.
      *
-     * @param floor      requested floor, which the ceiling is never below
-     * @param configured operator ceiling, or {@code -1} for the core count rule
+     * <p>An explicit {@code max-threads} always wins. Otherwise the thread layer's budget port answers,
+     * because its controller is the one place that knows what is left after the deducted lanes and the
+     * reserve; its number is used as is, never reduced again. Without a running thread layer the
+     * documented core fraction is the fallback. A ceiling below the floor is not a startup failure: the
+     * fund stays at the floor and the snapshot says {@code NO_HEADROOM}.
+     *
+     * @param floor      requested floor, which the ceiling is never silently below
+     * @param configured operator ceiling, or {@code -1} for the runtime budget
+     * @param budget     budget port of a running thread layer, or {@code null}
      * @return the ceiling to use
      */
-    private static int resolveMax(final int floor, final int configured) {
+    private int resolveMax(
+        final int floor,
+        final int configured,
+        final @Nullable KairosBudgetPort budget
+    ) {
         if (configured > 0) {
+            this.budgetSource = "kairos.max-threads " + configured;
             if (configured < floor) {
                 LOGGER.warn(
                     "Kairos: kairos.max-threads {} is below the {} requested tick threads; the fund stays fixed",
@@ -972,7 +1357,39 @@ public final class KairosScheduler extends Scheduler {
             }
             return configured;
         }
-        final int usable = (int) Math.floor(Runtime.getRuntime().availableProcessors() * USABLE_CORE_FRACTION);
+        if (budget != null) {
+            final int ceiling;
+            try {
+                ceiling = budget.ceiling(floor);
+            } catch (final RuntimeException failure) {
+                LOGGER.warn("Kairos: the budget port failed; falling back to the core count", failure);
+                return this.coreCeiling(floor);
+            }
+            this.budgetSource = budget.describe();
+            if (ceiling < floor) {
+                this.budgetSource = budget.describe() + " (budget " + ceiling + " below floor " + floor + ')';
+                LOGGER.warn(
+                    "Kairos: the budget allows {} tick thread(s), below the floor {}; the fund stays fixed",
+                    ceiling,
+                    floor
+                );
+                return floor;
+            }
+            return ceiling;
+        }
+        return this.coreCeiling(floor);
+    }
+
+    /**
+     * Resolves the fallback ceiling from the core count, the same 80% rule the compute budget uses.
+     *
+     * @param floor requested floor
+     * @return the fallback ceiling, never below the floor
+     */
+    private int coreCeiling(final int floor) {
+        final int cores = Runtime.getRuntime().availableProcessors();
+        final int usable = (int) Math.floor(cores * USABLE_CORE_FRACTION);
+        this.budgetSource = "floor(" + cores + " cores * 0.8)";
         return Math.max(floor, usable);
     }
 
@@ -1019,12 +1436,13 @@ public final class KairosScheduler extends Scheduler {
         /**
          * When this runner last became idle, read by the supervisor under the schedule lock.
          */
-        private volatile long idleSince = System.nanoTime();
+        private volatile long idleSince;
 
         private Runner(final Thread thread, final int slot, final KairosScheduler scheduler) {
             this.thread = thread;
             this.slot = slot;
             this.scheduler = scheduler;
+            this.idleSince = scheduler.clock.getAsLong();
         }
 
         private void setStatePlain(final TickThreadRunnerState state) {
@@ -1081,7 +1499,7 @@ public final class KairosScheduler extends Scheduler {
                 throw new IllegalStateException("Cannot force idle in state " + state);
             }
             state.stateTarget.ownedBy = null;
-            this.idleSince = System.nanoTime();
+            this.idleSince = this.scheduler.clock.getAsLong();
             this.setStateOpaque(new TickThreadRunnerState(null, STATE_IDLE));
             // no need to unpark
         }
@@ -1112,7 +1530,7 @@ public final class KairosScheduler extends Scheduler {
 
                 final ScheduledState newWait = this.scheduler.returnTask(this, reschedule ? task : null);
                 if (newWait == null) {
-                    this.idleSince = System.nanoTime();
+                    this.idleSince = this.scheduler.clock.getAsLong();
                     this.setStatePlain(new TickThreadRunnerState(null, STATE_IDLE));
                 } else {
                     if (newWait.ownedBy != null) {

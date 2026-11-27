@@ -12,6 +12,7 @@ import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.SheddingReport;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
+import kz.bejiihiu.tuff.threads.kairos.KairosSnapshot;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureController;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
 import org.jspecify.annotations.Nullable;
@@ -69,10 +70,13 @@ public final class ThreadsReport {
         final @Nullable ResourceSnapshot snapshot = status.snapshot();
         final @Nullable ThreadManagementSettings settings = status.settings();
         if (snapshot == null || settings == null) {
-            return List.of(
-                "Tuff thread layer: warming up (no sample yet).",
-                INDENT + "The refresher takes one pass per second; run the command again in a moment."
-            );
+            final List<String> warming = new ArrayList<>(3);
+            warming.add("Tuff thread layer: warming up (no sample yet).");
+            warming.add(INDENT + "The refresher takes one pass per second; run the command again in a moment.");
+            if (settings != null) {
+                warming.add(INDENT + describeScheduler(status, settings));
+            }
+            return List.copyOf(warming);
         }
 
         final List<String> lines = new ArrayList<>();
@@ -109,6 +113,7 @@ public final class ThreadsReport {
                 + "the thread list are not collected");
         }
         lines.add(INDENT + describePressure(status, settings));
+        lines.add(INDENT + describeScheduler(status, settings));
         lines.add(INDENT + "degraded: " + (status.metricsEnabled()
             ? describeReasons(snapshot.degradedReasons())
             : "unknown (metrics are disabled)"));
@@ -172,6 +177,35 @@ public final class ThreadsReport {
 
     private static String describeTps(final double tps) {
         return tps < 0.0d ? "unknown" : String.format(Locale.ROOT, "%.1f", tps);
+    }
+
+    /**
+     * Describes the active region scheduler and, under Kairos, the state of its fund.
+     *
+     * <p>EDF and work stealing get an honest "no fund telemetry" instead of invented numbers: they have
+     * no fund, no supervisor and no wait queue this layer can read. Under Kairos the line carries the
+     * same fund, queue and supervisor facts as {@code /tuff scheduler}, condensed to one line because
+     * this command is about threads.
+     *
+     * @param status   current status, carrying the optional Kairos snapshot
+     * @param settings effective settings, naming the configured scheduler
+     * @return the line, without the leading indent
+     */
+    private static String describeScheduler(final ThreadsStatus status, final ThreadManagementSettings settings) {
+        final @Nullable KairosSnapshot kairos = status.kairos();
+        if (kairos != null) {
+            return "scheduler: kairos - " + (kairos.elastic() ? "elastic" : "fixed") + " fund "
+                + kairos.liveThreads() + '/' + kairos.maxThreads() + " live/max (min " + kairos.minThreads()
+                + ", target " + kairos.targetThreads() + "), queued " + kairos.queuedTicks()
+                + ", overdue " + kairos.overdueTicks() + ", supervisor "
+                + kairos.supervisor().name().toLowerCase(Locale.ROOT) + ", status "
+                + kairos.status().name().toLowerCase(Locale.ROOT);
+        }
+        final ThreadManagementSettings.RegionScheduler configured = settings.regionExecution().scheduler();
+        if (configured == ThreadManagementSettings.RegionScheduler.KAIROS) {
+            return "scheduler: kairos - selected, but the scheduler has not started (see the startup log)";
+        }
+        return "scheduler: " + formatScheduler(configured) + " - no fund telemetry (Kairos only)";
     }
 
     /**

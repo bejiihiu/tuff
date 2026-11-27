@@ -79,7 +79,9 @@ thread-management:
       # fixed fund that was already load tested: min == max, no supervisor thread. Turn this on only
       # together with a load test of your own.
       elastic: false
-      # Ceiling of the fund, or -1 for "80% of the cores", the same rule the compute budget uses.
+      # Ceiling of the fund, or -1 for the thread layer budget when it runs (otherwise "80% of the
+      # cores", the compute budget rule). A budget below the floor leaves the fund fixed and shows up
+      # as NO_HEADROOM in /tuff scheduler.
       max-threads: -1
       # How long a thread must sit idle before it may be retired. The floor is never retired.
       keep-alive-seconds: 30

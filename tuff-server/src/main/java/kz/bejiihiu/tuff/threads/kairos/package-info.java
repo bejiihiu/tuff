@@ -1,10 +1,10 @@
 /**
- * The first Kairos prototype: a deadline scheduler with a fixed fund of tick threads.
+ * Kairos: Folia's deadline queue with a fund of tick threads that can grow and shrink.
  *
- * <p>The package is deliberately small. It ports the EDF queue, comparator and runner state machine
- * from leafpile one to one and adds nothing else: no elasticity, no budget port, no affinity, no
- * catch up. Those are later packages with their own gates. The only extra piece is the experimental
- * opt in, because a scheduler an operator did not ask for must never start.
+ * <p>The queue, comparator and runner state machine are ported from leafpile one to one; the fund is
+ * the part this package adds. A single supervisor owns spawn and retire, the budget and supervisor
+ * sources are seams the thread layer fills in, and a fixed fund keeps the first prototype's exact
+ * behaviour. Nothing here touches ownership, region tasks or tick order.
  */
 @NullMarked
 package kz.bejiihiu.tuff.threads.kairos;

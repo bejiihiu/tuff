@@ -3,6 +3,7 @@ package kz.bejiihiu.tuff.threads.bootstrap;
 import java.util.Objects;
 import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
+import kz.bejiihiu.tuff.threads.kairos.KairosSnapshot;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
 import org.jspecify.annotations.Nullable;
 
@@ -30,6 +31,7 @@ import org.jspecify.annotations.Nullable;
  * @param metricsEnabled      whether the runtime samples pool and thread state at all
  * @param pressure            last tick pressure decision, or {@code null} when the feature is off or
  *                            has not decided yet
+ * @param kairos              snapshot of the Kairos fund, or {@code null} when Kairos is not running
  */
 public record ThreadsStatus(
     State state,
@@ -38,7 +40,8 @@ public record ThreadsStatus(
     int unregisteredThreads,
     long sampleAgeMillis,
     boolean metricsEnabled,
-    @Nullable TickPressureSnapshot pressure
+    @Nullable TickPressureSnapshot pressure,
+    @Nullable KairosSnapshot kairos
 ) {
 
     /**
@@ -59,6 +62,32 @@ public record ThreadsStatus(
                 "sampleAgeMillis must be -1 or non negative, got " + sampleAgeMillis
             );
         }
+    }
+
+    /**
+     * Creates a status without a Kairos snapshot.
+     *
+     * <p>Kept so callers that predate the scheduler line - tests that build a status by hand - keep
+     * their shape; the canonical constructor carries the snapshot.
+     *
+     * @param state               lifecycle state of the thread layer
+     * @param settings            effective settings, or {@code null} when there is no runtime
+     * @param snapshot            latest resource snapshot, or {@code null} when there is no runtime
+     * @param unregisteredThreads threads no pool accounts for, or {@code -1} when not measured
+     * @param sampleAgeMillis     age of the cached sample, or {@code -1} when there is none
+     * @param metricsEnabled      whether the runtime samples pool and thread state at all
+     * @param pressure            last tick pressure decision, or {@code null}
+     */
+    public ThreadsStatus(
+        final State state,
+        final @Nullable ThreadManagementSettings settings,
+        final @Nullable ResourceSnapshot snapshot,
+        final int unregisteredThreads,
+        final long sampleAgeMillis,
+        final boolean metricsEnabled,
+        final @Nullable TickPressureSnapshot pressure
+    ) {
+        this(state, settings, snapshot, unregisteredThreads, sampleAgeMillis, metricsEnabled, pressure, null);
     }
 
     /**
@@ -134,7 +163,27 @@ public record ThreadsStatus(
             unregisteredThreads,
             sampleAgeMillis,
             this.metricsEnabled,
-            this.pressure
+            this.pressure,
+            this.kairos
+        );
+    }
+
+    /**
+     * Returns a copy that carries the current Kairos fund snapshot.
+     *
+     * @param kairos the fund snapshot, or {@code null} when Kairos is not running
+     * @return the copy
+     */
+    public ThreadsStatus withKairos(final @Nullable KairosSnapshot kairos) {
+        return new ThreadsStatus(
+            this.state,
+            this.settings,
+            this.snapshot,
+            this.unregisteredThreads,
+            this.sampleAgeMillis,
+            this.metricsEnabled,
+            this.pressure,
+            kairos
         );
     }
 
@@ -152,7 +201,8 @@ public record ThreadsStatus(
             this.unregisteredThreads,
             this.sampleAgeMillis,
             this.metricsEnabled,
-            pressure
+            pressure,
+            this.kairos
         );
     }
 

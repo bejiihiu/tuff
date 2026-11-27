@@ -18,6 +18,7 @@ import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.ThreadSnapshot;
 import kz.bejiihiu.tuff.threads.bridge.RegionThreads;
 import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
+import kz.bejiihiu.tuff.threads.kairos.KairosServices;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -361,6 +362,57 @@ class ThreadsBootstrapTest {
 
         assertEquals(0, ThreadsSampler.countUnknown(unregistered, snapshot),
             "a thread listed by any probe is accounted, not unknown");
+    }
+
+    @Test
+    void theKairosSeamsComeFromTheControllerAndTheServicePool() throws IOException, InterruptedException {
+        final Path file = this.write("""
+            thread-management:
+              enabled: true
+              region-execution:
+                threads: 2
+            """);
+        final ThreadsBootstrap bootstrap = new ThreadsBootstrap();
+        bootstrap.startWith(new ThreadsConfig(file));
+
+        final KairosServices services = bootstrap.kairosServices();
+        assertNotNull(services.budget(), "a running layer gives Kairos a budget port");
+        final int usable = bootstrap.currentStatus().snapshot().usableCores();
+        assertEquals(
+            Math.max(2, usable + 2),
+            services.budget().ceiling(2),
+            "the ceiling is the controller's usable cores plus the region threads it already deducted"
+        );
+
+        final Thread supervisor = services.supervisors().create(
+            "Tuff Kairos Supervisor", () -> { }, (thread, failure) -> { }
+        );
+        assertNotNull(supervisor, "the service pool is L2, so the provider must accept the thread");
+        assertTrue(supervisor.getName().startsWith("Tuff Kairos Supervisor"), supervisor.getName());
+        supervisor.start();
+        supervisor.join(TimeUnit.SECONDS.toMillis(5L));
+        assertFalse(supervisor.isAlive());
+
+        bootstrap.shutdown();
+    }
+
+    @Test
+    void aDisabledLayerHasNoKairosSeams() throws IOException {
+        final Path file = this.write("""
+            thread-management:
+              enabled: false
+            """);
+        final ThreadsBootstrap bootstrap = new ThreadsBootstrap();
+        bootstrap.startWith(new ThreadsConfig(file));
+
+        final KairosServices services = bootstrap.kairosServices();
+        assertNull(services.budget(), "without a runtime the fund falls back to the core count");
+        assertNull(
+            services.supervisors().create("Tuff Kairos Supervisor", () -> { }, (thread, failure) -> { }),
+            "without a runtime the scheduler builds its own daemon"
+        );
+
+        bootstrap.shutdown();
     }
 
     private Path write(final String contents) throws IOException {

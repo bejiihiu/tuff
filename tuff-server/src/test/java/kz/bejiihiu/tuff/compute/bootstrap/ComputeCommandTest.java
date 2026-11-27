@@ -100,13 +100,20 @@ class ComputeCommandTest {
     }
 
     @Test
+    void schedulerSubcommandShowsTheFund() {
+        assertAction(ComputeCommand.Action.SCHEDULER, "scheduler");
+        assertAction(ComputeCommand.Action.SCHEDULER, "SCHEDULER");
+    }
+
+    @Test
     void completionsWalkDownTheArgumentTree() {
-        assertEquals(List.of("compute", "status", "reload", "threads"), completions(""));
+        assertEquals(List.of("compute", "status", "reload", "threads", "scheduler"), completions(""));
         assertEquals(List.of("compute"), completions("c"));
         assertEquals(List.of("consumers", "tasks", "reload", "jfr"), completions("compute", ""));
         assertEquals(List.of("tasks"), completions("compute", "t"));
         assertEquals(List.of("jfr"), completions("compute", "j"));
         assertEquals(List.of("start", "stop"), completions("compute", "jfr", "s"));
+        assertEquals(List.of("scheduler"), completions("sch"));
         assertEquals(List.of(), completions("compute", "tasks", ""));
         assertEquals(List.of(), completions("compute", "consumers", ""));
         assertEquals(List.of(), completions("reload", ""));
