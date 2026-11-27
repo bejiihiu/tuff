@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.TimeUnit;
 import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -83,7 +84,50 @@ class KairosConfigTest {
         assertEquals(KairosKernel.defaults(), KairosGate.kernel());
         assertTrue(KairosGate.kernel().catchUpBudgetMillis() > 0);
         assertFalse(KairosGate.kernel().affinity());
+        assertEquals(KairosIdleWork.off(), KairosGate.idleWork(), "idle work must default to off");
         assertTrue(result.problems().isEmpty(), () -> "unexpected problems: " + result.problems());
+    }
+
+    @Test
+    void theReaderPublishesTheIdleWorkBlock(@TempDir final Path directory) throws IOException {
+        final ThreadsConfig.ThreadsLoadResult result = load(directory, """
+            thread-management:
+              region-execution:
+                kairos:
+                  idle-work:
+                    enabled: true
+                    mid-tick: true
+                    utmi-jobs: true
+                    slice-millis: 3
+                    max-added-lag-millis: 9
+                    max-share-percent: 40
+            """);
+
+        assertTrue(result.problems().isEmpty(), () -> "unexpected problems: " + result.problems());
+        final KairosIdleWork idle = KairosGate.idleWork();
+        assertEquals(new KairosIdleWork(true, true, true, 3, 9, 40), idle);
+        assertTrue(idle.armed());
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(3L), idle.sliceNanos());
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(9L), idle.maxAddedLagNanos());
+    }
+
+    @Test
+    void anUnreadableIdleWorkValueFallsBackToOff(@TempDir final Path directory) throws IOException {
+        final ThreadsConfig.ThreadsLoadResult result = load(directory, """
+            thread-management:
+              region-execution:
+                kairos:
+                  idle-work:
+                    enabled: true
+                    mid-tick: true
+                    slice-millis: 0
+            """);
+
+        assertEquals(KairosIdleWork.off(), KairosGate.idleWork(), "one bad number must not enable the path");
+        assertTrue(
+            result.problems().stream().anyMatch(problem -> problem.toString().contains("idle-work")),
+            () -> "the unreadable key must be named: " + result.problems()
+        );
     }
 
     private static ThreadsConfig.ThreadsLoadResult load(final Path directory, final String yaml) throws IOException {

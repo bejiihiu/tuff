@@ -22,6 +22,7 @@ public final class KairosGate {
     private static volatile boolean armed;
     private static volatile KairosTuning tuning = KairosTuning.fixed();
     private static volatile KairosKernel kernel = KairosKernel.defaults();
+    private static volatile KairosIdleWork idleWork = KairosIdleWork.off();
     private static volatile KairosServices services = KairosServices.none();
 
     private KairosGate() {
@@ -52,6 +53,32 @@ public final class KairosGate {
      */
     public static KairosKernel kernel() {
         return kernel;
+    }
+
+    /**
+     * Records the knobs of the idle path.
+     *
+     * <p>They travel with the tick knobs for the same reason: the settings record they would belong to
+     * is owned by the thread layer and shared with pools that know nothing about ticks, and the gate is
+     * already the value that crosses the window between reading {@code config/tuff.yml} and starting
+     * the region scheduler.
+     *
+     * <p>A missing {@code idle-work} block arrives here as {@link KairosIdleWork#off()}, which is the
+     * behaviour a server that does not opt in must keep.
+     *
+     * @param idle idle knobs to apply once the scheduler starts, never {@code null}
+     */
+    public static void idleWork(final KairosIdleWork idle) {
+        idleWork = idle;
+    }
+
+    /**
+     * Returns the idle knobs that came with the last configuration read.
+     *
+     * @return the idle knobs to apply, never {@code null}; the disabled default when nothing was read
+     */
+    public static KairosIdleWork idleWork() {
+        return idleWork;
     }
 
     /**
@@ -128,6 +155,7 @@ public final class KairosGate {
         armed = false;
         tuning = KairosTuning.fixed();
         kernel = KairosKernel.defaults();
+        idleWork = KairosIdleWork.off();
         services = KairosServices.none();
     }
 

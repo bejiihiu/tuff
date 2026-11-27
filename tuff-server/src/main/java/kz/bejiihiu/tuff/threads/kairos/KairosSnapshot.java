@@ -44,6 +44,7 @@ import java.util.Objects;
  * @param stolenTicks             ticks another runner took out of a backlog
  * @param catchUpBursts           catch-up bursts the fund started
  * @param catchUpTicks            tick bodies run to recover a backlog
+ * @param idleWork                the idle path: what it is allowed to do, what it did and why it stopped
  */
 public record KairosSnapshot(
     boolean elastic,
@@ -70,7 +71,8 @@ public record KairosSnapshot(
     long affinityHits,
     long stolenTicks,
     long catchUpBursts,
-    long catchUpTicks
+    long catchUpTicks,
+    IdleWork idleWork
 ) {
 
     /**
@@ -84,6 +86,7 @@ public record KairosSnapshot(
         Objects.requireNonNull(lastDecisionDetail, "lastDecisionDetail");
         Objects.requireNonNull(budgetSource, "budgetSource");
         Objects.requireNonNull(leaseWait, "leaseWait");
+        Objects.requireNonNull(idleWork, "idleWork");
         degradedReasons = List.copyOf(degradedReasons);
     }
 
@@ -213,6 +216,72 @@ public record KairosSnapshot(
          */
         public boolean armed() {
             return this.timeoutMillis > 0L;
+        }
+    }
+
+    /**
+     * State and cost of the idle path: the work a tick thread may do while it has nothing to tick.
+     *
+     * <p>Off is the default and reads as zero everywhere: no source is polled, no intermediate task is
+     * drained and the counters stay at zero. When the path is on, the counters are what a measurement
+     * needs to judge it: how much work was taken, how often a due tick interrupted it, and how much
+     * lateness it caused. {@code addedTickLagMaxMillis} is measured only across a body that actually
+     * followed idle work, so an unrelated slow tick is not blamed on it.
+     *
+     * <p>{@code disabled} is the self-protection, not the configuration: {@link Disabled#LAG_BUDGET}
+     * means the path ran and added more lateness than {@code max-added-lag-millis}, so it turned itself
+     * off until the region was stable again. A path that is off by configuration reports
+     * {@link Disabled#NONE} and {@code enabled == false}.
+     *
+     * @param enabled               master switch from the configuration
+     * @param midTick               whether a waiting runner may drain its region's intermediate tasks
+     * @param utmiJobs              whether a parked runner may take jobs from an idle-safe source
+     * @param sourcePresent         whether an idle-safe source is wired at all
+     * @param idleWorkNanos         wall clock spent on idle work since start, in nanoseconds
+     * @param jobsTaken             idle-safe jobs taken since start
+     * @param midTickPasses         intermediate task passes run since start
+     * @param preemptions           passes or jobs a due tick or a grant interrupted
+     * @param addedTickLagMaxMillis worst lateness of a body that followed idle work, in milliseconds
+     * @param shareOfIdlePercent    share of measured idle time spent on idle work, from 0 to 100
+     * @param disabled              why the self-protection turned the path off
+     */
+    public record IdleWork(
+        boolean enabled,
+        boolean midTick,
+        boolean utmiJobs,
+        boolean sourcePresent,
+        long idleWorkNanos,
+        long jobsTaken,
+        long midTickPasses,
+        long preemptions,
+        long addedTickLagMaxMillis,
+        double shareOfIdlePercent,
+        Disabled disabled
+    ) {
+
+        /**
+         * Validates the record.
+         *
+         * @throws NullPointerException if {@code disabled} is {@code null}
+         */
+        public IdleWork {
+            Objects.requireNonNull(disabled, "disabled");
+        }
+
+        /**
+         * Why the idle path is not running.
+         */
+        public enum Disabled {
+
+            /**
+             * The path is allowed to run, or was never on.
+             */
+            NONE,
+
+            /**
+             * Idle work added more lateness than its budget, so it is off until the region is stable.
+             */
+            LAG_BUDGET
         }
     }
 }

@@ -8,6 +8,7 @@ import java.util.Set;
 import kz.bejiihiu.tuff.compute.config.ConfigProblem;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import kz.bejiihiu.tuff.threads.kairos.KairosGate;
+import kz.bejiihiu.tuff.threads.kairos.KairosIdleWork;
 import kz.bejiihiu.tuff.threads.kairos.KairosKernel;
 import org.bukkit.configuration.Configuration;
 import org.bukkit.configuration.ConfigurationSection;
@@ -55,7 +56,7 @@ final class ThreadsConfigParser {
     private static final String KAIROS_PATH = REGION_PATH + ".kairos";
     private static final Set<String> KAIROS_KEYS = Set.of(
         "elastic", "max-threads", "keep-alive-seconds", "spawn-rate-per-second",
-        "catch-up", "steal", "affinity", "lease", "metrics"
+        "catch-up", "steal", "affinity", "lease", "metrics", "idle-work"
     );
     private static final String CATCH_UP_PATH = KAIROS_PATH + ".catch-up";
     private static final Set<String> CATCH_UP_KEYS = Set.of("cap-ticks", "budget-millis");
@@ -67,6 +68,10 @@ final class ThreadsConfigParser {
     private static final Set<String> LEASE_KEYS = Set.of("timeout-seconds");
     private static final String KAIROS_METRICS_PATH = KAIROS_PATH + ".metrics";
     private static final Set<String> KAIROS_METRICS_KEYS = Set.of("jfr");
+    private static final String IDLE_PATH = KAIROS_PATH + ".idle-work";
+    private static final Set<String> IDLE_KEYS = Set.of(
+        "enabled", "mid-tick", "utmi-jobs", "slice-millis", "max-added-lag-millis", "max-share-percent"
+    );
     private static final Set<String> ASYNC_COMPUTE_KEYS = Set.of("managed", "max-threads", "tick-pressure");
     private static final Set<String> TICK_PRESSURE_KEYS = Set.of(
         "enabled",
@@ -95,6 +100,7 @@ final class ThreadsConfigParser {
         final ThreadManagementSettings defaults = ThreadManagementSettings.defaults();
         // a read that has no kairos block still has an answer for the scheduler: the stock behaviour
         KairosGate.kernel(KairosKernel.defaults());
+        KairosGate.idleWork(KairosIdleWork.off());
         final ConfigurationSection root = configuration.getConfigurationSection(SECTION);
         if (root == null) {
             problems.add(new ConfigProblem(SECTION, "section is missing, using the observe-only defaults"));
@@ -273,6 +279,7 @@ final class ThreadsConfigParser {
     ) {
         if (section == null) {
             KairosGate.kernel(KairosKernel.defaults());
+            KairosGate.idleWork(KairosIdleWork.off());
             return fallback;
         }
         final boolean elastic = readBoolean(section, "elastic", fallback.elastic(), KAIROS_PATH + ".elastic", problems);
@@ -291,6 +298,7 @@ final class ThreadsConfigParser {
         // pools that have no idea what a tick is. the gate is already the value that crosses this
         // window, so the knobs arrive at the scheduler start with the rest of the kairos block
         KairosGate.kernel(parseKernel(section, problems));
+        KairosGate.idleWork(parseIdleWork(section, problems));
         try {
             return new ThreadManagementSettings.RegionExecution.Kairos(elastic, maxThreads, keepAlive, spawnRate);
         } catch (final IllegalArgumentException ex) {
@@ -338,6 +346,50 @@ final class ThreadsConfigParser {
             return new KairosKernel(cap, budget, queueSize, stealThreshold, leaseSeconds * 1000, jfr);
         } catch (final IllegalArgumentException ex) {
             problems.add(new ConfigProblem(CATCH_UP_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
+            return defaults;
+        }
+    }
+
+    /**
+     * Reads the idle path knobs and publishes them to the scheduler.
+     *
+     * <p>The block is optional and off when absent. A value outside its range is reported and the
+     * whole idle path falls back to off, not to a neighbour's value: a slice of zero milliseconds
+     * would mean "run without a bound", which is the one thing this feature must never do by
+     * accident.
+     *
+     * @param kairos   the {@code kairos} section, never {@code null}
+     * @param problems problem sink, appended to in place
+     * @return the knobs to publish, never {@code null}
+     */
+    private static KairosIdleWork parseIdleWork(
+        final ConfigurationSection kairos,
+        final List<ConfigProblem> problems
+    ) {
+        final KairosIdleWork defaults = KairosIdleWork.off();
+        final ConfigurationSection section = readSection(kairos, "idle-work", IDLE_PATH, problems);
+        if (section == null) {
+            return defaults;
+        }
+        final boolean enabled = readBoolean(section, "enabled", defaults.enabled(), IDLE_PATH + ".enabled", problems);
+        final boolean midTick = readBoolean(section, "mid-tick", defaults.midTick(), IDLE_PATH + ".mid-tick", problems);
+        final boolean utmiJobs = readBoolean(
+            section, "utmi-jobs", defaults.utmiJobs(), IDLE_PATH + ".utmi-jobs", problems
+        );
+        final int slice = readInt(
+            section, "slice-millis", defaults.sliceMillis(), IDLE_PATH + ".slice-millis", problems
+        );
+        final int lag = readInt(
+            section, "max-added-lag-millis", defaults.maxAddedLagMillis(),
+            IDLE_PATH + ".max-added-lag-millis", problems
+        );
+        final int share = readInt(
+            section, "max-share-percent", defaults.maxSharePercent(), IDLE_PATH + ".max-share-percent", problems
+        );
+        try {
+            return new KairosIdleWork(enabled, midTick, utmiJobs, slice, lag, share);
+        } catch (final IllegalArgumentException ex) {
+            problems.add(new ConfigProblem(IDLE_PATH, "rejected (" + ex.getMessage() + "), using off"));
             return defaults;
         }
     }
@@ -642,6 +694,9 @@ final class ThreadsConfigParser {
                 reportUnknownIn(kairos.getConfigurationSection("lease"), LEASE_PATH, LEASE_KEYS, problems);
                 reportUnknownIn(
                     kairos.getConfigurationSection("metrics"), KAIROS_METRICS_PATH, KAIROS_METRICS_KEYS, problems
+                );
+                reportUnknownIn(
+                    kairos.getConfigurationSection("idle-work"), IDLE_PATH, IDLE_KEYS, problems
                 );
             }
         }

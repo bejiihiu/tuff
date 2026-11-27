@@ -85,14 +85,14 @@ public final class KairosTickEvent extends Event {
     /**
      * Emits the event when a recording has it enabled.
      *
-     * @param regionId            region of the tick, or {@code -1}
-     * @param tickId              id of the scheduled tick
-     * @param scheduledStartNanos deadline the tick was measured against
-     * @param startNanos          moment the body started
-     * @param endNanos            moment the body returned
-     * @param missedPeriods       periods the handle was behind, or {@code -1}
-     * @param catchUpTicks        {@code 1} for a catch-up body, otherwise {@code 0}
-     * @param skipped             periods written off, or {@code -1}
+     * @param regionId                       region of the tick, or {@code -1}
+     * @param tickId                         id of the scheduled tick
+     * @param scheduledStartNanos            deadline the tick was measured against
+     * @param startNanos                     moment the body started
+     * @param endNanos                       moment the body returned
+     * @param missedPeriods                  periods the handle was behind, or {@code -1}
+     * @param catchUpTicks                   one for a catch-up body, otherwise zero
+     * @param skipped                        periods written off, or {@code -1}
      */
     static void emit(
         final long regionId,

@@ -34,25 +34,6 @@ public record KairosKernel(
 ) {
 
     /**
-     * Creates the knobs of everything but the recording, which is off.
-     *
-     * @param catchUpCapTicks      tick bodies one late region may run back to back
-     * @param catchUpBudgetMillis  wall clock a single catch-up burst may spend
-     * @param affinityQueueSize    ticks a runner may keep for itself
-     * @param stealThresholdMillis how late a kept tick must be before another runner may take it
-     * @param leaseTimeoutMillis   permit wait above which the supervisor warns
-     */
-    public KairosKernel(
-        final int catchUpCapTicks,
-        final int catchUpBudgetMillis,
-        final int affinityQueueSize,
-        final int stealThresholdMillis,
-        final int leaseTimeoutMillis
-    ) {
-        this(catchUpCapTicks, catchUpBudgetMillis, affinityQueueSize, stealThresholdMillis, leaseTimeoutMillis, false);
-    }
-
-    /**
      * Validates the knobs.
      *
      * @throws IllegalArgumentException if a value is outside its documented range
@@ -81,6 +62,25 @@ public record KairosKernel(
                 "leaseTimeoutMillis must not be negative, got " + leaseTimeoutMillis
             );
         }
+    }
+
+    /**
+     * Creates the knobs of everything but the recording, which is off.
+     *
+     * @param catchUpCapTicks      tick bodies one late region may run back to back
+     * @param catchUpBudgetMillis  wall clock a single catch-up burst may spend
+     * @param affinityQueueSize    ticks a runner may keep for itself
+     * @param stealThresholdMillis how late a kept tick must be before another runner may take it
+     * @param leaseTimeoutMillis   permit wait above which the supervisor warns
+     */
+    public KairosKernel(
+        final int catchUpCapTicks,
+        final int catchUpBudgetMillis,
+        final int affinityQueueSize,
+        final int stealThresholdMillis,
+        final int leaseTimeoutMillis
+    ) {
+        this(catchUpCapTicks, catchUpBudgetMillis, affinityQueueSize, stealThresholdMillis, leaseTimeoutMillis, false);
     }
 
     /**

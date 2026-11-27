@@ -5,7 +5,7 @@ Subject: [PATCH] Tuff: hook region ticks for accounting and Kairos
 
 
 diff --git a/io/papermc/paper/threadedregions/TickRegionScheduler.java b/io/papermc/paper/threadedregions/TickRegionScheduler.java
-index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd81008a9f5341e8631964074696b06a1d0b9e25 100644
+index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..7a0e9043f5e44b69b4ebe11b193ed4171e397ea9 100644
 --- a/io/papermc/paper/threadedregions/TickRegionScheduler.java
 +++ b/io/papermc/paper/threadedregions/TickRegionScheduler.java
 @@ -53,7 +53,8 @@ public final class TickRegionScheduler {
@@ -27,7 +27,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd81008a9f5341e8631964074696b06a
                  ret.setUncaughtExceptionHandler(TickRegionScheduler.this::uncaughtException);
                  return ret;
              }
-@@ -84,6 +85,17 @@ public final class TickRegionScheduler {
+@@ -84,6 +85,19 @@ public final class TickRegionScheduler {
                  ((StealingScheduledThreadPool)this.scheduler).setFlags(StealingScheduledThreadPool.FLAG_SCHEDULE_EVENLY);
                  break;
              }
@@ -37,7 +37,9 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd81008a9f5341e8631964074696b06a
 +                    // Tuff - catch up reads the handle's own period count and bounds its write off
 +                    new kz.bejiihiu.tuff.threads.kairos.KairosTickControl(
 +                        tick -> ((RegionScheduleHandle)tick).missedPeriods(),
-+                        (tick, periods) -> ((RegionScheduleHandle)tick).limitWriteOff(periods)
++                        (tick, periods) -> ((RegionScheduleHandle)tick).limitWriteOff(periods),
++                        // Tuff - idle work never starts intermediate tasks for a dropped region
++                        tick -> ((RegionScheduleHandle)tick).isMarkedAsNonSchedulable()
 +                    )
 +                );
 +                break;
@@ -45,7 +47,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd81008a9f5341e8631964074696b06a
              default: {
                  throw new IllegalStateException("Unknown scheduler type: " + schedulerType);
              }
-@@ -93,6 +105,8 @@ public final class TickRegionScheduler {
+@@ -93,6 +107,8 @@ public final class TickRegionScheduler {
      public void start() {
          if (this.scheduler instanceof EDFSchedulerThreadPool edfSchedulerThreadPool) {
              edfSchedulerThreadPool.start();
@@ -54,7 +56,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd81008a9f5341e8631964074696b06a
          }
      }
  
-@@ -121,6 +135,8 @@ public final class TickRegionScheduler {
+@@ -121,6 +137,8 @@ public final class TickRegionScheduler {
              }
  
              stealingScheduledThreadPool.setThreadAllocation(threadAllocation, stealThresholdNS, taskTimeSliceNS);
@@ -63,7 +65,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd81008a9f5341e8631964074696b06a
          }
      }
  
-@@ -315,6 +331,14 @@ public final class TickRegionScheduler {
+@@ -315,6 +333,14 @@ public final class TickRegionScheduler {
  
          protected final Schedule tickSchedule;
  
@@ -78,7 +80,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd81008a9f5341e8631964074696b06a
          private TickRegionScheduler scheduler;
  
          public RegionScheduleHandle(final TickRegions.TickRegionData region, final long firstStart) {
-@@ -340,6 +364,48 @@ public final class TickRegionScheduler {
+@@ -340,6 +366,48 @@ public final class TickRegionScheduler {
              this.tickSchedule.setLastPeriod(to == TimeUtil.DEADLINE_NOT_SET ? to : to - TIME_BETWEEN_TICKS);
          }
  
@@ -127,7 +129,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..cd81008a9f5341e8631964074696b06a
          public final void markNonSchedulable() {
              this.cancelled.set(true);
          }
-@@ -430,7 +496,11 @@ public final class TickRegionScheduler {
+@@ -430,7 +498,11 @@ public final class TickRegionScheduler {
              final long tickStart = System.nanoTime();
  
              // use max(), don't assume that tickStart >= scheduledStart

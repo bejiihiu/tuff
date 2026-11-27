@@ -20,13 +20,17 @@ import java.util.PriorityQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.BooleanSupplier;
 import java.util.function.LongSupplier;
 import java.util.function.ToLongFunction;
+import kz.bejiihiu.tuff.threads.idle.IdleWork;
+import kz.bejiihiu.tuff.threads.idle.IdleWorkSource;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jspecify.annotations.Nullable;
@@ -120,6 +124,34 @@ public final class KairosScheduler extends Scheduler {
     private static final long OVERDUE_WARN_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(10L);
 
     /**
+     * How long a parked runner waits between two polls of the idle-safe source. Only used while the
+     * source is armed; without it a runner would sleep for a whole second and idle work would be taken
+     * only when something else happened to wake the thread.
+     */
+    private static final long IDLE_WORK_POLL_NANOS = TimeUnit.MILLISECONDS.toNanos(20L);
+
+    /**
+     * How long the idle path stays off after it added more lateness than its budget. The path is
+     * re-armed once this much time has passed without another violation, which is the definition of
+     * "the region is stable again" the snapshot reports.
+     */
+    private static final long IDLE_STABILITY_NANOS = TimeUnit.SECONDS.toNanos(5L);
+
+    /**
+     * Window the {@code max-share-percent} budget is measured over. One second matches the metrics
+     * interval, so "25 percent of idle" means a quarter of a second of work per second at most.
+     */
+    private static final long IDLE_SHARE_WINDOW_NANOS = TimeUnit.SECONDS.toNanos(1L);
+
+    /**
+     * A body that starts later than this after its last idle slice is not blamed on idle work. The
+     * window only exists so a slice taken minutes before a tick cannot make the tick look delayed by
+     * it; a slice that really did push a body is at most a few microseconds away from the body's
+     * start.
+     */
+    private static final long IDLE_LAG_ATTRIBUTION_NANOS = TimeUnit.MILLISECONDS.toNanos(100L);
+
+    /**
      * The scheduler that is actually running, so the console can report the fund without a server
      * reference. Set by {@link #start()} and cleared by {@link #halt()}.
      */
@@ -209,6 +241,57 @@ public final class KairosScheduler extends Scheduler {
 
     /** Whether the per-tick and per-pass recording is armed. Read once per body, never allocates. */
     private volatile boolean jfr;
+
+    /** Idle path knobs resolved at start; off by default. */
+    private volatile KairosIdleWork idleWork = KairosIdleWork.off();
+
+    /** Where idle-safe jobs come from, or {@code null}; from {@link KairosServices} at start. */
+    private volatile @Nullable IdleWorkSource idleSource;
+
+    /** Whether a waiting runner may drain its region's intermediate tasks. */
+    private volatile boolean idleMidTick;
+
+    /** Whether a parked runner may take jobs from {@link #idleSource}. */
+    private volatile boolean idleUtmiJobs;
+
+    /** Wall clock one idle slice may take. */
+    private volatile long idleSliceNanos = TimeUnit.MILLISECONDS.toNanos(1L);
+
+    /** Lateness above which idle work disables itself. */
+    private volatile long idleLagBudgetNanos = TimeUnit.MILLISECONDS.toNanos(5L);
+
+    /** Share of the one second window idle work may spend. */
+    private volatile int idleSharePercent = 25;
+
+    /** Wall clock spent on idle work since start. */
+    private final LongAdder idleWorkNanos = new LongAdder();
+
+    /** Wall clock spent parked by runners while the idle path was armed. */
+    private final LongAdder idleWaitNanos = new LongAdder();
+
+    /** Idle-safe jobs taken since start. */
+    private final LongAdder idleJobsTaken = new LongAdder();
+
+    /** Intermediate task passes run since start. */
+    private final LongAdder midTickPasses = new LongAdder();
+
+    /** Passes or jobs a due tick or a grant interrupted. */
+    private final LongAdder idlePreemptions = new LongAdder();
+
+    /** Worst lateness of a body that followed idle work, best effort. */
+    private volatile long addedTickLagMaxNanos;
+
+    /** Start of the current share window, in clock terms. */
+    private final AtomicLong shareWindowStartNanos = new AtomicLong();
+
+    /** Idle work inside the current share window, in wall clock nanoseconds. */
+    private final AtomicLong shareWindowWorkNanos = new AtomicLong();
+
+    /** Set when idle work exceeded its lag budget; cleared once the stability window has passed. */
+    private final AtomicBoolean idleDisarmed = new AtomicBoolean();
+
+    /** When the idle path disarmed itself, in clock terms. */
+    private volatile long idleDisarmedAtNanos;
 
     /** Ticks a runner may keep for itself, {@code 0} when soft affinity is off. */
     private volatile int affinityQueueSize;
@@ -410,6 +493,7 @@ public final class KairosScheduler extends Scheduler {
             this.jfr = this.kernel.jfr();
             this.affinityQueueSize = this.kernel.affinityQueueSize();
             this.stealThresholdNanos = TimeUnit.MILLISECONDS.toNanos(this.kernel.stealThresholdMillis());
+            this.resolveIdleWork(KairosGate.idleWork(), services.idle());
             final int floor = this.minThreads;
             // one source for the ceiling: the thread layer's controller when it runs, the documented
             // core fraction otherwise. the port already accounts for the reserve, so nothing here
@@ -677,7 +761,8 @@ public final class KairosScheduler extends Scheduler {
             this.affinityHits.sum(),
             this.stolenTicks.sum(),
             this.catchUpBursts.sum(),
-            this.catchUpTicks.sum()
+            this.catchUpTicks.sum(),
+            this.idleWorkSnapshot()
         );
     }
 
@@ -739,6 +824,173 @@ public final class KairosScheduler extends Scheduler {
         }
         final long age = now - start;
         return Math.max(0L, age);
+    }
+
+    /**
+     * Copies the idle knobs into the fund and remembers the job source.
+     *
+     * <p>The source is only kept when the operator asked for idle-safe jobs, so a server that left the
+     * feature off does not even hold the reference. The slice and the budget are converted once here;
+     * a runner reads the fields and never converts anything on its path.
+     *
+     * @param knobs  idle knobs from the configuration, never {@code null}
+     * @param source job source from the thread layer, or {@code null}
+     */
+    private void resolveIdleWork(final KairosIdleWork knobs, final @Nullable IdleWorkSource source) {
+        this.idleWork = knobs;
+        final boolean armed = knobs.armed();
+        this.idleMidTick = armed && knobs.midTick();
+        this.idleUtmiJobs = armed && knobs.utmiJobs();
+        this.idleSliceNanos = knobs.sliceNanos();
+        this.idleLagBudgetNanos = knobs.maxAddedLagNanos();
+        this.idleSharePercent = knobs.maxSharePercent();
+        this.idleSource = this.idleUtmiJobs ? source : null;
+        this.shareWindowStartNanos.set(this.clock.getAsLong());
+        this.shareWindowWorkNanos.set(0L);
+    }
+
+    /**
+     * Builds the idle section of the snapshot.
+     *
+     * <p>The share is work divided by measured idle time, both taken from the same counters: a server
+     * with the path off reports zero because neither counter moved, not because the answer was
+     * hardcoded.
+     *
+     * @return the idle report, never {@code null}
+     */
+    private KairosSnapshot.IdleWork idleWorkSnapshot() {
+        final long work = this.idleWorkNanos.sum();
+        final long wait = this.idleWaitNanos.sum();
+        final long total = work + wait;
+        final double share = total <= 0L ? 0.0d : 100.0d * (double) work / (double) total;
+        return new KairosSnapshot.IdleWork(
+            this.idleWork.enabled(),
+            this.idleMidTick,
+            this.idleUtmiJobs,
+            this.idleSource != null,
+            work,
+            this.idleJobsTaken.sum(),
+            this.midTickPasses.sum(),
+            this.idlePreemptions.sum(),
+            TimeUnit.NANOSECONDS.toMillis(this.addedTickLagMaxNanos),
+            share,
+            this.idleDisarmed.get()
+                ? KairosSnapshot.IdleWork.Disabled.LAG_BUDGET
+                : KairosSnapshot.IdleWork.Disabled.NONE
+        );
+    }
+
+    /**
+     * Returns whether idle work may start right now.
+     *
+     * <p>Three gates in order: the configuration, the self-protection and the stability window. The
+     * last one is what re-arms the path after a violation: the region is called stable once a whole
+     * window passed without another one, which is a deliberate simplification - there is one fund, not
+     * one guard per region, and a per region state machine would cost more than the work it protects.
+     *
+     * @return {@code true} when a slice may start
+     */
+    boolean idleWorkArmed() {
+        if (!this.idleWork.armed()) {
+            return false;
+        }
+        if (!this.idleDisarmed.get()) {
+            return true;
+        }
+        final long now = this.clock.getAsLong();
+        if (now - this.idleDisarmedAtNanos < IDLE_STABILITY_NANOS) {
+            return false;
+        }
+        this.idleDisarmed.set(false);
+        return true;
+    }
+
+    /**
+     * Returns whether the share budget still allows a slice in the current window.
+     *
+     * <p>The window is a second long and the allowance is the configured percentage of it. The reset
+     * races are harmless: two runners may both reset a window whose counter was already close to the
+     * allowance, which loses at most one window's worth of accounting and never allows unbounded work
+     * because the next slice is measured again.
+     *
+     * @return {@code true} when a slice fits the share budget
+     */
+    boolean idleShareAllowsWork() {
+        final int share = this.idleSharePercent;
+        if (share <= 0) {
+            return false;
+        }
+        final long now = this.clock.getAsLong();
+        final long start = this.shareWindowStartNanos.get();
+        if (now < start || now - start >= IDLE_SHARE_WINDOW_NANOS) {
+            this.shareWindowStartNanos.set(now);
+            this.shareWindowWorkNanos.set(0L);
+        }
+        final long allowance = IDLE_SHARE_WINDOW_NANOS / 100L * share;
+        return this.shareWindowWorkNanos.get() < allowance;
+    }
+
+    /**
+     * Records the wall clock a slice took.
+     *
+     * @param nanos duration of the slice, ignored when not positive
+     */
+    void accountIdleWork(final long nanos) {
+        if (nanos <= 0L) {
+            return;
+        }
+        this.idleWorkNanos.add(nanos);
+        this.shareWindowWorkNanos.addAndGet(nanos);
+    }
+
+    /**
+     * Records the lateness of a body that followed idle work, and disables the path when it is over
+     * budget.
+     *
+     * <p>This is the whole self-protection. A slice is supposed to end before the deadline, so added
+     * lateness means some unit ignored its cancellation flag; the honest response is to stop using
+     * idle work rather than to keep paying for it. The warning is written once per incident, not on
+     * every late tick, and only on the thread that first crosses the budget.
+     *
+     * @param addedNanos lateness caused by idle work, zero or negative when the body was on time
+     */
+    void recordAddedLag(final long addedNanos) {
+        if (addedNanos <= 0L) {
+            return;
+        }
+        if (addedNanos > this.addedTickLagMaxNanos) {
+            this.addedTickLagMaxNanos = addedNanos;
+        }
+        if (addedNanos <= this.idleLagBudgetNanos) {
+            return;
+        }
+        if (!this.idleDisarmed.compareAndSet(false, true)) {
+            return;
+        }
+        this.idleDisarmedAtNanos = this.clock.getAsLong();
+        LOGGER.warn(
+            "Kairos: idle work delayed a tick by {} ms, above the {} ms budget; idle work is off until the "
+                + "region is stable again",
+            TimeUnit.NANOSECONDS.toMillis(addedNanos),
+            this.idleWork.maxAddedLagMillis()
+        );
+    }
+
+    /**
+     * Describes the idle path in one clause for the startup line.
+     *
+     * @return a short human readable summary, never {@code null}
+     */
+    private String describeIdleWork() {
+        final KairosIdleWork knobs = this.idleWork;
+        if (!knobs.armed()) {
+            return "idle work off";
+        }
+        return "idle work " + (this.idleMidTick ? "mid-tick" : "")
+            + (this.idleMidTick && this.idleUtmiJobs ? " + " : "")
+            + (this.idleUtmiJobs ? (this.idleSource == null ? "utmi jobs (no source)" : "utmi jobs") : "")
+            + ", slice " + knobs.sliceMillis() + " ms, lag budget " + knobs.maxAddedLagMillis()
+            + " ms, share " + knobs.maxSharePercent() + '%';
     }
 
     /**
@@ -1975,7 +2227,8 @@ public final class KairosScheduler extends Scheduler {
             + (knobs.catchUpBudgetMillis() > 0 ? knobs.catchUpBudgetMillis() + " ms" : "off")
             + ", affinity queue " + knobs.affinityQueueSize()
             + " (steal " + knobs.stealThresholdMillis() + " ms), lease timeout "
-            + (knobs.leaseTimeoutMillis() > 0 ? knobs.leaseTimeoutMillis() + " ms" : "off");
+            + (knobs.leaseTimeoutMillis() > 0 ? knobs.leaseTimeoutMillis() + " ms" : "off")
+            + ", " + this.describeIdleWork();
     }
 
     /**
@@ -2112,6 +2365,12 @@ public final class KairosScheduler extends Scheduler {
         private volatile long idleSince;
 
         /**
+         * Wall clock when this runner last finished an idle slice, or zero. Runner thread only; used to
+         * decide whether a late body may be blamed on idle work.
+         */
+        private long idleWorkEndNanos;
+
+        /**
          * Ticks kept for this runner while soft affinity is on, or {@code null} when it is off.
          * Guarded by {@link KairosScheduler#scheduleLock}.
          */
@@ -2201,6 +2460,182 @@ public final class KairosScheduler extends Scheduler {
             }
         }
 
+        /**
+         * Runs at most one idle-safe job while this runner has no permit and no due tick.
+         *
+         * <p>The runner is a tick thread, and that is the point: it already owns no region, its thread
+         * locals and caches are the ones the next tick will use, and it is parked anyway. The job is
+         * bounded by the configured slice and by {@link #idleCanContinue}, which also turns false the
+         * moment a tick is granted to this runner. Nothing here counts as a tick, so the fund's demand
+         * and ordering are untouched.
+         *
+         * @param idleState snapshot of this runner's state the job was taken under
+         * @return {@code true} when a job ran
+         */
+        private boolean runIdleJob(final TickThreadRunnerState idleState) {
+            final KairosScheduler scheduler = this.scheduler;
+            final IdleWorkSource source = scheduler.idleSource;
+            if (!scheduler.idleUtmiJobs || source == null) {
+                return false;
+            }
+            if (this.state != idleState || !scheduler.idleWorkArmed() || !scheduler.idleShareAllowsWork()) {
+                return false;
+            }
+            final IdleWork job;
+            try {
+                job = source.poll();
+            } catch (RuntimeException | LinkageError _) {
+                // a broken source must not take the fund down; it simply offers nothing this round
+                return false;
+            }
+            if (job == null) {
+                return false;
+            }
+            final long sliceEnd = System.nanoTime() + scheduler.idleSliceNanos;
+            final BooleanSupplier canContinue = () -> this.idleCanContinue(idleState, sliceEnd);
+            final long workStart = System.nanoTime();
+            try {
+                job.run(canContinue);
+            } catch (RuntimeException | LinkageError _) {
+                // foreign code: it may fail, the tick path may not
+            } finally {
+                final long workEnd = System.nanoTime();
+                scheduler.accountIdleWork(workEnd - workStart);
+                scheduler.idleJobsTaken.increment();
+                this.idleWorkEndNanos = workEnd;
+            }
+            if (this.state != idleState) {
+                scheduler.idlePreemptions.increment();
+            }
+            return true;
+        }
+
+        /**
+         * Runs one bounded pass over the intermediate tasks of the region whose permit this runner
+         * holds while it waits for the deadline.
+         *
+         * <p>This is Folia's own task drain, not a private queue: {@code hasTasks()} decides whether
+         * anything waits and {@code runTasks} runs it under the region's ticking mark, exactly like the
+         * work-stealing scheduler does between two ticks. The region cannot be ticked concurrently
+         * because this runner holds its permit and {@code runTasks} re-acquires the region itself; a
+         * region that was already dropped is skipped before either call, and the cancellation flag is
+         * re-read between tasks.
+         *
+         * <p>One pass per await, never two. A pass that ends with time left simply leaves the runner
+         * waiting normally, so an idle region cannot turn into a second tick loop.
+         *
+         * @param awaitState snapshot of this runner's state the pass was started under
+         * @return {@code true} when a pass ran
+         */
+        private boolean runMidTickPass(final TickThreadRunnerState awaitState) {
+            final KairosScheduler scheduler = this.scheduler;
+            if (!scheduler.idleMidTick || !scheduler.idleWorkArmed() || !scheduler.idleShareAllowsWork()) {
+                return false;
+            }
+            final ScheduledState task = awaitState.stateTarget;
+            if (task == null || this.state != awaitState) {
+                return false;
+            }
+            if (scheduler.ticks.cancelled().test(task.tick)) {
+                // a dropped region owns nothing to drain; the stock path never touches it either
+                return false;
+            }
+            final long deadline = scheduler.scheduledStart.applyAsLong(task.tick);
+            final long now = System.nanoTime();
+            if (now - deadline >= 0L) {
+                return false;
+            }
+            if (!task.tick.hasTasks()) {
+                return false;
+            }
+            final long sliceEnd = now + scheduler.idleSliceNanos;
+            final BooleanSupplier canContinue = () -> this.midTickCanContinue(awaitState, task, deadline, sliceEnd);
+            final long workStart = System.nanoTime();
+            try {
+                task.tick.runTasks(canContinue);
+            } finally {
+                final long workEnd = System.nanoTime();
+                scheduler.accountIdleWork(workEnd - workStart);
+                scheduler.midTickPasses.increment();
+                this.idleWorkEndNanos = workEnd;
+            }
+            if (this.state != awaitState || System.nanoTime() - deadline >= 0L) {
+                scheduler.idlePreemptions.increment();
+            }
+            return true;
+        }
+
+        /**
+         * Answers whether a mid-tick pass may keep draining.
+         *
+         * <p>Order matters: the state is checked first because a grant or a cancellation replaces it,
+         * then the handle's own cancellation, then the two wall-clock bounds. The deadline comes before
+         * the slice so a pass that reaches the deadline is cut even when its slice still has time.
+         *
+         * @param awaitState state the pass was started under
+         * @param task       tick whose tasks are being drained
+         * @param deadline   deadline of that tick
+         * @param sliceEnd   end of the slice
+         * @return {@code true} while the pass may run another task
+         */
+        private boolean midTickCanContinue(
+            final TickThreadRunnerState awaitState,
+            final ScheduledState task,
+            final long deadline,
+            final long sliceEnd
+        ) {
+            if (this.scheduler.halted || this.state != awaitState) {
+                return false;
+            }
+            if (this.scheduler.ticks.cancelled().test(task.tick)) {
+                return false;
+            }
+            final long now = System.nanoTime();
+            return now - deadline < 0L && now - sliceEnd < 0L;
+        }
+
+        /**
+         * Answers whether an idle-safe job may keep running.
+         *
+         * <p>Only two things can stop it: the slice end and a tick arriving. There is no deadline to
+         * check here because the runner has no permit; the state change caused by the grant is the
+         * signal, which is why the volatile read comes first.
+         *
+         * @param idleState state the job was started under
+         * @param sliceEnd  end of the slice
+         * @return {@code true} while the job may run
+         */
+        private boolean idleCanContinue(final TickThreadRunnerState idleState, final long sliceEnd) {
+            if (this.scheduler.halted || this.state != idleState) {
+                return false;
+            }
+            return System.nanoTime() - sliceEnd < 0L;
+        }
+
+        /**
+         * Blames a late body on idle work when an idle slice just ran.
+         *
+         * <p>A body that follows a slice closely is the one the slice could have delayed; a body that
+         * starts long after the last slice is late for its own reasons (a grant that waited, the OS, a
+         * previous body) and must not trip the guard. The window is the only heuristic in the whole
+         * path, and it errs towards not blaming idle work: missing a violation costs a little lag,
+         * blaming the wrong one disables a safe feature.
+         *
+         * @param deadline deadline of the body that is about to start
+         */
+        private void recordIdleLag(final long deadline) {
+            final long last = this.idleWorkEndNanos;
+            if (last == 0L) {
+                return;
+            }
+            this.idleWorkEndNanos = 0L;
+            final long now = System.nanoTime();
+            if (now - last > IDLE_LAG_ATTRIBUTION_NANOS) {
+                return;
+            }
+            this.scheduler.recordAddedLag(Math.max(0L, now - deadline));
+        }
+
         @Override
         public void run() {
             try {
@@ -2222,11 +2657,29 @@ public final class KairosScheduler extends Scheduler {
 
                 switch (startStateType) {
                     case STATE_IDLE -> {
+                        final boolean idleJobs = this.scheduler.idleUtmiJobs;
                         while (this.state.state == STATE_IDLE) {
                             Thread.interrupted();
+                            final TickThreadRunnerState idleState = this.state;
+                            if (idleJobs) {
+                                this.runIdleJob(idleState);
+                                if (this.state.state != STATE_IDLE) {
+                                    // a tick was granted while the job ran; the next loop runs it
+                                    continue;
+                                }
+                                if (this.scheduler.halted) {
+                                    return;
+                                }
+                            }
                             // bounded on purpose: halt sets its flag before it unparks, and a park that
                             // lands between the two would otherwise never be woken
-                            LockSupport.parkNanos(IDLE_PARK_NANOS);
+                            if (idleJobs) {
+                                final long parkStart = System.nanoTime();
+                                LockSupport.parkNanos(IDLE_WORK_POLL_NANOS);
+                                this.scheduler.idleWaitNanos.add(System.nanoTime() - parkStart);
+                            } else {
+                                LockSupport.parkNanos(IDLE_PARK_NANOS);
+                            }
                             if (this.scheduler.halted) {
                                 return;
                             }
@@ -2235,13 +2688,25 @@ public final class KairosScheduler extends Scheduler {
 
                     case STATE_AWAITING_TICK -> {
                         final long deadline = this.scheduler.scheduledStart.applyAsLong(startStateTask.tick);
+                        if (this.scheduler.idleMidTick) {
+                            // one bounded pass while the permit waits for its deadline; the pass itself
+                            // stops at the slice end or the deadline, whichever comes first
+                            this.runMidTickPass(startState);
+                        }
+                        final boolean trackWait = this.scheduler.idleWork.armed();
                         while (this.state == startState) {
                             Thread.interrupted();
                             final long diff = deadline - System.nanoTime();
                             if (diff <= 0L) {
                                 break;
                             }
-                            LockSupport.parkNanos(startState, diff);
+                            if (trackWait) {
+                                final long parkStart = System.nanoTime();
+                                LockSupport.parkNanos(startState, diff);
+                                this.scheduler.idleWaitNanos.add(System.nanoTime() - parkStart);
+                            } else {
+                                LockSupport.parkNanos(startState, diff);
+                            }
                             if (this.scheduler.halted) {
                                 return;
                             }
@@ -2250,6 +2715,10 @@ public final class KairosScheduler extends Scheduler {
                         if (this.state != startState || !this.takeTask(startState, startStateTask)) {
                             continue;
                         }
+
+                        // measured before the body: the only work that can push a body past its
+                        // deadline is an idle slice, and only the guard cares about that number
+                        this.recordIdleLag(deadline);
 
                         // the body may be a catch-up body; the decision is made before the handle moves
                         this.scheduler.prepareBody(startStateTask);

@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.StringJoiner;
+import java.util.concurrent.TimeUnit;
 import org.jspecify.annotations.Nullable;
 
 /**
@@ -91,9 +92,45 @@ public final class KairosReport {
             + ", steals " + snapshot.stolenTicks()
             + ", catch-up " + snapshot.catchUpBursts() + " burst(s) / "
             + snapshot.catchUpTicks() + " tick(s)");
+        lines.add(INDENT + "idle work: " + describeIdleWork(snapshot.idleWork()));
         lines.add(INDENT + "leases: " + describeLeaseWait(snapshot.leaseWait()));
         lines.add(INDENT + "degraded: " + describeReasons(snapshot.degradedReasons()));
         return List.copyOf(lines);
+    }
+
+    /**
+     * Describes the idle path: what it is allowed to do, what it did and whether the guard turned it
+     * off. "off" tools are named explicitly so an operator can tell a disabled feature from a broken
+     * one.
+     *
+     * @param idle idle report of the snapshot
+     * @return one line without the leading indent
+     */
+    private static String describeIdleWork(final KairosSnapshot.IdleWork idle) {
+        if (!idle.enabled()) {
+            return "off (idle-work.enabled is false)";
+        }
+        if (!idle.midTick() && !idle.utmiJobs()) {
+            return "off (mid-tick and utmi-jobs are both false)";
+        }
+        final StringBuilder text = new StringBuilder(128);
+        text.append("on (mid-tick ").append(idle.midTick() ? "on" : "off")
+            .append(", utmi jobs ").append(idle.utmiJobs() ? "on" : "off");
+        if (idle.utmiJobs() && !idle.sourcePresent()) {
+            text.append(", no source");
+        }
+        text.append("); ").append(idle.jobsTaken()).append(" job(s), ")
+            .append(idle.midTickPasses()).append(" mid-tick pass(es), ")
+            .append(idle.preemptions()).append(" preemption(s), ")
+            .append(TimeUnit.NANOSECONDS.toMillis(idle.idleWorkNanos())).append(" ms spent, ")
+            .append(String.format(Locale.ROOT, "%.1f", idle.shareOfIdlePercent()))
+            .append("% of idle, added lag max ").append(idle.addedTickLagMaxMillis()).append(" ms; ");
+        if (idle.disabled() == KairosSnapshot.IdleWork.Disabled.NONE) {
+            text.append("self-protection: none");
+        } else {
+            text.append("self-protection: disabled (idle work added more lag than its budget)");
+        }
+        return text.toString();
     }
 
     private static String describeLeaseWait(final KairosSnapshot.LeaseWait leaseWait) {

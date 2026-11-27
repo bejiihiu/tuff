@@ -31,6 +31,13 @@ thread-management:
         local-queue-size: 0 # off by default: one shared queue
       lease:
         timeout-seconds: 0  # accounting only, no warning
+      idle-work:            # off by default: bounded housekeeping while a runner waits
+        enabled: false
+        mid-tick: false
+        utmi-jobs: false
+        slice-millis: 1
+        max-added-lag-millis: 5
+        max-share-percent: 25
 ```
 
 ## What it does
@@ -65,6 +72,17 @@ thread-management:
   period, so catching up is paced and never becomes a tick storm. Every body still goes through its
   own acquisition, so the one-permit-per-runner invariant, the cancellation check and the watchdog see
   exactly what they see on the stock path, and a cancelled region never gets a catch-up body.
+- **An idle thread may do a little housekeeping** (`idle-work`). Off by default, and it has two
+  independent sources. A runner that already holds a region's permit and is waiting for the deadline
+  may drain that region's intermediate tasks through the handle's own `hasTasks()` / `runTasks` path,
+  one bounded pass per wait, so the work happens between two ticks instead of at the start of the
+  next one. A runner with no permit at all may take one job from the thread layer's idle-safe source
+  (the only producer shipped is that layer's periodic metrics pass, offered once every five seconds
+  while the refresher keeps the other passes). A tick always wins: the pass checks the deadline before
+  the slice and the job's cancellation flag reads the runner state, so a granted tick stops both at
+  the next check. If idle work adds more than `max-added-lag-millis` to a body it disables itself
+  until the region is stable again, and `max-share-percent` caps the work per second. With
+  `enabled: false` neither source is touched: no handle is asked about tasks, no source is polled.
 - **A tick tends to come back to the same thread** (`affinity`). With `local-queue-size` above 0 a
   runner keeps the regions it just ticked in a bounded private queue instead of the one shared queue,
   so their thread locals and caches stay warm. The shared queue is still consulted, and an earlier
@@ -123,6 +141,12 @@ thread-management:
 | `region-execution.kairos.affinity.local-queue-size` | tuff.yml | `0` | ticks a runner may keep for itself; `0` keeps the single shared queue |
 | `region-execution.kairos.lease.timeout-seconds` | tuff.yml | `0` | permit wait that triggers a warning; `0` keeps the measurement only |
 | `region-execution.kairos.metrics.jfr` | tuff.yml | `false` | record every tick and every pass as JFR events; off costs one field read per tick |
+| `region-execution.kairos.idle-work.enabled` | tuff.yml | `false` | master switch of the idle path |
+| `region-execution.kairos.idle-work.mid-tick` | tuff.yml | `false` | let a waiting runner drain its region's intermediate tasks |
+| `region-execution.kairos.idle-work.utmi-jobs` | tuff.yml | `false` | let a parked runner take jobs from the thread layer's idle-safe source |
+| `region-execution.kairos.idle-work.slice-millis` | tuff.yml | `1` | most wall clock one idle slice may take, `1` to `100` |
+| `region-execution.kairos.idle-work.max-added-lag-millis` | tuff.yml | `5` | lateness a tick may suffer from idle work before it disables itself |
+| `region-execution.kairos.idle-work.max-share-percent` | tuff.yml | `25` | most of a one second window idle work may spend |
 
 Everything except `threaded-regions.threads` is restart only. The settings are read when the region
 scheduler starts; the scheduler object itself is created while `paper-global.yml` is being loaded, so
@@ -157,6 +181,7 @@ Tuff scheduler: Kairos (experimental) - status: ok
   supervisor: running; last decision grow (2 -> 3, target 4)
   fund events: spawned 1, retired 0
   ticks: affinity hits 214, steals 3, catch-up 7 burst(s) / 12 tick(s)
+  idle work: off (idle-work.enabled is false)
   leases: 812 measured, wait max queued 24 ms / parked 4 ms, 3 over the 100 ms timeout
   degraded: none
 ```
@@ -176,6 +201,10 @@ Tuff scheduler: Kairos (experimental) - status: ok
   late, and `catch-up bursts / tick(s)` are the bursts started and the extra bodies they ran.
 - `leases` is the permit accounting: grants measured, the worst wait before a permit existed, the
   worst wait after it existed, and the timeouts when a timeout is configured.
+- `idle work` names the sources and what they did: jobs and mid-tick passes taken, preemptions, wall
+  clock spent, its share of measured idle time, the worst lateness a body suffered because of it, and
+  whether the self-protection turned it off. A path that is off by configuration says so and reports
+  no numbers rather than zeros that look like a measurement.
 - `last decision` is `grow`, `shrink` or `idle` with the before, after and target of the last pass.
 - Under EDF or `WORK_STEALING` the command prints `no fund telemetry` and the configured thread count.
   Those schedulers have no fund, no supervisor and no wait queue this project can read; inventing a
@@ -237,6 +266,15 @@ same miss next to free headroom is a slow tick.
   once more than a skip would have allowed, with the same consequences for anything that counts
   ticks. That is why the cap exists, why the budget is required for it to engage at all, and why the
   default is exactly Folia's skip. Measure it on your own profile before enabling it.
+- **Idle work is bounded by its own measurement, not by the author's promise.** A slice is a wall
+  clock bound; a unit that ignores it is exactly what `max-added-lag-millis` exists for. The path
+  disables itself when a body that followed idle work starts too late and re-arms after five seconds
+  without another violation, so a bad unit costs one incident, not a permanent regression. Two limits
+  remain honest: a single long intermediate task cannot be preempted inside `runTasks` (the
+  work-stealing scheduler has the same property), and the added lag is attributed only when the body
+  starts within 100 ms of the last slice, so a violation near that boundary may go unblamed rather
+  than blaming an unrelated slow tick. Read [idle-safe work](../utmi/idle-work.md) before writing a
+  producer of your own.
 - **Not a faster scheduler.** Order and clamping are EDF's. Any gain must come from the elasticity
   and from the optional tick policies above; if a measurement shows none, the feature is expected to
   be removed rather than kept as a curiosity.
@@ -250,5 +288,7 @@ same miss next to free headroom is a slow tick.
 Set `scheduler: EDF` and restart. Kairos classes are not loaded and no Kairos thread exists on the
 EDF path. If you only want the stock tick behaviour back while staying on Kairos, set
 `catch-up.cap-ticks: 1`, `affinity.local-queue-size: 0` and `lease.timeout-seconds: 0` and restart:
-those three defaults are the ported Folia path, verified by the ordering parity test. Nothing
-migrates; the world is untouched.
+those three defaults are the ported Folia path, verified by the ordering parity test. Idle work has
+its own switch: `idle-work.enabled: false` (or a restart while it is already false) is the whole
+rollback, and it leaves no job, pass or guard behind because the path is checked before the handle or
+the source is touched. Nothing migrates; the world is untouched.

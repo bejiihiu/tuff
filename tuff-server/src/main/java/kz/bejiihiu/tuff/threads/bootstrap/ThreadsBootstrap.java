@@ -13,6 +13,7 @@ import kz.bejiihiu.tuff.threads.ThreadSpec;
 import kz.bejiihiu.tuff.threads.UnifiedThreadManager;
 import kz.bejiihiu.tuff.threads.bridge.RegionThreads;
 import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
+import kz.bejiihiu.tuff.threads.idle.MetricsIdleSource;
 import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
@@ -325,14 +326,20 @@ public final class ThreadsBootstrap {
      * ledger already deducted for this lane. Adding them back is what keeps the floor from being
      * subtracted twice; the reserve is already inside {@code usable} and is never removed here again.
      * The supervisor is created through the provider, under the {@code service} pool the sampler
-     * registered at L2, so it is accounted like any other Tuff thread.
+     * registered at L2, so it is accounted like any other Tuff thread. The idle source is the same
+     * layer's periodic metrics refresh; a scheduler with the idle path off never polls it, and one
+     * without a thread layer gets none at all.
      *
      * @param runtime running thread manager
      * @return the seams, never {@code null}
      */
     static KairosServices kairosServices(final ThreadManagerRuntime runtime) {
         final UnifiedThreadManager manager = runtime.manager();
-        return new KairosServices(new UtmiBudgetPort(manager), new UtmiSupervisorSource(manager));
+        return new KairosServices(
+            new UtmiBudgetPort(manager),
+            new UtmiSupervisorSource(manager),
+            new MetricsIdleSource(manager)
+        );
     }
 
     /**

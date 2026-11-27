@@ -116,6 +116,29 @@ thread-management:
         # (tuff.scheduler.Tick, tuff.scheduler.Fund). Off costs one field read per tick. Turn it on for
         # a measurement run, not permanently: the per-tick event is one event per tick per region.
         jfr: false
+      # Let tick threads do bounded housekeeping while they have nothing to tick. Off by default and
+      # experimental: it can only add work to a thread that is already parked, never to one that is
+      # ticking, and it is measured against the tick it precedes. Restart only.
+      idle-work:
+        # Master switch. Off means neither source below is touched and the fund behaves exactly like it
+        # did before this section existed.
+        enabled: false
+        # A runner that holds a region's permit and is waiting for the deadline may drain that region's
+        # intermediate tasks through the handle's own runTasks path, in one slice per wait.
+        mid-tick: false
+        # A runner with no permit at all may take a job from the thread layer's idle-safe source. The
+        # only producer shipped is the one-second metrics refresh of that layer; it runs at most once
+        # every five seconds on an idle fund, and the refresher thread keeps the rest.
+        utmi-jobs: false
+        # Wall clock one slice of idle work may take, in milliseconds. A slice that overruns is the
+        # signal below, not a second chance.
+        slice-millis: 1
+        # Lateness a tick may suffer because of idle work before the whole idle path disables itself.
+        # It re-arms after five seconds without another violation. 0 disables idle work on the first
+        # late tick.
+        max-added-lag-millis: 5
+        # Most of a one second window idle work may spend, in percent. 0 disables it as well.
+        max-share-percent: 25
 
   async-compute:
     # Older spelling of execution-pools.compute.managed below: both keys describe one switch and
