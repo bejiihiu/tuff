@@ -4,6 +4,10 @@ Real JMH runs of the compute engine on one developer machine. The module lives i
 `tuff-benchmarks`, depends on `:tuff-compute` only, is not part of `build` or CI, is not published and
 is not bundled into the server jar.
 
+This page covers in-process JMH measurements only. Process-level evidence against a real server jar -
+the scheduler comparison, its artifacts and its statistics - is documented in
+[`docs/bench/`](../bench/README.md).
+
 > **One run, current code.** Every table below was measured on the code that ships the wake-one
 > submission signal, the consumer quota resolved against platform workers plus virtual-lane permits,
 > and the deterministic lane accounting. The earlier "pre-fix" tables are gone; where a change is the
