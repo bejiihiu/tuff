@@ -21,6 +21,7 @@ import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import kz.bejiihiu.tuff.threads.ThreadSnapshot;
 import kz.bejiihiu.tuff.threads.internal.impl.budget.BudgetDeductions;
 import kz.bejiihiu.tuff.threads.internal.impl.controller.ResourceControllerImpl;
+import kz.bejiihiu.tuff.threads.internal.spi.PoolObservation;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolProbe;
 import org.junit.jupiter.api.Test;
 
@@ -470,7 +471,8 @@ class ResourceMetricsImplTest {
         final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
         final MetricsFixtures.FakeLeaseController controller = new MetricsFixtures.FakeLeaseController(2);
         final SheddingReport report = new SheddingReport(
-            1, true, 1, List.of(COMPUTE), "load shedding withholding 1 core(s) from compute"
+            1, true, SheddingReport.State.SHEDDING, 1, List.of(COMPUTE),
+            "load shedding withholding 1 core(s) from compute"
         );
         controller.shedding(report);
         controller.reasons(COMPUTE, DegradedReason.LOAD_SHEDDING);
@@ -493,6 +495,67 @@ class ResourceMetricsImplTest {
         assertEquals(List.of(DegradedReason.LOAD_SHEDDING), snapshot.pool(COMPUTE).orElseThrow().degradedReasons());
         assertTrue(snapshot.degradedReasons().contains(DegradedReason.LOAD_SHEDDING),
             "the top level union must not lose the controller's reason");
+    }
+
+    @Test
+    void anUnreadableProbeReportsUnknownNotZero() {
+        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
+        final PoolProbe unreadable = new MetricsFixtures.FakeProbe(
+            COMPUTE,
+            new MetricsFixtures.FakeObservation(0, 0, -1, -1, -1L, -1L, List.of())
+        );
+
+        final PoolSnapshot pool = this.metricsWithProbes(pools, List.of(unreadable))
+            .snapshot()
+            .pool(COMPUTE)
+            .orElseThrow();
+
+        assertEquals(-1, pool.activeThreads(), "a probe that cannot classify is unknown, not idle");
+        assertEquals(-1, pool.idleThreads());
+        assertEquals(-1L, pool.queuedTasks());
+        assertEquals(SaturationReport.Level.UNKNOWN, pool.saturation().level());
+    }
+
+    @Test
+    void aProbeThatThrowsReportsUnknownNotZero() {
+        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
+        final PoolProbe broken = new PoolProbe() {
+            @Override
+            public PoolId pool() {
+                return COMPUTE;
+            }
+
+            @Override
+            public PoolObservation observe() {
+                throw new IllegalStateException("the pool is gone");
+            }
+        };
+
+        final PoolSnapshot pool = this.metricsWithProbes(pools, List.of(broken))
+            .snapshot()
+            .pool(COMPUTE)
+            .orElseThrow();
+
+        assertEquals(-1, pool.activeThreads());
+        assertEquals(-1, pool.idleThreads());
+        assertEquals(SaturationReport.Level.UNKNOWN, pool.saturation().level());
+    }
+
+    @Test
+    void totalThreadsIsThePublishedThreadList() {
+        final MetricsFixtures.FakePools pools = new MetricsFixtures.FakePools(spec(COMPUTE, 1));
+        this.registry.put(COMPUTE, thread(11L, "registered-only", COMPUTE, Thread.State.RUNNABLE));
+        final Thread probeThread = new Thread(() -> { }, "probe-visible");
+        final PoolProbe probe = new MetricsFixtures.FakeProbe(
+            COMPUTE,
+            new MetricsFixtures.FakeObservation(1, 1, 1, 0, 0L, -1L, List.of(probeThread))
+        );
+
+        final ResourceSnapshot snapshot = this.metricsWithProbes(pools, List.of(probe)).snapshot();
+
+        assertEquals(1, snapshot.threads().size(), "the probe supplied the list");
+        assertEquals(snapshot.threads().size(), snapshot.totalThreads(),
+            "one moment, one list: the header must agree with the published threads");
     }
 
     private ResourceMetricsImpl metrics(final MetricsFixtures.FakePools pools, final MetricsConfig config) {

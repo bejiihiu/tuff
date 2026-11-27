@@ -22,9 +22,11 @@ import org.jspecify.annotations.Nullable;
  * and their reasons still go to the log and the snapshot, but nothing is applied. That is the honest
  * behaviour for "the layer observes; the engine owns its threads".
  *
- * <p>The budget formula lives here once: {@code budget = usable - reserve}, floored at one. The adapter
- * calls {@link #budgetFor(int, int)} from its own budget port, so the startup number and every later
- * change agree.
+ * <p>The budget formula lives in one place per number: the sink says what the pool owns
+ * ({@code poolBudget}, after its cap and any load shedding) and what its floor is ({@code minBudget});
+ * the monitor subtracts the reserve from that same base. The adapter's budget port calls the same
+ * {@link #budgetFor(int, int)}, so the startup number, every pressure change and the printed report
+ * cannot diverge.
  */
 public final class TickPressureMonitor implements TickSampleListener {
 
@@ -102,17 +104,24 @@ public final class TickPressureMonitor implements TickSampleListener {
         }
         final int usable = Math.max(1, this.usableCores.getAsInt());
         final @Nullable PressureBudgetSink current = this.sink;
+        final int poolBudget = current == null ? usable : Math.max(1, current.poolBudget(usable));
         final int ceiling = current == null
-            ? Math.max(0, usable - 1)
+            ? Math.max(0, poolBudget - 1)
             : Math.max(0, current.maxReserve(usable));
         final TickPressureController.Decision decision = this.controller.evaluate(signal, ceiling, nowNanos);
         final int budget = budgetFor(usable, decision.reserve());
+        final int applied = Math.max(
+            current == null ? 1 : Math.max(1, current.minBudget()),
+            budgetFor(poolBudget, decision.reserve())
+        );
         final TickPressureSnapshot snapshot = new TickPressureSnapshot(
             true,
             decision.state(),
             decision.reserve(),
             ceiling,
             budget,
+            poolBudget,
+            applied,
             usable,
             decision.reason(),
             signal
@@ -121,11 +130,13 @@ public final class TickPressureMonitor implements TickSampleListener {
         if (!decision.changed()) {
             return;
         }
-        LOGGER.info("{}; reserve {} of {} core(s), budget {} of {} ({} region(s), lag {}%, min TPS {}, max MSPT {})",
+        LOGGER.info("{}; reserve {} of {} core(s), budget {} applied of {} pool core(s), {} usable "
+                + "({} region(s), lag {}%, min TPS {}, max MSPT {})",
             describe(decision.reason()),
             decision.reserve(),
             ceiling,
-            budget,
+            applied,
+            poolBudget,
             usable,
             signal.regions(),
             Math.round(signal.lagFraction() * 100.0d),

@@ -98,6 +98,15 @@ public enum DegradedReason {
     CRITICAL_POOL_PRESSURE,
 
     /**
+     * The critical pools are promised more lease capacity than the machine has.
+     *
+     * <p>Their declared minimum is always honoured, so the arithmetic can overcommit on purpose. This
+     * reason makes that explicit: the excess above {@code usable} is best effort, and an operator who
+     * sees it knows the ledger is not lying about the guarantees it handed out.
+     */
+    CRITICAL_OVERCOMMIT,
+
+    /**
      * The pool's capacity is temporarily reduced to keep a critical lane alive.
      *
      * <p>Only non critical pools get this reason, only while load shedding is active, and never below

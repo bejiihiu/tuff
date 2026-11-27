@@ -36,7 +36,9 @@ thread-management:
     # with requests waiting while every non critical pool is already fully leased, the background pools
     # give up one core at a time (never below their declared minimum) and get it back after the critical
     # queue has been calm for a few seconds. Held work is never interrupted; only new leases are
-    # refused. Off keeps the budget fixed whatever the pressure. Needs a restart.
+    # refused. The trigger needs a critical pool that can lease, i.e. L3 or deeper; region execution and
+    # network are at most L2 in this build, so an enabled policy reports "dormant" and changes nothing.
+    # Off keeps the budget fixed whatever the pressure. Needs a restart.
     load-shedding: false
 
   lifecycle:
@@ -48,9 +50,10 @@ thread-management:
     monitor-threads: true
 
   region-execution:
-    # Let the thread layer create Folia's region tick threads and account their lifecycle. Off is
-    # observation only: Folia keeps its scheduler, its thread class and its order. Managed mode is a
-    # separate, reviewed step and needs its own load test, so the default is off.
+    # Let the thread layer account for Folia's region tick threads. Folia still creates, names and
+    # schedules them; the manager wraps the tick body so the thread is registered while it runs. It
+    # never creates these threads itself and never changes their class. Off is observation only.
+    # Managed mode is a separate, reviewed step and needs its own load test, so the default is off.
     managed: false
     # Must stay true. Folia owns tick order, catch up and region ownership; turning this off is
     # rejected at startup instead of being silently ignored.
@@ -96,7 +99,8 @@ thread-management:
       # second.
       cooldown-seconds: 5
       # Most cores the pool may give up, and how many move per decision. The pool never falls below
-      # its own min-threads.
+      # its own min-threads, and the budget it yields is the pool's own cap after its max-threads and
+      # load shedding, not the ledger's usable number.
       max-reserve-cores: 2
       step-cores: 1
 
@@ -122,8 +126,9 @@ thread-management:
       preserve-specialization: true
 
   metrics:
-    # Collect pool and thread state at all. With collection off the other flags have no effect,
-    # snapshots carry zeros and /tuff threads says that metrics are disabled.
+    # Collect pool and thread state at all. With collection off the other flags have no effect; the
+    # snapshot stays structural (registered pools, registry threads, -1 for everything unmeasured) and
+    # /tuff threads says that metrics are disabled. It never fakes measured zeros.
     enabled: true
     # Publish per pool counters and saturation.
     per-pool: true

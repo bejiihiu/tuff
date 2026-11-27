@@ -98,4 +98,17 @@ public interface ThreadRegistry {
      * @return an immutable list in thread id order, possibly empty
      */
     List<ThreadSnapshot> snapshot();
+
+    /**
+     * Checks whether the registry has stopped accepting registrations.
+     *
+     * <p>A wrapper built before shutdown can run after it; it asks here to tell "the manager is
+     * stopping" apart from a programming error, and runs its body unaccounted in the first case. The
+     * default answers {@code false}, for registries that have no lifecycle.
+     *
+     * @return {@code true} after the owner stopped the registry
+     */
+    default boolean isStopped() {
+        return false;
+    }
 }

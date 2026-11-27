@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -120,10 +121,12 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     private final Condition permitFreed = this.lock.newCondition();
     private final List<Waiter> waiters = new ArrayList<>();
     private final Map<Thread, Integer> heldPermits = new HashMap<>();
+    private final List<Runnable> capacityListeners = new CopyOnWriteArrayList<>();
     private final AtomicLong uids = new AtomicLong();
     private volatile Ledger ledger;
     private volatile Map<PoolId, Integer> shedShares = Map.of();
     private long sequence;
+    private long shedVersion;
     private int globalInUse;
     private int shedCores;
     private int calmEvaluations;
@@ -191,12 +194,23 @@ public final class ResourceControllerImpl implements ThreadResourceController {
                 .map(Map.Entry::getKey)
                 .sorted()
                 .toList();
+            final SheddingReport.State state;
+            if (!this.loadShedding) {
+                state = SheddingReport.State.OFF;
+            } else if (!this.criticalLanesManagedLocked()) {
+                state = SheddingReport.State.DORMANT;
+            } else if (this.shedCores > 0) {
+                state = SheddingReport.State.SHEDDING;
+            } else {
+                state = SheddingReport.State.ARMED;
+            }
             return new SheddingReport(
                 this.ledger.plan().criticalReserveCores(),
                 this.loadShedding,
+                state,
                 this.shedCores,
                 pools,
-                this.summaryLocked(pools)
+                this.summaryLocked(pools, state)
             );
         } finally {
             this.lock.unlock();
@@ -204,8 +218,24 @@ public final class ResourceControllerImpl implements ThreadResourceController {
     }
 
     @Override
+    public void addCapacityListener(final Runnable listener) {
+        Objects.requireNonNull(listener, "listener");
+        this.capacityListeners.add(listener);
+    }
+
+    @Override
+    public void removeCapacityListener(final Runnable listener) {
+        Objects.requireNonNull(listener, "listener");
+        this.capacityListeners.remove(listener);
+    }
+
+    @Override
     public List<DegradedReason> degradedReasons(final PoolId pool) {
         Objects.requireNonNull(pool, "pool");
+        // resolve first: a pool registered after the controller (the compute adapter's L4 spec, the
+        // sampler's service spec) is not in the ledger until something asks about it, and a reason list
+        // that silently skipped it would disagree with the snapshot
+        this.state(pool);
         this.lock.lock();
         try {
             final @Nullable PoolState state = this.ledger.states().get(pool);
@@ -453,6 +483,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
      * @param holder thread that asked for the lease
      */
     void releasePermit(final PoolId pool, final boolean global, final Thread holder) {
+        final boolean capacityChanged;
         this.lock.lock();
         try {
             final @Nullable PoolState state = this.ledger.states().get(pool);
@@ -465,9 +496,12 @@ public final class ResourceControllerImpl implements ThreadResourceController {
             this.heldPermits.computeIfPresent(holder, (ignored, count) -> count <= 1 ? null : count - 1);
             this.grantWaitersLocked();
             // after the hand off, so a critical request that was just served does not count as pressure
-            this.evaluateSheddingLocked(this.clock.nanoTime());
+            capacityChanged = this.evaluateSheddingLocked(this.clock.nanoTime());
         } finally {
             this.lock.unlock();
+        }
+        if (capacityChanged) {
+            this.fireCapacityChanged();
         }
     }
 
@@ -578,6 +612,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
         final Duration budget = waitBudget(request, untilDeadlineNanos(request, now));
         final long budgetNanos = nanos(budget);
         this.lock.lock();
+        boolean capacityChanged = false;
         try {
             if (this.closed) {
                 throw new IllegalStateException(
@@ -587,7 +622,7 @@ public final class ResourceControllerImpl implements ThreadResourceController {
             // every admission decision is a chance to notice a starving critical lane and to give the
             // withheld cores back once it has been quiet; the cooldown keeps this from moving on
             // every request
-            this.evaluateSheddingLocked(now);
+            capacityChanged = this.evaluateSheddingLocked(now);
             final @Nullable LeaseImpl immediate = this.tryGrantLocked(state, request, now, caller);
             if (immediate != null) {
                 return Optional.of(immediate);
@@ -632,6 +667,10 @@ public final class ResourceControllerImpl implements ThreadResourceController {
             }
         } finally {
             this.lock.unlock();
+            if (capacityChanged) {
+                // outside the lock: the listener re-reads the ledger and may take the lock again
+                this.fireCapacityChanged();
+            }
         }
     }
 
@@ -767,42 +806,45 @@ public final class ResourceControllerImpl implements ThreadResourceController {
      * point is to keep the non critical pools from oscillating.
      *
      * @param now current monotonic time
+     * @return {@code true} when the effective capacity of some pool changed and owners must re-read it
      */
-    private void evaluateSheddingLocked(final long now) {
+    private boolean evaluateSheddingLocked(final long now) {
+        final long before = this.shedVersion;
         if (!this.loadShedding) {
             if (this.shedCores != 0 || !this.shedShares.isEmpty()) {
                 this.shedCores = 0;
                 this.calmEvaluations = 0;
                 this.publishShedSharesLocked();
             }
-            return;
+            return before != this.shedVersion;
         }
         if (!this.criticalPressureLocked(now)) {
             if (this.shedCores == 0) {
                 this.calmEvaluations = 0;
-                return;
+                return false;
             }
             this.calmEvaluations++;
             if (this.calmEvaluations < SHED_CALM_EVALUATIONS || !this.cooldownElapsed(now)) {
-                return;
+                return false;
             }
             this.shedCores = Math.max(0, this.shedCores - SHED_STEP_CORES);
             this.calmEvaluations = 0;
             this.lastShedChangeNanos = now;
             this.publishShedSharesLocked();
-            return;
+            return before != this.shedVersion;
         }
         this.calmEvaluations = 0;
         if (!this.cooldownElapsed(now)) {
-            return;
+            return false;
         }
         final int headroom = this.shedHeadroomLocked();
         if (headroom <= 0) {
-            return;
+            return false;
         }
         this.shedCores += Math.min(SHED_STEP_CORES, headroom);
         this.lastShedChangeNanos = now;
         this.publishShedSharesLocked();
+        return before != this.shedVersion;
     }
 
     /**
@@ -915,7 +957,47 @@ public final class ResourceControllerImpl implements ThreadResourceController {
             }
         }
         this.shedCores -= remaining;
-        this.shedShares = Map.copyOf(shares);
+        final Map<PoolId, Integer> published = Map.copyOf(shares);
+        if (!published.equals(this.shedShares)) {
+            this.shedShares = published;
+            this.shedVersion++;
+        }
+    }
+
+    /**
+     * Checks whether any critical pool could lease capacity in this wiring.
+     *
+     * <p>The shedding trigger is a parked critical request, and a request can only be parked by a pool
+     * that got past the L3 gate in {@link #acquire(LeaseRequest)}. When region execution and network are
+     * at L2, as they are in the shipped wiring, the trigger is unreachable and the report says
+     * {@link SheddingReport.State#DORMANT} instead of pretending the protection is active.
+     *
+     * @return {@code true} when at least one critical pool is registered at capacity coverage
+     */
+    private boolean criticalLanesManagedLocked() {
+        for (final PoolState state : this.ledger.states().values()) {
+            if (state.critical && state.managed) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Calls every capacity listener after a change that no lease caused.
+     *
+     * <p>Called outside the controller lock: a listener typically re-reads {@link #budget(PoolId)} and
+     * resizes a pool, which may ask the controller again. A listener that throws is ignored - the ledger
+     * already moved and an owner's failure must not roll it back.
+     */
+    private void fireCapacityChanged() {
+        for (final Runnable listener : this.capacityListeners) {
+            try {
+                listener.run();
+            } catch (RuntimeException _) {
+                // an owner that cannot handle the change must not break admission
+            }
+        }
     }
 
     /**
@@ -949,28 +1031,31 @@ public final class ResourceControllerImpl implements ThreadResourceController {
      * Builds the one printable line of the shedding report.
      *
      * @param pools pools currently reduced, in id order
+     * @param state what the policy is doing in this wiring
      * @return the summary, never blank
      */
-    private String summaryLocked(final List<PoolId> pools) {
+    private String summaryLocked(final List<PoolId> pools, final SheddingReport.State state) {
         final int reserve = this.ledger.plan().criticalReserveCores();
         final String held = reserve > 0
             ? reserve + " core(s) held for the critical lanes"
             : "no core held for the critical lanes";
-        if (!this.loadShedding) {
-            return held + "; load shedding off";
-        }
-        if (this.shedCores <= 0) {
-            return held + "; load shedding on, nothing withheld";
-        }
-        final StringBuilder names = new StringBuilder();
-        for (final PoolId pool : pools) {
-            if (!names.isEmpty()) {
-                names.append(", ");
+        return switch (state) {
+            case OFF -> held + "; load shedding off";
+            case DORMANT -> held + "; load shedding on but dormant: no critical pool can lease capacity "
+                + "(region and network are at most L2), so the trigger cannot fire";
+            case ARMED -> held + "; load shedding on, nothing withheld";
+            case SHEDDING -> {
+                final StringBuilder names = new StringBuilder();
+                for (final PoolId pool : pools) {
+                    if (!names.isEmpty()) {
+                        names.append(", ");
+                    }
+                    names.append(pool.value());
+                }
+                yield "load shedding withholding " + this.shedCores + " core(s) from " + names
+                    + " while a critical pool waits; " + held;
             }
-            names.append(pool.value());
-        }
-        return "load shedding withholding " + this.shedCores + " core(s) from " + names
-            + " while a critical pool waits; " + held;
+        };
     }
 
     /**

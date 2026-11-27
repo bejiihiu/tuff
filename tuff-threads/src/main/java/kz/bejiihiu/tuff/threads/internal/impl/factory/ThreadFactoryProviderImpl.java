@@ -91,11 +91,25 @@ public final class ThreadFactoryProviderImpl implements ThreadFactoryProvider {
 
         return () -> {
             final Thread current = Thread.currentThread();
-            this.registry.register(current, spec.pool());
+            boolean registered;
+            try {
+                this.registry.register(current, spec.pool());
+                registered = true;
+            } catch (IllegalStateException ex) {
+                // the wrapper outlived the layer: the registry stopped between building this runnable
+                // and its first run. for a region body this is the tick path, so throwing here would
+                // abort a tick over bookkeeping; run unaccounted instead. anything else is a real bug
+                if (!this.registry.isStopped()) {
+                    throw ex;
+                }
+                registered = false;
+            }
             try {
                 body.run();
             } finally {
-                this.registry.unregister(current);
+                if (registered) {
+                    this.registry.unregister(current);
+                }
             }
         };
     }

@@ -48,10 +48,25 @@ public final class TickPressureEvent extends Event {
     public int maxReserveCores;
 
     /**
-     * Processor budget the pool should run at.
+     * Processor budget the pool should run at, as the ledger level estimate {@code usable - reserve}.
+     *
+     * <p>Kept for continuity with older recordings; {@link #appliedBudget} is the number the engine
+     * actually received.
      */
     @Label("Budget")
     public int budget;
+
+    /**
+     * Compute pool capacity before the reserve, after its cap and any load shedding.
+     */
+    @Label("Pool Budget")
+    public int poolBudget;
+
+    /**
+     * Processor budget actually applied to the engine.
+     */
+    @Label("Applied Budget")
+    public int appliedBudget;
 
     /**
      * Budget ledger's usable cores at the time of the decision.
@@ -102,6 +117,8 @@ public final class TickPressureEvent extends Event {
             event.reserveCores = snapshot.reserve();
             event.maxReserveCores = snapshot.maxReserve();
             event.budget = snapshot.budget();
+            event.poolBudget = snapshot.poolBudget();
+            event.appliedBudget = snapshot.appliedBudget();
             event.usableCores = snapshot.usableCores();
             event.regions = snapshot.signal().regions();
             event.lagFraction = snapshot.signal().lagFraction();

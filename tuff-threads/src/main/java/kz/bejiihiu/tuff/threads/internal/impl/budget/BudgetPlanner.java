@@ -32,8 +32,11 @@ import kz.bejiihiu.tuff.threads.internal.spi.TopologyView;
  *
  * <p>Pools that share what is left (compute, service, virtual) resolve against {@code usable}. Their
  * declared caps can add up to more than {@code usable} - a hundred elastic pools with share {@code 1.0}
- * is normal configuration - so the sum is capped proportionally and the plan says so. Reserves are the
- * guaranteed part of a budget and the only thing that may be oversubscribed; that is reported too.
+ * is normal configuration - so the shared remainder is divided: declared minimums are funded first,
+ * fixed budgets before elastic ones, and the space above them is split in proportion to each pool's
+ * remaining headroom. An elastic minimum that no longer fits is reported as a shortfall instead of
+ * being invented. Reserves are the guaranteed part of a budget and the only thing that may be
+ * oversubscribed; that is reported too.
  *
  * <p>{@link #plan(List)} may be called once per planner. A second call is rejected instead of returning
  * a slightly different ledger, because two live ledgers are worse than a stale one. The controller
@@ -178,9 +181,9 @@ public final class BudgetPlanner {
         if (sharedDemand > shared) {
             reasons.add(
                 "shared pool caps reach " + sharedDemand + " cores but only " + shared
-                    + " are usable; dividing the remainder proportionally instead of overcommitting"
+                    + " are usable; funding declared minimums first, then dividing the remainder"
             );
-            budgets = divideUsable(requested, sharedDemand, shared);
+            budgets = divideUsable(requested, shared);
         } else {
             budgets = requested;
         }
@@ -188,6 +191,16 @@ public final class BudgetPlanner {
             if (!budget.satisfied()) {
                 reasons.add(budget.degradedReason());
             }
+        }
+        final int criticalCapacity = budgets.stream()
+            .filter(PoolBudget::critical)
+            .mapToInt(PoolBudget::capacity)
+            .sum();
+        if (criticalCapacity > usable) {
+            reasons.add(
+                "critical pools may lease " + criticalCapacity + " cores, above the " + usable
+                    + " usable; the excess is best effort and is reported, not reserved twice"
+            );
         }
 
         if (beforeCritical <= 0) {
@@ -262,7 +275,9 @@ public final class BudgetPlanner {
         final boolean critical = spec.kind() == PoolKind.REGION_EXECUTION || spec.kind() == PoolKind.NETWORK;
         final int capacity = critical ? Math.max(capped, spec.minThreads()) : clampToShared(capped, shared);
         final int reserved = Math.min(spec.budget().reservedCores(), capacity);
-        return new PoolBudget(spec.id(), spec.kind(), spec.minThreads(), capped, reserved);
+        return new PoolBudget(
+            spec.id(), spec.kind(), spec.minThreads(), capped, reserved, spec.budget().isElastic()
+        );
     }
 
     /**
@@ -319,37 +334,105 @@ public final class BudgetPlanner {
     }
 
     /**
-     * Splits {@code usable} between the shared pools in proportion to their declared caps.
+     * Splits {@code usable} between the shared pools, funding declared minimums first.
      *
-     * <p>Largest remainder first, id order as the tie breaker, so the split is deterministic and the sum
-     * never exceeds the remainder. A pool may end up with zero permits: on a machine where the shared
-     * pools together asked for more than exists, every pool keeping at least one is exactly the
-     * overcommit the ledger is supposed to prevent.
+     * <p>The order is policy, not taste. Absolute (fixed) budgets come before elastic ones, because a
+     * fixed budget named a number while an elastic one asked for "whatever is left". Inside each group
+     * the id order keeps the result deterministic. That way a pool with a real thread and a one core
+     * claim (the service refresher, the virtual lane's pump) keeps its core even on a machine where the
+     * elastic pool's declared minimum no longer fits; the elastic pool is the one that reports the
+     * shortfall. What is left after the minimums is divided in proportion to each pool's remaining
+     * headroom, largest remainder first, id order as the tie breaker, so the sum never exceeds the
+     * remainder.
      *
      * @param budgets requested budgets in id order
-     * @param demand  sum of the shared caps
-     * @param usable  cores available to the shared pools
+     * @param usable  cores available to the shared pools, may be zero
      * @return budgets with capped shared capacities
      */
-    private static List<PoolBudget> divideUsable(
-        final List<PoolBudget> budgets,
-        final int demand,
-        final int usable
-    ) {
+    private static List<PoolBudget> divideUsable(final List<PoolBudget> budgets, final int usable) {
         final int[] allocated = new int[budgets.size()];
+        int remaining = Math.max(0, usable);
+        final List<Integer> order = new ArrayList<>(budgets.size());
+        for (int index = 0; index < budgets.size(); index++) {
+            if (sharesUsable(budgets.get(index))) {
+                order.add(index);
+            }
+        }
+        order.sort(Comparator
+            .comparingInt((Integer index) -> budgets.get(index).elastic() ? 1 : 0)
+            .thenComparing(index -> budgets.get(index).pool()));
+        for (final int index : order) {
+            final PoolBudget budget = budgets.get(index);
+            final int floor = Math.min(budget.minCores(), budget.maxCores());
+            final int funded = Math.min(floor, remaining);
+            allocated[index] = funded;
+            remaining -= funded;
+        }
+        if (remaining > 0) {
+            divideHeadroom(budgets, allocated, remaining);
+        }
+
+        final List<PoolBudget> capped = new ArrayList<>(budgets.size());
+        for (int index = 0; index < budgets.size(); index++) {
+            final PoolBudget budget = budgets.get(index);
+            if (!sharesUsable(budget)) {
+                capped.add(budget);
+                continue;
+            }
+            final int capacity = Math.min(budget.maxCores(), allocated[index]);
+            capped.add(new PoolBudget(
+                budget.pool(),
+                budget.kind(),
+                budget.minCores(),
+                capacity,
+                Math.min(budget.reservedCores(), capacity),
+                budget.elastic()
+            ));
+        }
+        return List.copyOf(capped);
+    }
+
+    /**
+     * Spreads what the minimums did not use in proportion to the pools' remaining headroom.
+     *
+     * <p>Largest remainder first, id order as the tie breaker: the same rule the ledger used before,
+     * just applied to the space above the funded minimums instead of the whole cap.
+     *
+     * @param budgets   requested budgets in id order
+     * @param allocated per pool allocation so far, updated in place
+     * @param remaining cores still unassigned, at least one
+     */
+    private static void divideHeadroom(
+        final List<PoolBudget> budgets,
+        final int[] allocated,
+        final int remaining
+    ) {
+        int headroomTotal = 0;
         final long[] remainder = new long[budgets.size()];
+        for (int index = 0; index < budgets.size(); index++) {
+            final PoolBudget budget = budgets.get(index);
+            if (!sharesUsable(budget)) {
+                continue;
+            }
+            headroomTotal += Math.max(0, budget.maxCores() - allocated[index]);
+        }
+        if (headroomTotal <= 0) {
+            return;
+        }
         int assigned = 0;
         for (int index = 0; index < budgets.size(); index++) {
             final PoolBudget budget = budgets.get(index);
             if (!sharesUsable(budget)) {
                 continue;
             }
-            final long scaled = (long) usable * budget.maxCores();
-            allocated[index] = (int) (scaled / demand);
-            remainder[index] = scaled % demand;
-            assigned += allocated[index];
+            final int headroom = Math.max(0, budget.maxCores() - allocated[index]);
+            final long scaled = (long) remaining * headroom;
+            final int share = (int) (scaled / headroomTotal);
+            allocated[index] += share;
+            remainder[index] = scaled % headroomTotal;
+            assigned += share;
         }
-        int leftover = usable - assigned;
+        int leftover = remaining - assigned;
         while (leftover > 0) {
             int best = -1;
             for (int index = 0; index < budgets.size(); index++) {
@@ -372,23 +455,5 @@ public final class BudgetPlanner {
             remainder[best] = -1L;
             leftover--;
         }
-
-        final List<PoolBudget> capped = new ArrayList<>(budgets.size());
-        for (int index = 0; index < budgets.size(); index++) {
-            final PoolBudget budget = budgets.get(index);
-            if (!sharesUsable(budget)) {
-                capped.add(budget);
-                continue;
-            }
-            final int capacity = Math.min(budget.maxCores(), allocated[index]);
-            capped.add(new PoolBudget(
-                budget.pool(),
-                budget.kind(),
-                budget.minCores(),
-                capacity,
-                Math.min(budget.reservedCores(), capacity)
-            ));
-        }
-        return List.copyOf(capped);
     }
 }

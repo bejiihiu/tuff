@@ -90,6 +90,9 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
         this.pressure = pressure;
         this.provider = manager.threadFactory();
         this.controller = manager.resources();
+        // load shedding moves a pool's effective capacity without a lease; the engine has to hear about
+        // it on the same admission decision, not on the next pressure sample
+        this.controller.addCapacityListener(this::capacityChanged);
         final String prefix = settings.workers().threadNamePrefix();
         this.platformProbe = new ComputePoolProbe(
             PoolId.COMPUTE, this::engineMetrics, prefix, settings.workers().minThreads()
@@ -185,15 +188,40 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
 
     @Override
     public int processors() {
-        // the controller's budget is already net of the reserves; asking it here is the whole point of
-        // the port, so nothing below subtracts region, chunk or IO threads a second time. the tick
-        // pressure reserve is the one subtraction on top: regions are late and the pool gives cores back
-        final int usable = Math.max(1, this.controller.usableCores());
-        final int poolBudget = this.controller.budget(PoolId.COMPUTE)
-            .map(budget -> Math.max(1, budget.resolveCores(usable)))
-            .orElse(usable);
+        // the controller's budget is already net of the reserves and of any shed, so the pool budget is
+        // the one base both the startup number and every later resize use. the tick pressure reserve is
+        // the one subtraction on top: regions are late and the pool gives cores back. the min-threads
+        // floor wins over both, because the engine will not run fewer workers than that anyway
+        final int poolBudget = this.poolBudget(Math.max(1, this.controller.usableCores()));
         final @Nullable TickPressureMonitor monitor = this.pressure;
-        return TickPressureMonitor.budgetFor(poolBudget, monitor == null ? 0 : monitor.reserve());
+        return this.applyReserve(poolBudget, monitor == null ? 0 : monitor.reserve());
+    }
+
+    /**
+     * Returns the compute pool's effective capacity, after load shedding and before pressure.
+     *
+     * <p>This is the number the adapter answers to {@link PressureBudgetSink#poolBudget(int)}; the
+     * monitor uses the same value so the printed budget and the applied one cannot diverge.
+     *
+     * @param usableCores budget ledger's usable cores, at least one
+     * @return the pool budget, at least one
+     */
+    private int poolBudget(final int usableCores) {
+        return this.controller.budget(PoolId.COMPUTE)
+            .map(budget -> Math.max(1, budget.resolveCores(usableCores)))
+            .orElse(usableCores);
+    }
+
+    /**
+     * Applies the tick pressure reserve to a pool budget, never below {@code min-threads}.
+     *
+     * @param poolBudget cores the pool owns right now
+     * @param reserve    cores it is yielding to the regions
+     * @return the processor budget to hand to the engine, at least the configured minimum
+     */
+    private int applyReserve(final int poolBudget, final int reserve) {
+        final int floor = Math.max(1, this.settings.workers().minThreads());
+        return Math.max(floor, TickPressureMonitor.budgetFor(poolBudget, reserve));
     }
 
     /**
@@ -265,7 +293,17 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
         if (!this.managed) {
             return base;
         }
-        return body -> base.newThread(this.accounted(PoolId.COMPUTE, name, body));
+        // the lane's pump is a platform thread of the virtual pool, not a compute worker: classifying
+        // it as compute made the pump show up twice (registry plus the lane's own count) and under the
+        // wrong pool
+        final PoolId pool = this.virtualPump(name) && this.manages(PoolId.COMPUTE_VIRTUAL)
+            ? PoolId.COMPUTE_VIRTUAL
+            : PoolId.COMPUTE;
+        return body -> base.newThread(this.accounted(pool, name, body));
+    }
+
+    private boolean virtualPump(final String name) {
+        return name.equals(this.settings.workers().threadNamePrefix() + "-virtual-pump");
     }
 
     private void register() {
@@ -303,11 +341,17 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
                     CoverageLevel.L2,
                     ResourceBudget.fixed(1, 0)
                 )
-                : PoolSpec.observeOnly(
+                : new PoolSpec(
                     PoolId.COMPUTE_VIRTUAL,
                     PoolKind.VIRTUAL,
                     OWNER,
-                    "virtual lane of the async compute engine"
+                    "virtual lane of the async compute engine (disabled)",
+                    0,
+                    -1,
+                    // a lane that is off owns nothing: registering it with the observe-only elastic
+                    // default made it a claimant of the shared remainder and halved the compute budget
+                    CoverageLevel.L1,
+                    ResourceBudget.fixed(0, 0)
                 ));
             this.managed = true;
             this.attachProbes();
@@ -356,6 +400,29 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
             .orElse(false);
     }
 
+    /**
+     * Re-applies the budget after the controller moved the pool's capacity.
+     *
+     * <p>Load shedding is the case: it withholds a core from the compute pool on an admission or release
+     * decision, and waiting for the next pressure sample would leave the engine sized for capacity it no
+     * longer has. The callback is registered once and calls the same {@code applyProcessorBudget} the
+     * pressure sink uses, so there is still one writer.
+     */
+    private void capacityChanged() {
+        if (!this.managed) {
+            return;
+        }
+        final @Nullable AsyncComputeScheduler current = this.engine;
+        if (current == null) {
+            return;
+        }
+        try {
+            current.applyProcessorBudget(this.processors());
+        } catch (RuntimeException ex) {
+            LOGGER.warn("Tuff compute: the engine refused the budget after a capacity change", ex);
+        }
+    }
+
     private @Nullable SchedulerMetrics engineMetrics() {
         final AsyncComputeScheduler current = this.engine;
         return current == null ? null : current.metrics();
@@ -381,13 +448,27 @@ public final class ComputeUtmiAdapter implements ComputeThreadFactoryPort, Compu
     private final class AdapterPressureSink implements PressureBudgetSink {
 
         @Override
+        public int poolBudget(final int usableCores) {
+            return ComputeUtmiAdapter.this.poolBudget(Math.max(1, usableCores));
+        }
+
+        @Override
+        public int minBudget() {
+            return Math.max(1, ComputeUtmiAdapter.this.settings.workers().minThreads());
+        }
+
+        @Override
         public int maxReserve(final int usableCores) {
             final @Nullable TickPressureMonitor monitor = ComputeUtmiAdapter.this.pressure;
             if (monitor == null) {
                 return 0;
             }
             final int configured = Math.max(0, monitor.maxReserveCores());
-            final int floor = Math.max(0, usableCores - ComputeUtmiAdapter.this.settings.workers().minThreads());
+            // the floor is the pool's own min-threads, and it applies to the pool budget - the same
+            // number the engine is sized from - not to the ledger's usable
+            final int floor = Math.max(0,
+                ComputeUtmiAdapter.this.poolBudget(Math.max(1, usableCores))
+                    - Math.max(1, ComputeUtmiAdapter.this.settings.workers().minThreads()));
             return Math.min(configured, floor);
         }
 

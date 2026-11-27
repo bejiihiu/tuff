@@ -40,12 +40,12 @@ manager, because the owner's checks key off the concrete thread class.
 | `chunk-worker` | L1 | L2 claim — `execution-pools.chunk-system.managed: true` | The spec is registered at L2 with `min 1`, but no owner hands over a factory or a body, so nothing is created or wrapped | L2 today; L2 is also the honest limit | L3+ needs a different queue: ordered streams carry sub-order values, and replacing them with a plain FIFO deadlocks chunk generation. The L2 claim is blocked on Moonrise handing its factory over before static init, not on the manager |
 | `chunk-io` | L1 | Same flag as `chunk-worker` | Same registration claim; `IO_POOL` keeps its own threads | L2 today | Same ordered-queue argument, plus `non-daemon` and the 60-second drain in `MoonriseCommon.haltExecutors` |
 | `network` | L1 | L2 claim — `execution-pools.network.managed: true` | Same registration claim; netty keeps its loops | L2 | An event loop owns its channels: parking or sharing it stalls every connection on it, and its affinity and graceful shutdown are netty's. L3 would need sizing authority over a pool whose size is already a netty contract |
-| `chat` | L0 | None | The chat decoration executor (`Async Chat Thread`) is not registered; the level is a gap in the inventory, not a claim | L2 | The pool is a `ThreadPoolExecutor` that `misc.chat-threads.chat-executor-core-size/-max-size` resizes at runtime. L2 must keep that class and those setters; L3 would silently break a documented user key. The chat filter worker is a different pool: non-daemon, blocking HTTP to an external service, and only ever L2 |
+| `chat` | L1 | None | The chat decoration executor (`Async Chat Thread`) is registered and observed by a probe at L1; it keeps its own `ThreadPoolExecutor` | L2 | L2 must keep that class and those setters, because `misc.chat-threads.chat-executor-core-size/-max-size` resizes it at runtime; L3 would silently break a documented user key. The chat filter worker is a different pool: non-daemon, blocking HTTP to an external service, and only ever L2 |
 | `service` | L2 for the registered pool | None; the sampler raises it | Only the refresher thread is in this pool; it is created through the provider with `min 1` and a one-core fixed budget | L2 today; L3 for a real background pool | The other service executors (`Util`, `MCUtil`, command builder, profiles) are separate pools with their own blocking and shutdown contracts, and none is registered yet |
-| `background` | L0 | None | `Util.backgroundExecutor` (the shared ForkJoinPool) is invisible to the layer | L2, L3 candidate | A ForkJoinPool grows workers when a task blocks, so a naive cap changes throughput instead of protecting it. L4 is out of the question: it is the JDK pool the whole server and its consumers already share |
+| `background` | L1 | None | `Util.backgroundExecutor` (the shared ForkJoinPool) is registered and observed by a probe at L1; it keeps its own threads and growth | L2, L3 candidate | A ForkJoinPool grows workers when a task blocks, so a naive cap changes throughput instead of protecting it. L4 is out of the question: it is the JDK pool the whole server and its consumers already share |
 
-`chat` and `background` are not canonical `PoolId`s in this build. L0 on those rows means "not
-registered", not "registered as an exception" — the level table's L0 covers both.
+`chat` and `background` are canonical `PoolId`s (`chat`, `background`), registered at L1 and backed by
+their probes; "L0" would mean no registry entry at all, which is not their state.
 
 ## What a printed level proves
 
@@ -113,6 +113,10 @@ are about how much it may take from everybody else on their behalf.
   `NETWORK` and whose coverage is at least L3 (they are the ones with permits to withhold) can lose
   capacity, and never below their declared minimum. An L1/L2 pool has no permits of its own, so it is
   not a shedding target.
+- **Shedding is dormant in this build.** Its trigger is a parked lease request from a critical pool,
+  and only a pool at L3 or deeper can call `acquire`. Region execution and network stop at L2 here, so
+  `/tuff threads` prints the policy as `dormant` instead of claiming an active protection. The reserve
+  above still applies; the dynamic half waits for a managed critical lane.
 - **The reserve is not a coverage promise.** `region-execution` at L2 still has Folia's threads and
   `network` at L2 still has netty's loops: the reserve protects the leases those pools may hold, not the
   threads their owners create. Nothing here moves a pool to L3/L4, and nothing here reshapes a queue.

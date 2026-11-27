@@ -94,9 +94,14 @@ public final class ThreadsReport {
             lines.addAll(describeRegions(pool));
         }
         if (snapshot.pools().isEmpty()) {
-            lines.add(INDENT + INDENT + (status.metricsEnabled()
-                ? "no pool is registered"
-                : "the pool list is unavailable while metrics are disabled"));
+            if (!status.metricsEnabled()) {
+                lines.add(INDENT + INDENT + "the pool list is unavailable while metrics are disabled");
+            } else if (!settings.metrics().perPool()) {
+                lines.add(INDENT + INDENT + "the pool list is off (thread-management.metrics.per-pool: false); "
+                    + "the totals and the thread list are still published");
+            } else {
+                lines.add(INDENT + INDENT + "no pool is registered");
+            }
         }
 
         if (!status.metricsEnabled()) {
@@ -191,7 +196,8 @@ public final class ThreadsReport {
         }
         return "pressure: " + (pressure.state() == TickPressureController.State.PRESSURE ? "yielding" : "normal")
             + ", reserve " + pressure.reserve() + " of " + pressure.maxReserve() + " core(s)"
-            + ", budget " + pressure.budget() + " of " + pressure.usableCores()
+            + ", budget " + pressure.appliedBudget() + " applied of " + pressure.poolBudget() + " pool core(s)"
+            + ", " + pressure.usableCores() + " usable"
             + "; lag " + Math.round(pressure.signal().lagFraction() * 100.0d) + '%'
             + ", min TPS " + describeTps(pressure.signal().minimumTps())
             + ", max MSPT " + describeMspt(pressure.signal().maximumMspt())
@@ -217,9 +223,6 @@ public final class ThreadsReport {
         final String held = shedding.criticalReserveCores() + " core(s) held for the critical lanes";
         if (!settings.resources().loadShedding()) {
             return held + "; load shedding off (thread-management.resources.load-shedding: false)";
-        }
-        if (!shedding.enabled()) {
-            return held + "; load shedding on";
         }
         return shedding.summary();
     }

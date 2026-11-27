@@ -153,6 +153,8 @@ class ThreadsReportTest {
             2,
             6,
             8,
+            6,
+            8,
             TickPressureController.Reason.LAG_STEP_UP,
             new TickSignal(true, 4, 0.5d, 17.2d, 41.0d)
         );
@@ -168,7 +170,8 @@ class ThreadsReportTest {
 
         final String text = String.join("\n", ThreadsReport.overview(status));
 
-        assertTrue(text.contains("pressure: yielding, reserve 2 of 2 core(s), budget 6 of 8"), text);
+        assertTrue(text.contains(
+            "pressure: yielding, reserve 2 of 2 core(s), budget 6 applied of 8 pool core(s), 8 usable"), text);
         assertTrue(text.contains("lag 50%, min TPS 17.2, max MSPT 41.0 ms"), text);
         assertTrue(text.contains("(LAG_STEP_UP)"), text);
     }
@@ -193,7 +196,7 @@ class ThreadsReportTest {
     @Test
     void theReserveLineExplainsTheCriticalReserveAndTheShed() {
         final SheddingReport report = new SheddingReport(
-            2, true, 1, List.of(PoolId.COMPUTE),
+            2, true, SheddingReport.State.SHEDDING, 1, List.of(PoolId.COMPUTE),
             "load shedding withholding 1 core(s) from compute while a critical pool waits; "
                 + "2 core(s) held for the critical lanes"
         );
@@ -228,6 +231,64 @@ class ThreadsReportTest {
             text.contains("reserve: 0 core(s) held for the critical lanes; load shedding off "
                 + "(thread-management.resources.load-shedding: false)"),
             text
+        );
+    }
+
+    @Test
+    void aDormantSheddingPolicySaysWhyItCannotFire() {
+        final SheddingReport dormant = new SheddingReport(
+            1, true, SheddingReport.State.DORMANT, 0, List.of(),
+            "1 core(s) held for the critical lanes; load shedding on but dormant: no critical pool can "
+                + "lease capacity (region and network are at most L2), so the trigger cannot fire"
+        );
+        final ResourceSnapshot snapshot = new ResourceSnapshot(
+            Instant.EPOCH, 8, 1, 4, 0, 4, 4, 0.0d, 0.0d, -1.0d, List.of(), List.of(), Set.of(), dormant
+        );
+        final ThreadsStatus status = new ThreadsStatus(
+            ThreadsStatus.State.RUNNING, settingsWithShedding(), snapshot, 0, 412L, true, null
+        );
+
+        final String text = String.join("\n", ThreadsReport.overview(status));
+
+        assertTrue(text.contains("reserve: 1 core(s) held for the critical lanes; load shedding on but dormant"), text);
+        assertTrue(text.contains("the trigger cannot fire"), text);
+    }
+
+    @Test
+    void anEmptyPoolListWithPerPoolOffIsNotReportedAsNoPools() {
+        final ThreadManagementSettings defaults = ThreadManagementSettings.defaults();
+        final ThreadManagementSettings settings = new ThreadManagementSettings(
+            defaults.enabled(),
+            defaults.resources(),
+            defaults.lifecycle(),
+            defaults.regionExecution(),
+            defaults.asyncCompute(),
+            defaults.executionPools(),
+            new ThreadManagementSettings.Metrics(true, false, true)
+        );
+        final ResourceSnapshot snapshot = new ResourceSnapshot(
+            Instant.EPOCH, 8, 1, 2, 1, 1, 2, 0.0d, 0.0d, -1.0d, List.of(), List.of(), Set.of()
+        );
+        final ThreadsStatus status = new ThreadsStatus(
+            ThreadsStatus.State.RUNNING, settings, snapshot, 0, 412L, true, null
+        );
+
+        final String text = String.join("\n", ThreadsReport.overview(status));
+
+        assertFalse(text.contains("no pool is registered"), text);
+        assertTrue(text.contains("thread-management.metrics.per-pool: false"), text);
+    }
+
+    private static ThreadManagementSettings settingsWithShedding() {
+        final ThreadManagementSettings defaults = ThreadManagementSettings.defaults();
+        return new ThreadManagementSettings(
+            defaults.enabled(),
+            new ThreadManagementSettings.Resources(true, 1, -1, true),
+            defaults.lifecycle(),
+            defaults.regionExecution(),
+            defaults.asyncCompute(),
+            defaults.executionPools(),
+            defaults.metrics()
         );
     }
 

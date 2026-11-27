@@ -21,8 +21,9 @@ import kz.bejiihiu.tuff.threads.PoolKind;
  * @param minCores      declared minimum in cores, zero for an observe-only pool
  * @param maxCores      budget ceiling in cores, never silently raised to the minimum
  * @param reservedCores guaranteed share inside the ceiling, clamped so it can never exceed it
+ * @param elastic       whether the pool asked for a share instead of an absolute count
  */
-public record PoolBudget(PoolId pool, PoolKind kind, int minCores, int maxCores, int reservedCores) {
+public record PoolBudget(PoolId pool, PoolKind kind, int minCores, int maxCores, int reservedCores, boolean elastic) {
 
     /**
      * Validates a pool budget.

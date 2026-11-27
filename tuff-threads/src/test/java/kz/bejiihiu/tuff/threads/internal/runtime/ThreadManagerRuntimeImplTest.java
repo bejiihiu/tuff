@@ -93,6 +93,26 @@ class ThreadManagerRuntimeImplTest {
     }
 
     @Test
+    void aMeasuredCriticalPressureMovesTheManagerState() {
+        final ThreadManagerRuntime runtime = this.factory.create(ThreadManagementSettings.defaults());
+        final UnifiedThreadManager manager = runtime.manager();
+        runtime.start();
+        // a critical lane whose guarantee cannot fit: the controller measures pressure without any
+        // parked request, and the manager has to surface that same reason as its own state
+        manager.pools().register(new PoolSpec(
+            PoolId.NETWORK, PoolKind.NETWORK, "test", "event loops", 100, -1, CoverageLevel.L3,
+            ResourceBudget.fixed(100, 0)
+        ));
+
+        assertEquals(UnifiedThreadManager.State.DEGRADED, manager.state());
+        assertTrue(manager.degradedReasons().contains(DegradedReason.CRITICAL_POOL_PRESSURE));
+        assertEquals(UnifiedThreadManager.State.DEGRADED, manager.state(),
+            "state() and degradedReasons() must tell the same story");
+
+        runtime.shutdown(Duration.ZERO);
+    }
+
+    @Test
     void startIsIdempotentAndCreatesNoThread() {
         final ThreadManagerRuntime runtime = this.factory.create(ThreadManagementSettings.defaults());
         final UnifiedThreadManager manager = runtime.manager();

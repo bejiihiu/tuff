@@ -253,15 +253,25 @@ public final class ThreadManagerImpl implements UnifiedThreadManager {
     /**
      * Collects the reasons the manager itself can see.
      *
+     * <p>Three sources, one set: what each spec implies about coverage and configuration, what the
+     * budget ledger could not honour, and what the controller measured - a critical pool under pressure
+     * is a measurement of the moment, so a `state()` that ignored it would disagree with `degraded:`.
+     *
      * @return the reasons, empty before the first registration
      */
     private Set<DegradedReason> managementReasons() {
         final Set<DegradedReason> reasons = new LinkedHashSet<>();
         for (final PoolSpec spec : this.pools.specs()) {
             reasons.addAll(this.specReasons(spec));
+            reasons.addAll(this.resources.degradedReasons(spec.id()));
         }
-        if (!this.pools.ids().isEmpty() && this.resources.plan().degraded()) {
-            reasons.add(DegradedReason.BUDGET_EXHAUSTED);
+        if (!this.pools.ids().isEmpty()) {
+            if (this.resources.plan().shortfall()) {
+                reasons.add(DegradedReason.BUDGET_EXHAUSTED);
+            }
+            if (this.resources.plan().criticalOvercommit()) {
+                reasons.add(DegradedReason.CRITICAL_OVERCOMMIT);
+            }
         }
         return reasons;
     }

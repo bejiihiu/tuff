@@ -356,6 +356,79 @@ class BudgetPlannerTest {
         assertFalse(plan.pool(PoolId.COMPUTE).isEmpty());
     }
 
+    @Test
+    void declaredMinimumsAreFundedBeforeTheElasticPool() {
+        final PoolSpec virtual = new PoolSpec(
+            PoolId.COMPUTE_VIRTUAL, PoolKind.VIRTUAL, "tuff-compute", "virtual lane", 1, 64,
+            CoverageLevel.L2, ResourceBudget.fixed(1, 0)
+        );
+        final PoolSpec service = new PoolSpec(
+            PoolId.SERVICE, PoolKind.SERVICE, "tuff", "services", 1, -1,
+            CoverageLevel.L2, ResourceBudget.fixed(1, 0)
+        );
+
+        final BudgetPlan plan = plan(8, BudgetDeductions.none(), List.of(compute(2), virtual, service));
+
+        assertEquals(5, plan.usableCores(), "8 cores: 6 ceiling, 1 reserve");
+        assertEquals(1, plan.pool(PoolId.COMPUTE_VIRTUAL).orElseThrow().capacity(),
+            "the lane's pump keeps its core even when the caps do not all fit");
+        assertEquals(1, plan.pool(PoolId.SERVICE).orElseThrow().capacity(),
+            "the service refresher keeps its core");
+        assertEquals(3, plan.pool(PoolId.COMPUTE).orElseThrow().capacity(),
+            "compute gets what the fixed claims left");
+        assertFalse(plan.degraded(), () -> "proportional division is not a shortfall: " + plan.degradedReasons());
+        assertTrue(
+            plan.degradedReasons().stream().anyMatch(reason -> reason.contains("funding declared minimums first")),
+            () -> "the division has to be explained, got " + plan.degradedReasons()
+        );
+    }
+
+    @Test
+    void aFixedBudgetWinsOverAnElasticMinimumOnATinyMachine() {
+        final PoolSpec virtual = new PoolSpec(
+            PoolId.COMPUTE_VIRTUAL, PoolKind.VIRTUAL, "tuff-compute", "virtual lane", 1, 64,
+            CoverageLevel.L2, ResourceBudget.fixed(1, 0)
+        );
+        final PoolSpec service = new PoolSpec(
+            PoolId.SERVICE, PoolKind.SERVICE, "tuff", "services", 1, -1,
+            CoverageLevel.L2, ResourceBudget.fixed(1, 0)
+        );
+
+        final BudgetPlan plan = plan(4, BudgetDeductions.none(), List.of(compute(2), virtual, service));
+
+        assertEquals(2, plan.usableCores(), "4 cores: 3 ceiling, 1 reserve");
+        assertEquals(1, plan.pool(PoolId.SERVICE).orElseThrow().capacity(),
+            "the real thread wins over the elastic minimum");
+        assertEquals(1, plan.pool(PoolId.COMPUTE_VIRTUAL).orElseThrow().capacity());
+        assertEquals(0, plan.pool(PoolId.COMPUTE).orElseThrow().capacity(),
+            "nothing is left, and zero is the honest answer");
+        assertFalse(plan.pool(PoolId.COMPUTE).orElseThrow().satisfied());
+        assertTrue(plan.degraded(), "an elastic minimum that does not fit is a real shortfall");
+        assertTrue(
+            plan.degradedReasons().stream().anyMatch(reason -> reason.contains("needs at least 2")),
+            () -> "the missing cores have to be named, got " + plan.degradedReasons()
+        );
+    }
+
+    @Test
+    void criticalCapacityAboveUsableIsReportedNotInvented() {
+        final PoolSpec network = new PoolSpec(
+            PoolId.NETWORK, PoolKind.NETWORK, "netty", "event loops", 1, -1,
+            CoverageLevel.L3, ResourceBudget.elastic(1.0d, 0)
+        );
+
+        final BudgetPlan plan = plan(16, BudgetDeductions.none(), List.of(network, compute(1)));
+
+        assertEquals(10, plan.usableCores(), "12 ceiling, 1 reserve, 1 critical guarantee");
+        assertEquals(12, plan.criticalCapacityCores(), "the critical cap resolves against the ceiling");
+        assertTrue(plan.criticalOvercommit());
+        assertTrue(
+            plan.degradedReasons().stream().anyMatch(reason -> reason.contains("critical pools may lease 12")),
+            () -> "the overcommit has to be reported, got " + plan.degradedReasons()
+        );
+        assertFalse(plan.degraded(), "the guarantees themselves still fit");
+    }
+
     /**
      * Mirrors the core deductions the server actually applies: Folia's tick thread formula, Moonrise's
      * worker formula and one IO thread.

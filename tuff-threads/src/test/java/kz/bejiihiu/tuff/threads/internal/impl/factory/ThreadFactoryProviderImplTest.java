@@ -239,6 +239,26 @@ class ThreadFactoryProviderImplTest {
     }
 
     @Test
+    void aWrapperBuiltBeforeTheRegistryStoppedStillRunsAfterIt() {
+        final ThreadSpec spec = ThreadSpec.of(POOL, "late-body", HANDLER);
+        final AtomicReference<Boolean> ran = new AtomicReference<>(false);
+        final Runnable wrapped = this.provider.wrap(spec, () -> {
+            ran.set(true);
+            assertTrue(this.provider.poolOf(Thread.currentThread()).isEmpty(),
+                "the stopped registry must not account a late body");
+        });
+
+        // the runtime order: the factory stops first, then the registry
+        this.provider.markStopped();
+        this.registry.markStopped();
+
+        wrapped.run();
+
+        assertEquals(Boolean.TRUE, ran.get(), "the body still runs; bookkeeping must not abort a tick");
+        assertTrue(this.registry.isStopped());
+    }
+
+    @Test
     void poolOfUnknownThreadIsEmpty() {
         final Thread thread = new Thread(() -> { }, "not-ours");
         assertTrue(this.provider.poolOf(thread).isEmpty());

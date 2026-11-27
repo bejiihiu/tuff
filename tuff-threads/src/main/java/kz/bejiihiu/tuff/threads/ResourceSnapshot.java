@@ -32,7 +32,8 @@ import java.util.Set;
  * @param capturedAt               moment the snapshot was taken
  * @param usableCores              cores left to managed pools by the budget ledger, at least one
  * @param reservedCores            cores kept out of the managed budget, as configured, at least zero
- * @param totalThreads             live registered threads
+ * @param totalThreads             live threads; with per thread publication on this is exactly
+ *                                 {@code threads.size()}
  * @param activeThreads            registered threads that are runnable
  * @param idleThreads              registered threads waiting for work
  * @param peakThreads              highest number of live registered threads since start

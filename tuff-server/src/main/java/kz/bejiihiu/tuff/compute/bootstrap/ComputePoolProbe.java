@@ -97,8 +97,11 @@ final class ComputePoolProbe implements PoolProbe {
         if (!lane.enabled()) {
             return Reading.empty();
         }
-        // the pump is the one platform thread the lane always has; the running virtual threads come
-        // from the lane itself. Idle stays unknown: the lane exposes running tasks, not pump state
+        // the pump is the one platform thread the lane always has, and the adapter registers it under
+        // this pool; the +1 is that same thread, not an additional one. the sampler takes the larger of
+        // this count and the threads it can enumerate, so the pump is never counted twice. the running
+        // virtual threads come from the lane itself; idle stays unknown because the lane exposes
+        // running tasks, not pump state
         return new Reading(lane.running() + 1, 1, lane.running(), -1, lane.queued(), -1L, List.of());
     }
 

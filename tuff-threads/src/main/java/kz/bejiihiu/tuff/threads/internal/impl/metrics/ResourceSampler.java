@@ -459,9 +459,16 @@ public final class ResourceSampler {
 
         for (final PoolSpec spec : this.pools.specs()) {
             final PoolId id = spec.id();
-            final @Nullable PoolObservation observation = observe(probeByPool.get(id));
+            final @Nullable PoolProbe probe = probeByPool.get(id);
+            final @Nullable PoolObservation observation = observe(probe);
             final List<ObservedThread> observed = new ArrayList<>();
             this.collect(observed, registeredByPool.remove(id), observation);
+            // a probe that threw, or one that answered "I cannot classify these threads" without naming
+            // any, is unknown - not a measured zero. a probe that can name its threads still falls back
+            // to their states, which is the honest reading
+            final boolean unreadable = probe != null
+                && (observation == null
+                    || (observation.activeThreads() < 0 && observation.idleThreads() < 0 && observed.isEmpty()));
 
             long cpuDelta = 0L;
             int cpuReadings = 0;
@@ -484,12 +491,16 @@ public final class ResourceSampler {
             final int coreThreads = observation == null ? spec.minThreads() : Math.max(0, observation.coreThreads());
             final int derivedActive = countState(observed, false);
             final int derivedIdle = countState(observed, true);
-            final int active = observation != null && observation.activeThreads() >= 0
-                ? Math.min(observation.activeThreads(), alive)
-                : derivedActive;
-            final int idle = observation != null && observation.idleThreads() >= 0
-                ? Math.min(observation.idleThreads(), alive)
-                : derivedIdle;
+            final int active = unreadable
+                ? -1
+                : observation != null && observation.activeThreads() >= 0
+                    ? Math.min(observation.activeThreads(), alive)
+                    : derivedActive;
+            final int idle = unreadable
+                ? -1
+                : observation != null && observation.idleThreads() >= 0
+                    ? Math.min(observation.idleThreads(), alive)
+                    : derivedIdle;
             final long queued = observation == null ? -1L : observation.queuedTasks();
             final long capacity = observation == null ? -1L : observation.queueCapacity();
             final double cpuLoad = cpuLoad(cpuSupported, windowed, observed.isEmpty(), cpuReadings, cpuDelta,
@@ -555,6 +566,15 @@ public final class ResourceSampler {
                     idleTotal++;
                 }
             }
+        }
+
+        if (policy.perThread()) {
+            // one moment, one list: with per thread publication on, the top level counts are exactly
+            // the published threads. a probe that reports a count it cannot enumerate belongs to its
+            // pool line only, so the header can never disagree with the list underneath it.
+            total = publishedThreads.size();
+            activeTotal = countSnapshotStates(publishedThreads, false);
+            idleTotal = countSnapshotStates(publishedThreads, true);
         }
 
         this.cpuBaseline = nextBaseline;

@@ -172,4 +172,33 @@ public interface ThreadResourceController {
      * @throws NullPointerException if {@code pool} is {@code null}
      */
     SaturationReport saturation(PoolId pool);
+
+    /**
+     * Registers a listener for effective capacity changes that no lease caused.
+     *
+     * <p>The one such change today is load shedding: the controller withholds a core from a pool and
+     * the pool's owner has to re-read {@link #budget(PoolId)} and resize. A listener is called once per
+     * change, after the ledger was updated, on the thread that made the admission decision. It must be
+     * quick and must not throw; a slow listener slows admission down.
+     *
+     * <p>The default ignores the listener, so a controller that never moves capacity needs no
+     * implementation. The server's controller does implement it.
+     *
+     * @param listener listener to call
+     */
+    default void addCapacityListener(final Runnable listener) {
+        // optional capability; a controller without dynamic capacity has nothing to report
+    }
+
+    /**
+     * Removes a capacity listener registered with {@link #addCapacityListener(Runnable)}.
+     *
+     * <p>Idempotent: removing a listener that was never added is not an error. The default ignores it,
+     * like {@link #addCapacityListener(Runnable)}.
+     *
+     * @param listener listener to remove
+     */
+    default void removeCapacityListener(final Runnable listener) {
+        // optional capability; see addCapacityListener
+    }
 }

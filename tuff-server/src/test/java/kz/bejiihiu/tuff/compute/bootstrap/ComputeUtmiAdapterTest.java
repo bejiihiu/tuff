@@ -1,29 +1,60 @@
 package kz.bejiihiu.tuff.compute.bootstrap;
 
 import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
+import kz.bejiihiu.tuff.compute.ComputeConsumer;
+import kz.bejiihiu.tuff.compute.ComputePriority;
+import kz.bejiihiu.tuff.compute.ComputeRequest;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
+import kz.bejiihiu.tuff.compute.ComputeTask;
+import kz.bejiihiu.tuff.compute.ComputeTaskHandle;
+import kz.bejiihiu.tuff.compute.ComputeTaskType;
+import kz.bejiihiu.tuff.compute.ConsumerPolicy;
 import kz.bejiihiu.tuff.compute.SchedulerMetrics;
 import kz.bejiihiu.tuff.compute.config.ComputeThreadBudget;
 import kz.bejiihiu.tuff.compute.internal.engine.impl.ComputeSchedulers;
 import kz.bejiihiu.tuff.compute.internal.spi.ComputeThreadFactoryPort;
 import kz.bejiihiu.tuff.compute.internal.util.ComputeClock;
 import kz.bejiihiu.tuff.threads.CoverageLevel;
+import kz.bejiihiu.tuff.threads.DegradedReason;
+import kz.bejiihiu.tuff.threads.Lease;
+import kz.bejiihiu.tuff.threads.LeaseRequest;
+import kz.bejiihiu.tuff.threads.LeaseTimeoutException;
 import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.PoolKind;
+import kz.bejiihiu.tuff.threads.PoolSnapshot;
 import kz.bejiihiu.tuff.threads.PoolSpec;
+import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
+import kz.bejiihiu.tuff.threads.ResourceBudget;
+import kz.bejiihiu.tuff.threads.ResourceSnapshot;
+import kz.bejiihiu.tuff.threads.SaturationReport;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
+import kz.bejiihiu.tuff.threads.ThreadResourceController;
+import kz.bejiihiu.tuff.threads.ThreadSnapshot;
+import kz.bejiihiu.tuff.threads.internal.impl.controller.ResourceControllerImpl;
+import kz.bejiihiu.tuff.threads.internal.impl.events.JfrThreadSink;
+import kz.bejiihiu.tuff.threads.internal.impl.metrics.SystemMonotonicClock;
 import kz.bejiihiu.tuff.threads.internal.runtime.DefaultThreadManagerFactory;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolObservation;
 import kz.bejiihiu.tuff.threads.internal.spi.ThreadManagerRuntime;
+import kz.bejiihiu.tuff.threads.internal.spi.TopologyView;
+import kz.bejiihiu.tuff.threads.pressure.TickPressureMonitor;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -213,10 +244,244 @@ class ComputeUtmiAdapterTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"8, 3, 2, 1", "16, 9, 7, 2"})
+    void tickPressureNeverDropsBelowMinThreadsAndReportsTheAppliedBudget(
+        final int cores,
+        final int poolBudget,
+        final int appliedAtCeiling,
+        final int reserveCeiling
+    ) {
+        final ThreadManagerRuntime started = this.start(true, cores);
+        this.registerService(started);
+        final TickPressureMonitor monitor = new TickPressureMonitor(
+            pressurePolicy(true), started.manager().resources()::usableCores
+        );
+        final ComputeUtmiAdapter adapter = ComputeUtmiAdapter.attach(started, ComputeSettings.defaults(), monitor);
+        monitor.bind(adapter.pressureSink());
+
+        assertEquals(poolBudget, started.manager().resources().budget(PoolId.COMPUTE).orElseThrow().cores(),
+            "the pool budget is what the division actually gave compute");
+
+        monitor.onSample(pass(calm()), 0L);
+        assertEquals(poolBudget, monitor.snapshot().appliedBudget(),
+            "without pressure the applied budget is the whole pool budget");
+
+        for (int second = 1; second <= 20; second++) {
+            monitor.onSample(pass(lagging()), TimeUnit.SECONDS.toNanos(second));
+        }
+
+        assertEquals(reserveCeiling, monitor.snapshot().reserve(),
+            "the configured ceiling is lowered by the min-threads floor");
+        assertEquals(appliedAtCeiling, monitor.snapshot().appliedBudget());
+        assertEquals(appliedAtCeiling, adapter.processors(),
+            "one arithmetic: the report and the engine get the same number");
+        assertTrue(adapter.processors() >= ComputeSettings.defaults().workers().minThreads(),
+            "the pool never falls below its own min-threads");
+        assertTrue(monitor.snapshot().poolBudget() >= adapter.processors());
+    }
+
+    @Test
+    void aDisabledVirtualLaneDoesNotClaimAnyOfTheComputeBudget() {
+        final ThreadManagerRuntime started = this.start(true, 16);
+        final ComputeSettings settings = withVirtualLane(ComputeSettings.defaults(), false);
+        final ComputeUtmiAdapter adapter = ComputeUtmiAdapter.attach(started, settings);
+
+        assertTrue(adapter.isManaged());
+        assertEquals(started.manager().resources().usableCores(),
+            started.manager().resources().budget(PoolId.COMPUTE).orElseThrow().cores(),
+            "a lane that is off owns nothing, so compute keeps the whole remainder");
+        final PoolSpec virtual = started.manager().pools().spec(PoolId.COMPUTE_VIRTUAL).orElseThrow();
+        assertEquals(CoverageLevel.L1, virtual.coverage());
+        assertEquals(0, virtual.budget().resolveCores(started.manager().resources().usableCores()),
+            "the disabled lane declares no cores, so it never joins the shared demand");
+        assertEquals(0, virtual.minThreads());
+    }
+
+    @Test
+    void aShedReachesTheEngineOnTheAdmissionDecisionThatCausedIt() throws InterruptedException {
+        final ThreadManagerRuntime started = this.start(true, 16, true);
+        started.manager().pools().register(new PoolSpec(
+            PoolId.NETWORK, PoolKind.NETWORK, "netty", "event loops", 1, -1, CoverageLevel.L3,
+            ResourceBudget.fixed(1, 0)
+        ));
+        final ComputeSettings settings = ComputeSettings.defaults();
+        final ComputeUtmiAdapter adapter = ComputeUtmiAdapter.attach(started, settings);
+        final RecordingEngine engine = new RecordingEngine(settings);
+        adapter.bind(engine);
+
+        final int capacity = started.manager().resources().budget(PoolId.COMPUTE).orElseThrow().cores();
+        final int before = adapter.processors();
+        assertEquals(capacity, before, "the pool budget is the engine budget while nothing is shed");
+        assertTrue(engine.budgets().isEmpty(), "binding alone does not resize anything");
+
+        final List<Lease> held = new ArrayList<>(capacity);
+        for (int core = 0; core < capacity; core++) {
+            held.add(started.manager().resources().acquire(
+                LeaseRequest.immediate(PoolId.COMPUTE, System.nanoTime() + TimeUnit.MINUTES.toNanos(1L))
+            ));
+        }
+        final Lease network = started.manager().resources().acquire(
+            LeaseRequest.immediate(PoolId.NETWORK, System.nanoTime() + TimeUnit.MINUTES.toNanos(1L))
+        );
+        final Thread waiter = new Thread(() -> {
+            try {
+                started.manager().resources().acquire(new LeaseRequest(
+                    PoolId.NETWORK,
+                    System.nanoTime() + TimeUnit.MINUTES.toNanos(1L),
+                    Duration.ofMinutes(1L)
+                ));
+            } catch (RuntimeException _) {
+                // the test owns the outcome
+            }
+        }, "adapter-shed-waiter");
+        waiter.setDaemon(true);
+        waiter.start();
+        this.awaitWaiting(started.manager().resources(), PoolId.NETWORK);
+
+        assertThrows(
+            LeaseTimeoutException.class,
+            () -> started.manager().resources().acquire(LeaseRequest.immediate(
+                PoolId.COMPUTE, System.nanoTime() + TimeUnit.MINUTES.toNanos(1L)
+            )),
+            "the pool is at its capacity"
+        );
+
+        assertEquals(List.of(before - 1), engine.budgets(),
+            "the shed must reach the engine without waiting for the next pressure sample");
+        assertEquals(before - 1, adapter.processors());
+
+        ((ResourceControllerImpl) started.manager().resources()).close();
+        waiter.join(5_000L);
+        network.release();
+        for (final Lease lease : held) {
+            lease.release();
+        }
+    }
+
+    @Test
+    void theVirtualPumpIsAccountedOnceUnderTheVirtualPool() {
+        final ThreadManagerRuntime started = this.start(true, 8);
+        final ComputeSettings settings = ComputeSettings.defaults();
+        final ComputeUtmiAdapter adapter = ComputeUtmiAdapter.attach(started, settings);
+        this.engine = ComputeSchedulers.create(settings, ComputeClock.system(), adapter, adapter);
+        this.engine.start();
+        adapter.bind(this.engine);
+        this.awaitMinimumWorkers();
+
+        final ResourceSnapshot snapshot = started.manager().metrics().snapshot();
+        final List<ThreadSnapshot> pumps = snapshot.threads().stream()
+            .filter(thread -> thread.name().contains("-virtual-pump"))
+            .toList();
+
+        assertEquals(1, pumps.size(), "one pump, accounted once: " + snapshot.threads());
+        assertEquals(PoolId.COMPUTE_VIRTUAL, pumps.getFirst().pool(), "the pump belongs to the virtual pool");
+        assertEquals(snapshot.threads().size(), snapshot.totalThreads(),
+            "the header must agree with the published thread list");
+    }
+
     private ThreadManagerRuntime start(final boolean managed) {
         this.runtime = new DefaultThreadManagerFactory().create(settings(managed));
         this.runtime.start();
         return this.runtime;
+    }
+
+    private ThreadManagerRuntime start(final boolean managed, final int cores) {
+        return this.start(managed, cores, false);
+    }
+
+    private ThreadManagerRuntime start(final boolean managed, final int cores, final boolean loadShedding) {
+        this.runtime = new DefaultThreadManagerFactory(
+            new SystemMonotonicClock(), topology(cores), new JfrThreadSink()
+        ).create(settings(managed, loadShedding));
+        this.runtime.start();
+        return this.runtime;
+    }
+
+    private static void registerService(final ThreadManagerRuntime runtime) {
+        runtime.manager().pools().register(new PoolSpec(
+            PoolId.SERVICE, PoolKind.SERVICE, "tuff", "service refresher", 1, -1, CoverageLevel.L2,
+            ResourceBudget.fixed(1, 0)
+        ));
+    }
+
+    private static TopologyView topology(final int cores) {
+        return new TopologyView() {
+            @Override
+            public int availableProcessors() {
+                return cores;
+            }
+
+            @Override
+            public int totalCores() {
+                return cores;
+            }
+
+            @Override
+            public boolean numaAvailable() {
+                return false;
+            }
+
+            @Override
+            public int numaNodeCount() {
+                return 1;
+            }
+        };
+    }
+
+    private static ComputeSettings withVirtualLane(final ComputeSettings base, final boolean enabled) {
+        return new ComputeSettings(
+            base.enabled(),
+            base.workers(),
+            base.queue(),
+            base.scheduling(),
+            base.consumers(),
+            base.metrics(),
+            base.adaptive(),
+            enabled ? ComputeSettings.Lanes.defaults() : ComputeSettings.Lanes.withoutVirtual(),
+            base.shutdownGracePeriod()
+        );
+    }
+
+    private static ThreadManagementSettings.AsyncCompute.TickPressure pressurePolicy(final boolean enabled) {
+        return new ThreadManagementSettings.AsyncCompute.TickPressure(
+            enabled, 0.25d, 19.0d, 19.5d, 3, 5, 2, 1
+        );
+    }
+
+    private static RegionPoolMetrics lagging() {
+        return new RegionPoolMetrics(4, 4.0d, 12.0d, 4.0d, 11.0d, 16.0d, 2, 0, 0, 16);
+    }
+
+    private static RegionPoolMetrics calm() {
+        return new RegionPoolMetrics(4, 2.0d, 2.0d, 2.0d, 2.0d, 20.0d, 0, 0, 0, 16);
+    }
+
+    private static ResourceSnapshot pass(final RegionPoolMetrics regions) {
+        final PoolSpec spec = PoolSpec.observeOnly(
+            PoolId.REGION_EXECUTION, PoolKind.REGION_EXECUTION, "folia", "region tick execution"
+        );
+        final PoolSnapshot pool = new PoolSnapshot(
+            spec, 4, 0, 0, 4, -1L, -1L, -1L, -1L, -1L, -1.0d,
+            SaturationReport.unknown(PoolId.REGION_EXECUTION),
+            List.of(DegradedReason.OBSERVE_ONLY),
+            Optional.of(regions)
+        );
+        return new ResourceSnapshot(
+            Instant.EPOCH, 10, 1, 4, 0, 4, 4, 0.0d, 0.0d, -1.0d, List.of(pool), List.of(),
+            Set.of(DegradedReason.OBSERVE_ONLY)
+        );
+    }
+
+    private void awaitWaiting(final ThreadResourceController controller, final PoolId pool) {
+        final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10L);
+        while (System.nanoTime() < deadline) {
+            if (controller.saturation(pool).queuedTasks() >= 1) {
+                return;
+            }
+            Thread.yield();
+        }
+        fail("no request parked in pool '" + pool + "'");
     }
 
     private void awaitMinimumWorkers() {
@@ -236,9 +501,13 @@ class ComputeUtmiAdapterTest {
     }
 
     private static ThreadManagementSettings settings(final boolean computeManaged) {
+        return settings(computeManaged, false);
+    }
+
+    private static ThreadManagementSettings settings(final boolean computeManaged, final boolean loadShedding) {
         return new ThreadManagementSettings(
             true,
-            ThreadManagementSettings.Resources.defaults(),
+            new ThreadManagementSettings.Resources(true, 1, -1, loadShedding),
             ThreadManagementSettings.Lifecycle.defaults(),
             ThreadManagementSettings.RegionExecution.defaults(),
             ThreadManagementSettings.AsyncCompute.defaults(),
@@ -270,6 +539,128 @@ class ComputeUtmiAdapterTest {
         } catch (InterruptedException _) {
             Thread.currentThread().interrupt();
             return false;
+        }
+    }
+
+    /**
+     * Engine that only records the budgets the adapter applies.
+     *
+     * <p>The real engine resizes its gate to the minimum while idle, so its concurrency limit is not a
+     * record of what was applied; this double records the calls themselves.
+     */
+    private static final class RecordingEngine implements AsyncComputeScheduler {
+
+        private final List<Integer> budgets = new ArrayList<>();
+        private final ComputeSettings settings;
+
+        private RecordingEngine(final ComputeSettings settings) {
+            this.settings = settings;
+        }
+
+        private List<Integer> budgets() {
+            return List.copyOf(this.budgets);
+        }
+
+        @Override
+        public void applyProcessorBudget(final int processors) {
+            if (processors < 1) {
+                throw new IllegalArgumentException("budget must be at least one, got " + processors);
+            }
+            this.budgets.add(processors);
+        }
+
+        @Override
+        public ComputeSettings settings() {
+            return this.settings;
+        }
+
+        @Override
+        public SchedulerMetrics metrics() {
+            throw new UnsupportedOperationException("the recording engine has no metrics");
+        }
+
+        @Override
+        public SchedulerState state() {
+            return SchedulerState.RUNNING;
+        }
+
+        @Override
+        public void start() {
+        }
+
+        @Override
+        public void shutdown() {
+        }
+
+        @Override
+        public void shutdown(final Duration gracePeriod) {
+        }
+
+        @Override
+        public boolean awaitTermination(final Duration timeout) {
+            return true;
+        }
+
+        @Override
+        public <T> CompletableFuture<T> submit(
+            final ComputeTask<T> task
+        ) {
+            throw new UnsupportedOperationException("the recording engine accepts no work");
+        }
+
+        @Override
+        public <T> CompletableFuture<T> submit(
+            final ComputePriority priority,
+            final ComputeTask<T> task
+        ) {
+            throw new UnsupportedOperationException("the recording engine accepts no work");
+        }
+
+        @Override
+        public <T> CompletableFuture<T> submit(
+            final String consumerId,
+            final ComputeTaskType taskType,
+            final ComputePriority priority,
+            final ComputeTask<T> task
+        ) {
+            throw new UnsupportedOperationException("the recording engine accepts no work");
+        }
+
+        @Override
+        public <T> ComputeTaskHandle<T> enqueue(
+            final ComputeRequest<T> request
+        ) {
+            throw new UnsupportedOperationException("the recording engine accepts no work");
+        }
+
+        @Override
+        public ComputeConsumer registerConsumer(
+            final ComputeConsumer consumer
+        ) {
+            throw new UnsupportedOperationException("the recording engine has no consumers");
+        }
+
+        @Override
+        public boolean unregisterConsumer(final String consumerId) {
+            return false;
+        }
+
+        @Override
+        public Optional<ComputeConsumer> consumer(final String consumerId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public Set<String> consumerIds() {
+            return Set.of();
+        }
+
+        @Override
+        public void updateConsumerPolicy(
+            final String consumerId,
+            final ConsumerPolicy policy
+        ) {
+            throw new UnsupportedOperationException("the recording engine has no consumers");
         }
     }
 }

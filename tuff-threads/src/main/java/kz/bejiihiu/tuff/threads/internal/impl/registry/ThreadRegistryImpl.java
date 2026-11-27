@@ -284,6 +284,7 @@ public final class ThreadRegistryImpl implements ThreadRegistry {
      *
      * @return {@code true} after {@link #markStopped()}
      */
+    @Override
     public boolean isStopped() {
         return this.stopped;
     }

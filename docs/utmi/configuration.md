@@ -204,8 +204,10 @@ TPS and the worst single tick - and the controller evaluates exactly that snapsh
 Every decision that moves the reserve is one log line with its reason and one `tuff.threads.TickPressure`
 event; a pass that could not read the regions keeps the current reserve instead of guessing. The budget
 is applied through the compute adapter and `applyProcessorBudget`, the same single writer the startup
-budget uses, so there is no second sizing path. With the pool unmanaged the decisions are still logged
-and printed, but nothing changes.
+budget uses, so there is no second sizing path. That number is `pool budget - reserve`, floored at
+`min-threads`; `/tuff threads` prints it as `budget N applied of M pool core(s)` and the ledger's
+`usable` next to it, because the pool may be capped by `max-threads` or by load shedding. With the pool
+unmanaged the decisions are still logged and printed, but nothing changes.
 
 The policy is read once at startup and is restart-only, like the rest of this section: the thresholds
 describe the monitor that was built, and silently changing them under a running controller would make
@@ -240,6 +242,12 @@ deducted from the ceiling yet, so a managed network pool's capacity above its mi
 combination, not a single number: a critical pool has a live parked request **and** every non critical
 managed pool is already at its capacity. A critical queue that waits on its own accounting, with idle
 background pools, is normal back pressure and does not move anything.
+
+A parked request is only possible for a pool at L3 or deeper. In this build `region-execution` and
+`network` stop at L2 - Folia and netty own their threads and queues - so an enabled policy reports
+itself as **dormant** in `/tuff threads` and in `snapshot().shedding().state()`: it costs nothing and
+it does not claim to protect anything. The trigger becomes reachable when a critical lane is registered
+at L3; the reserve above applies either way.
 
 Once it fires, the policy is fixed (there are no keys for it, because a policy tuned per second is not a
 policy):

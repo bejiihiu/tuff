@@ -108,10 +108,61 @@ public record BudgetPlan(
     /**
      * Checks whether some part of the ledger could not be honoured.
      *
-     * @return {@code true} when there is at least one reason
+     * <p>Only a hard shortfall counts: no headroom at all, a declared guarantee that does not fit, or a
+     * guarantee that the shared remainder cannot pay for. Proportional division of caps that add up to
+     * more than the remainder is normal - an elastic budget resolves to the whole remainder by
+     * definition - and stays in {@link #degradedReasons()} as an explanation without turning the
+     * manager's state into a permanent warning.
+     *
+     * @return {@code true} when at least one promise cannot be kept
      */
     public boolean degraded() {
-        return !this.degradedReasons.isEmpty();
+        return this.shortfall();
+    }
+
+    /**
+     * Checks whether the planner had to break a promise, not just round a cap down.
+     *
+     * @return {@code true} when there is no headroom or a pool is below its declared minimum
+     */
+    public boolean shortfall() {
+        if (this.rawUsableCores <= 0) {
+            return true;
+        }
+        for (final PoolBudget budget : this.pools) {
+            if (!budget.satisfied()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Sums what the critical pools may lease by contract.
+     *
+     * <p>A critical pool keeps its declared minimum even above the arithmetic, so this can exceed
+     * {@link #usableCores()}. That is the one deliberate overcommit in the ledger; the manager reports
+     * it instead of hiding it.
+     *
+     * @return core capacity of the critical pools, at least zero
+     */
+    public int criticalCapacityCores() {
+        int capacity = 0;
+        for (final PoolBudget budget : this.pools) {
+            if (budget.critical()) {
+                capacity += budget.capacity();
+            }
+        }
+        return capacity;
+    }
+
+    /**
+     * Checks whether the critical lanes are promised more capacity than the machine has.
+     *
+     * @return {@code true} when {@link #criticalCapacityCores()} exceeds {@link #usableCores()}
+     */
+    public boolean criticalOvercommit() {
+        return this.criticalCapacityCores() > this.usableCores();
     }
 
     /**

@@ -256,6 +256,47 @@ class LoadSheddingTest {
             "the floor survives the storm");
     }
 
+    @Test
+    void anEnabledPolicyWithoutACriticalLaneThatCanLeaseIsDormant() {
+        final PoolSpec networkBelowCapacityCoverage = new PoolSpec(
+            NETWORK,
+            PoolKind.NETWORK,
+            "netty",
+            "event loops",
+            1,
+            -1,
+            CoverageLevel.L2,
+            ResourceBudget.fixed(1, 0)
+        );
+        final ResourceControllerImpl controller = this.controller(
+            true, this.compute(1, 2), networkBelowCapacityCoverage
+        );
+        final List<Lease> compute = this.hold(controller, COMPUTE, 2);
+
+        // saturate the shared pool with admission decisions; a critical pool that cannot lease never
+        // parks a request, so the trigger has nothing to see
+        for (int attempt = 0; attempt < 10; attempt++) {
+            assertThrows(
+                LeaseTimeoutException.class,
+                () -> controller.acquire(LeaseRequest.immediate(COMPUTE, this.deadline()))
+            );
+            this.clock.advance(COOLDOWN_NANOS);
+        }
+
+        final SheddingReport report = controller.sheddingReport();
+        assertTrue(report.enabled(), "the flag is on");
+        assertEquals(SheddingReport.State.DORMANT, report.state(),
+            "region and network are at most L2, so nothing can ever be shed");
+        assertFalse(report.active());
+        assertEquals(0, report.shedCores());
+        assertEquals(2, controller.budget(COMPUTE).orElseThrow().cores(), "a dormant policy changes no budget");
+        assertTrue(report.summary().contains("dormant"), report.summary());
+
+        for (final Lease lease : compute) {
+            lease.release();
+        }
+    }
+
     private void trigger(final ResourceControllerImpl controller) {
         controller.acquire(LeaseRequest.immediate(COMPUTE, this.deadline()));
     }
