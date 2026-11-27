@@ -12,6 +12,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Fixtures for the scheduler soak tests: a tick that records every execution, a factory that can
@@ -61,7 +62,7 @@ final class SoakFixtures {
         private final AtomicLong cpuNanos = new AtomicLong();
         private final CountDownLatch done;
         private final BooleanSupplier halted;
-        private final BooleanSupplier profiler;
+        private final @Nullable BooleanSupplier profiler;
 
         private volatile long deadline;
         private volatile int remainingReschedules;
@@ -88,7 +89,7 @@ final class SoakFixtures {
             final long periodNanos,
             final CountDownLatch done,
             final BooleanSupplier halted,
-            final BooleanSupplier profiler
+            final @Nullable BooleanSupplier profiler
         ) {
             this.label = label;
             this.deadline = deadline;
@@ -332,7 +333,7 @@ final class SoakFixtures {
         boolean awaitEntered(final long timeoutMillis) {
             try {
                 return this.entered.await(timeoutMillis, TimeUnit.MILLISECONDS);
-            } catch (final InterruptedException failure) {
+            } catch (InterruptedException _) {
                 Thread.currentThread().interrupt();
                 return false;
             }

@@ -1,10 +1,10 @@
 package kz.bejiihiu.tuff.threads.soak;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReentrantLock;
 import kz.bejiihiu.tuff.threads.kairos.KairosGate;
 import kz.bejiihiu.tuff.threads.kairos.KairosTuning;
 import org.junit.jupiter.api.AfterEach;
@@ -23,11 +23,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * scheduler owes. Every tick reschedules a known number of times, so a double execution or a lost
  * execution changes a count that the test can read.
  *
- * <p>The churn storm schedules and cancels a thousand ticks. Each pair is issued under one test side
- * lock on purpose: with a queue present, cancelling an awaiting tick promotes a queued one, and that
- * transition is a separate, documented defect of the scheduler (the promoted tick is not re-registered
- * as awaiting). Keeping each pair atomic keeps this test about accounting rather than about a fault
- * that is not fixed yet.
+ * <p>The churn storm is fully concurrent: four threads schedule and cancel their own far-dated ticks
+ * at the same time. A cancel that frees a permit hands the replacement through the scheduler's grant
+ * transition, which is exercised here on purpose.
  */
 @Tag("soak")
 @Timeout(150)
@@ -68,32 +66,28 @@ class KairosPermitSoakTest {
     }
 
     @Test
-    void aScheduleCancelStormLeavesNoPermitBehind() throws InterruptedException {
+    void aConcurrentScheduleCancelStormLeavesNoPermitBehind() throws InterruptedException {
         final int permits = 4;
         this.rig = new KairosRig(permits, KairosTuning.fixed(), SoakFixtures.FaultyThreadFactory.normal(), null);
         this.rig.start();
         final long far = System.nanoTime() + TimeUnit.HOURS.toNanos(1L);
         final CountDownLatch never = new CountDownLatch(1);
         final AtomicInteger cancelled = new AtomicInteger();
-        final ReentrantLock pair = new ReentrantLock();
+        final AtomicInteger failedCancel = new AtomicInteger();
         final int perThread = 400;
         final int stormThreads = 4;
-        final List<Thread> storm = new java.util.ArrayList<>();
+        final List<Thread> storm = new ArrayList<>();
         for (int thread = 0; thread < stormThreads; ++thread) {
             final int id = thread;
             storm.add(Thread.ofPlatform().name("churn-" + id).start(() -> {
                 for (int round = 0; round < perThread; ++round) {
-                    // a free permit is guaranteed here, so no queued tick can be promoted by the cancel
-                    pair.lock();
-                    try {
-                        final SoakFixtures.SoakTick tick = this.rig.tick(
-                            "churn-" + id + '-' + round, far, 0, 0L, 0L, never, null
-                        );
-                        if (this.rig.scheduler().cancel(tick)) {
-                            cancelled.incrementAndGet();
-                        }
-                    } finally {
-                        pair.unlock();
+                    final SoakFixtures.SoakTick tick = this.rig.tick(
+                        "churn-" + id + '-' + round, far, 0, 0L, 0L, never, null
+                    );
+                    if (this.rig.scheduler().cancel(tick)) {
+                        cancelled.incrementAndGet();
+                    } else {
+                        failedCancel.incrementAndGet();
                     }
                 }
             }));
@@ -102,7 +96,11 @@ class KairosPermitSoakTest {
             thread.join(30_000L);
             assertTrue(!thread.isAlive(), "the churn thread must finish");
         }
-        assertEquals(stormThreads * perThread, cancelled.get(), "every churn tick was waiting and must be cancelled");
+        assertEquals(
+            stormThreads * perThread,
+            cancelled.get(),
+            "every churn tick was waiting and must be cancelled; failed cancel calls: " + failedCancel.get()
+        );
         assertEquals(0, this.rig.permitsInUse(), "the storm must not leak a permit");
         for (final SoakFixtures.SoakTick tick : this.rig.ticks()) {
             assertEquals(0, tick.runs(), "a cancelled churn tick must never execute: " + tick);
@@ -120,8 +118,7 @@ class KairosPermitSoakTest {
         }
         this.rig.awaitQuiescent(15_000L);
         assertEquals(0, this.rig.permitsInUse(), "the storm must not leak a permit");
-        final int live = this.rig.scheduler().liveThreads();
-        assertEquals(permits, live, "a fixed fund keeps its size");
+        assertEquals(permits, this.rig.scheduler().liveThreads(), "a fixed fund keeps its size");
     }
 
     @Test

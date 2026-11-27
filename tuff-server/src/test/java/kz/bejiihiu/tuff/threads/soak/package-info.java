@@ -11,4 +11,7 @@
  * treats the scheduler as a black box, so a refactor inside the scheduler cannot silently remove the
  * evidence that the invariants still hold.
  */
+@NullMarked
 package kz.bejiihiu.tuff.threads.soak;
+
+import org.jspecify.annotations.NullMarked;

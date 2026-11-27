@@ -2,17 +2,19 @@ package kz.bejiihiu.tuff.threads.soak;
 
 import ca.spottedleaf.concurrentutil.scheduler.SchedulableTick;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 import kz.bejiihiu.tuff.threads.kairos.KairosGate;
 import kz.bejiihiu.tuff.threads.kairos.KairosScheduler;
 import kz.bejiihiu.tuff.threads.kairos.KairosServices;
 import kz.bejiihiu.tuff.threads.kairos.KairosSnapshot;
 import kz.bejiihiu.tuff.threads.kairos.KairosSupervisorSource;
 import kz.bejiihiu.tuff.threads.kairos.KairosTuning;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Drives one real {@link KairosScheduler} through its public seams.
@@ -30,8 +32,7 @@ final class KairosRig implements AutoCloseable {
     private final KairosScheduler scheduler;
     private final SoakFixtures.FaultyThreadFactory threads;
     private final AtomicBoolean halted = new AtomicBoolean();
-    private final List<SoakFixtures.SoakTick> ticks =
-        java.util.Collections.synchronizedList(new ArrayList<>());
+    private final List<SoakFixtures.SoakTick> ticks = Collections.synchronizedList(new ArrayList<>());
 
     /**
      * Arms the gate and builds a scheduler without starting it.
@@ -45,7 +46,7 @@ final class KairosRig implements AutoCloseable {
         final int floor,
         final KairosTuning tuning,
         final SoakFixtures.FaultyThreadFactory factory,
-        final KairosSupervisorSource source
+        final @Nullable KairosSupervisorSource source
     ) {
         this.threads = factory;
         KairosGate.arm(true, tuning, new KairosServices(null, source == null ? KairosSupervisorSource.plain() : source));
@@ -112,7 +113,7 @@ final class KairosRig implements AutoCloseable {
         final long runNanos,
         final long periodNanos,
         final CountDownLatch done,
-        final java.util.function.BooleanSupplier profiler
+        final @Nullable BooleanSupplier profiler
     ) {
         final SoakFixtures.SoakTick tick = new SoakFixtures.SoakTick(
             label, deadline, reschedules, runNanos, periodNanos, done, this.halted::get, profiler
@@ -205,7 +206,7 @@ final class KairosRig implements AutoCloseable {
         try {
             this.scheduler.halt();
             this.scheduler.join(TimeUnit.SECONDS.toMillis(20L));
-        } catch (final RuntimeException failure) {
+        } catch (RuntimeException _) {
             // cleanup only: a broken fund is reported by the test that drove it
         } finally {
             KairosGate.disarm();
