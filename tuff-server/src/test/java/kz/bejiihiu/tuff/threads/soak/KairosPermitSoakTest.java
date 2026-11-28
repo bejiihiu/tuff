@@ -52,14 +52,19 @@ class KairosPermitSoakTest {
             this.rig.tick("held-" + index, far, 0, 0L, 0L, never, null);
         }
         assertEquals(5, this.rig.permitsInUse(), "five scheduled ticks must be five held or waited permits");
+        assertEquals(5, this.rig.snapshot().scheduledTicks(), "five ticks must be five state entries");
+        this.rig.assertPermitAccounting();
 
         final List<SoakFixtures.SoakTick> ticks = this.rig.ticks();
         for (int index = 1; index < 5; ++index) {
             assertTrue(this.rig.scheduler().cancel(ticks.get(index)), "a queued tick must be cancellable: " + index);
         }
         assertEquals(1, this.rig.permitsInUse(), "cancelling four queued ticks must release exactly four permits");
+        assertEquals(1, this.rig.snapshot().scheduledTicks(), "four cancels must leave one state entry");
+        this.rig.assertPermitAccounting();
         assertTrue(this.rig.scheduler().cancel(ticks.getFirst()), "the last, awaiting tick must be cancellable");
         assertEquals(0, this.rig.permitsInUse(), "cancelling everything must leave no permit behind");
+        assertEquals(0, this.rig.snapshot().scheduledTicks(), "cancelling everything must empty the map");
         for (final SoakFixtures.SoakTick tick : ticks) {
             assertEquals(0, tick.runs(), "a tick cancelled before its deadline must not execute: " + tick);
         }
@@ -102,6 +107,8 @@ class KairosPermitSoakTest {
             "every churn tick was waiting and must be cancelled; failed cancel calls: " + failedCancel.get()
         );
         assertEquals(0, this.rig.permitsInUse(), "the storm must not leak a permit");
+        assertEquals(0, this.rig.snapshot().scheduledTicks(), "the storm must not leave a state entry");
+        this.rig.assertPermitAccounting();
         for (final SoakFixtures.SoakTick tick : this.rig.ticks()) {
             assertEquals(0, tick.runs(), "a cancelled churn tick must never execute: " + tick);
         }

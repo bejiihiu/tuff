@@ -45,6 +45,7 @@ import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -282,6 +283,53 @@ class RegionReliefTest {
         assertEquals(0L, this.relief.metrics().accepted());
         assertEquals(1L, this.relief.metrics().dropped());
         assertEquals(0, this.relief.metrics().inFlight());
+    }
+
+    @Test
+    void anOwnerPortThatRefusesTheTaskStillGetsTheDiscard() throws Exception {
+        this.start(reliefSettings(true, 8), 2);
+        final TestOwner owner = new TestOwner();
+        owner.refusingPort = true;
+        final CountDownLatch release = new CountDownLatch(1);
+        final ProbeWork work = new ProbeWork(7L, release);
+
+        assertTrue(this.onRegion(() -> this.relief.submit(owner, work)));
+        release.countDown();
+
+        assertTrue(work.terminal.await(10L, TimeUnit.SECONDS), "the terminal callback must still run");
+        assertEquals(1, work.discards.get(), "the discard is delivered exactly once");
+        assertEquals(Reason.DROPPED, work.discardReason.get());
+        assertEquals(0, work.applies.get(), "a refused port must not receive the result");
+        assertEquals(1L, this.relief.metrics().dropped());
+        assertEquals(0, this.relief.metrics().inFlight(), "the slot must be released");
+        assertNotSame(
+            this.regionThread,
+            work.callbackThread.get(),
+            "a port that refuses the task cannot be reached from the owner thread"
+        );
+    }
+
+    @Test
+    void anEnqueueRuntimeExceptionReleasesTheSlotAndRunsInline() {
+        final ComputeSettings compute = this.compute(true, 2, Map.of());
+        final FlakyEngine engine = new FlakyEngine(compute);
+        this.clock = new FakeClock();
+        final RegionReliefImpl service = new RegionReliefImpl(engine, reliefSettings(true, 1), this.clock);
+        final TestOwner owner = new TestOwner(Thread.currentThread());
+        engine.relief(service);
+
+        final ProbeWork first = new ProbeWork(7L);
+        assertFalse(service.submit(owner, first), "a request the engine never took runs inline");
+        assertEquals(1, first.applies.get());
+        assertEquals(1L, service.metrics().inlineFallbacks());
+
+        // the per-region slot is one, so a leak would make this second request fall back too
+        final ProbeWork second = new ProbeWork(7L);
+        assertTrue(service.submit(owner, second), "the reservation must have been returned");
+        assertEquals(1, second.applies.get(), "the accepted request is applied on the owner thread");
+        assertEquals(1L, service.metrics().accepted());
+        assertEquals(1L, service.metrics().inlineFallbacks(), "only the failed submission fell back");
+        assertEquals(0, service.metrics().inFlight());
     }
 
     @Test
@@ -527,6 +575,7 @@ class RegionReliefTest {
         private final Thread ownerThread;
         private volatile long currentEpoch = 7L;
         private volatile boolean runInline;
+        private volatile boolean refusingPort;
         private volatile boolean stopped;
 
         private TestOwner() {
@@ -554,6 +603,9 @@ class RegionReliefTest {
 
         @Override
         public void runOnOwner(final Runnable task) {
+            if (this.refusingPort) {
+                throw new IllegalStateException("the region refused the task");
+            }
             if (this.runInline || Thread.currentThread() == this.ownerThread) {
                 task.run();
                 return;
@@ -747,6 +799,120 @@ class RegionReliefTest {
     }
 
     /**
+     * Engine seam whose first submission fails with a plain runtime exception, which is what a queue
+     * hook or an eviction listener throwing looks like from the relief service.
+     */
+    private static final class FlakyEngine implements ComputeEngine {
+
+        private final ComputeSettings settings;
+        private final AtomicInteger failures = new AtomicInteger(1);
+        private volatile RegionRelief relief;
+
+        private FlakyEngine(final ComputeSettings settings) {
+            this.settings = settings;
+        }
+
+        private void relief(final RegionRelief service) {
+            this.relief = service;
+        }
+
+        @Override
+        public <T> ComputeTaskHandle<T> enqueue(final ComputeRequest<T> request) {
+            if (this.failures.getAndDecrement() > 0) {
+                throw new IllegalStateException("a queue hook rejected the submission");
+            }
+            // completes on the calling region thread, so the terminal decision runs inline there
+            final PendingHandle<T> handle = new PendingHandle<>(request);
+            try {
+                handle.complete(request.task().execute());
+            } catch (final Exception failure) {
+                handle.future().completeExceptionally(failure);
+            }
+            return handle;
+        }
+
+        @Override
+        public AsyncComputeScheduler.SchedulerState state() {
+            return AsyncComputeScheduler.SchedulerState.RUNNING;
+        }
+
+        @Override
+        public ComputeSettings settings() {
+            return this.settings;
+        }
+
+        @Override
+        public Optional<ComputeConsumer> consumer(final String consumerId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public void start() {
+            throw new AssertionError("the fake engine is started by construction");
+        }
+
+        @Override
+        public void shutdown(final Duration gracePeriod) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public void shutdownNow() {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public void applyProcessorBudget(final int processors) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public boolean awaitTermination(final Duration timeout) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public boolean cancel(final long taskId) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public ComputeConsumer registerConsumer(final ComputeConsumer consumer) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public boolean unregisterConsumer(final String consumerId) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public void updateConsumerPolicy(final String consumerId, final ConsumerPolicy policy) {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public Set<String> consumerIds() {
+            return Set.of();
+        }
+
+        @Override
+        public SchedulerMetrics metrics() {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public ComputeClock clock() {
+            throw new AssertionError("not used by this test");
+        }
+
+        @Override
+        public RegionRelief regionRelief() {
+            return this.relief;
+        }
+    }
+
+    /**
      * Handle of a task that never starts; cancellation completes it the way the engine would.
      *
      * @param <T> type of the produced value
@@ -788,6 +954,10 @@ class RegionReliefTest {
         @Override
         public CompletableFuture<T> future() {
             return this.future;
+        }
+
+        private void complete(final T value) {
+            this.future.complete(value);
         }
 
         @Override

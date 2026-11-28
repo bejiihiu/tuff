@@ -51,6 +51,32 @@ class MetricsIdleSourceTest {
     }
 
     @Test
+    void aSpentSliceDoesNotStartThePass() {
+        final MetricsIdleSource source = this.source();
+        final IdleWork work = source.poll();
+        assertNotNull(work, "the pass is due");
+
+        work.run(() -> false);
+
+        assertEquals(0, this.passes.get(), "a pass that has no slice left must not start");
+    }
+
+    @Test
+    void aStartedPassCompletesAndThePostCheckSeesTheSpentSlice() {
+        final MetricsIdleSource source = this.source();
+        final IdleWork work = source.poll();
+        assertNotNull(work);
+
+        // first answer is "go", the second one is the post check: the pass is atomic, so the contract
+        // is the one pass bound and the count proves it ran exactly once
+        final AtomicInteger answers = new AtomicInteger();
+        work.run(() -> answers.getAndIncrement() == 0);
+
+        assertEquals(1, this.passes.get(), "the atomic pass runs once and is not repeated");
+        assertEquals(2, answers.get(), "the unit checks the slice before and after the pass");
+    }
+
+    @Test
     void aStoppedLayerOffersNothing() {
         final MetricsIdleSource source = this.source();
         this.running.set(0);

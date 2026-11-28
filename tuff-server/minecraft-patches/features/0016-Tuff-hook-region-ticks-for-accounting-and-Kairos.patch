@@ -5,7 +5,7 @@ Subject: [PATCH] Tuff: hook region ticks for accounting and Kairos
 
 
 diff --git a/io/papermc/paper/threadedregions/TickRegionScheduler.java b/io/papermc/paper/threadedregions/TickRegionScheduler.java
-index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..bd528072ea2323ddae1ef8a46eb9f342d4068b17 100644
+index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..c4c67b57f4026e8e5467213d3426b0f772e442f4 100644
 --- a/io/papermc/paper/threadedregions/TickRegionScheduler.java
 +++ b/io/papermc/paper/threadedregions/TickRegionScheduler.java
 @@ -14,6 +14,9 @@ import ca.spottedleaf.moonrise.common.util.TickThread;
@@ -124,7 +124,7 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..bd528072ea2323ddae1ef8a46eb9f342
  
          public RegionScheduleHandle(final TickRegions.TickRegionData region, final long firstStart) {
              this.currentTick = 0L;
-@@ -340,6 +389,48 @@ public final class TickRegionScheduler {
+@@ -340,6 +389,62 @@ public final class TickRegionScheduler {
              this.tickSchedule.setLastPeriod(to == TimeUtil.DEADLINE_NOT_SET ? to : to - TIME_BETWEEN_TICKS);
          }
  
@@ -168,12 +168,26 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..bd528072ea2323ddae1ef8a46eb9f342
 +        public final void limitWriteOff(final long periods) {
 +            this.writeOffLimit = Math.max(0L, periods);
 +        }
++
++        /**
++         * Tuff start - the write off limit the next body will consume, or zero when none is pending.
++         *
++         * <p>A limit belongs to exactly one body: {@link #runTick()} reads it and clears it before the
++         * body starts, so a body that is not preceded by a new {@code limitWriteOff} call always sees
++         * the stock behaviour. This accessor exists so a subclass (and the regression test of this seam)
++         * can verify that consumption without touching the field.
++         *
++         * @return the pending limit, zero when the next body will write off the whole backlog
++         */
++        public final long pendingWriteOffLimit() {
++            return this.writeOffLimit;
++        }
 +        // Tuff end - bounded catch up
 +
          public final void markNonSchedulable() {
              this.cancelled.set(true);
          }
-@@ -430,7 +521,11 @@ public final class TickRegionScheduler {
+@@ -430,7 +535,14 @@ public final class TickRegionScheduler {
              final long tickStart = System.nanoTime();
  
              // use max(), don't assume that tickStart >= scheduledStart
@@ -181,12 +195,15 @@ index 5a72fa0d72bfdb927293abe921c57f6ae964a6ec..bd528072ea2323ddae1ef8a46eb9f342
 +            final long periodsAhead = this.tickSchedule.getPeriodsAhead(TIME_BETWEEN_TICKS, tickStart);
 +            // Tuff start - bounded catch up
 +            final long writeOff = this.writeOffLimit;
++            // the limit is consumed by this body only; keeping it here would make a handle that is not
++            // copied (or a copy that one day carries the field) write off a single period forever
++            this.writeOffLimit = 0L;
 +            final long tickCount = Math.max(1L, writeOff <= 0L ? periodsAhead : Math.min(periodsAhead, writeOff));
 +            // Tuff end - bounded catch up
  
              if (!this.tryMarkTicking()) {
                  if (!this.cancelled.get()) {
-@@ -505,6 +600,23 @@ public final class TickRegionScheduler {
+@@ -505,6 +617,23 @@ public final class TickRegionScheduler {
                  if (this.region != null) {
                      TickRegionScheduler.setTickingRegion(null);
                  }

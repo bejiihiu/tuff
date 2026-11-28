@@ -353,25 +353,34 @@ final class ThreadsConfigParser {
         final ConfigurationSection lease = readSection(kairos, "lease", LEASE_PATH, problems);
         final ConfigurationSection metrics = readSection(kairos, "metrics", KAIROS_METRICS_PATH, problems);
         final int cap = readIntIn(
-            catchUp, "cap-ticks", defaults.catchUpCapTicks(), CATCH_UP_PATH + ".cap-ticks", problems
+            catchUp, "cap-ticks", defaults.catchUpCapTicks(), 1, 64,
+            CATCH_UP_PATH + ".cap-ticks", problems
         );
         final int budget = readIntIn(
-            catchUp, "budget-millis", defaults.catchUpBudgetMillis(), CATCH_UP_PATH + ".budget-millis", problems
+            catchUp, "budget-millis", defaults.catchUpBudgetMillis(), 0, 600_000,
+            CATCH_UP_PATH + ".budget-millis", problems
         );
         final int stealThreshold = readIntIn(
-            steal, "threshold-millis", defaults.stealThresholdMillis(), STEAL_PATH + ".threshold-millis", problems
+            steal, "threshold-millis", defaults.stealThresholdMillis(), 0, 1_000,
+            STEAL_PATH + ".threshold-millis", problems
         );
         final int queueSize = readIntIn(
-            affinity, "local-queue-size", defaults.affinityQueueSize(), AFFINITY_PATH + ".local-queue-size", problems
+            affinity, "local-queue-size", defaults.affinityQueueSize(), 0, 256,
+            AFFINITY_PATH + ".local-queue-size", problems
         );
         final int leaseSeconds = readIntIn(
-            lease, "timeout-seconds", defaults.leaseTimeoutMillis() / 1000, LEASE_PATH + ".timeout-seconds", problems
+            lease, "timeout-seconds", defaults.leaseTimeoutMillis() / 1000, 0, 3_600,
+            LEASE_PATH + ".timeout-seconds", problems
         );
         final boolean jfr = metrics != null && readBoolean(
             metrics, "jfr", defaults.jfr(), KAIROS_METRICS_PATH + ".jfr", problems
         );
+        // long arithmetic on purpose: the width of the conversion is what used to turn a large but
+        // valid-looking seconds value into a negative millisecond one, and the kernel then rejected the
+        // whole block, resetting every other key with it
+        final long leaseMillis = Math.min(Integer.MAX_VALUE, (long) leaseSeconds * 1000L);
         try {
-            return new KairosKernel(cap, budget, queueSize, stealThreshold, leaseSeconds * 1000, jfr);
+            return new KairosKernel(cap, budget, queueSize, stealThreshold, (int) leaseMillis, jfr);
         } catch (final IllegalArgumentException ex) {
             problems.add(new ConfigProblem(CATCH_UP_PATH, "rejected (" + ex.getMessage() + "), using defaults"));
             return defaults;
@@ -636,11 +645,18 @@ final class ThreadsConfigParser {
     }
 
     /**
-     * Reads a whole number from an optional section.
+     * Reads a whole number from an optional section and enforces its documented range.
+     *
+     * <p>A value outside {@code [min, max]} is reported and replaced by the fallback of that one key.
+     * Accepting it would turn a soft tuning hint into a different behaviour: a local queue of 400 ticks
+     * is the latency trap the affinity path works to avoid, and a catch-up cap of two million would let
+     * one late region hold a permit for hours.
      *
      * @param section  section that holds the key, or {@code null} when the operator did not write it
      * @param key      key inside the section
-     * @param fallback value to use when the key or the section is missing
+     * @param fallback value to use when the key or the section is missing, or the value is out of range
+     * @param min      smallest accepted value, inclusive
+     * @param max      largest accepted value, inclusive
      * @param path     dotted path for the problem message
      * @param problems problem sink, appended to in place
      * @return the value, or the fallback
@@ -649,13 +665,22 @@ final class ThreadsConfigParser {
         final @Nullable ConfigurationSection section,
         final String key,
         final int fallback,
+        final int min,
+        final int max,
         final String path,
         final List<ConfigProblem> problems
     ) {
         if (section == null) {
             return fallback;
         }
-        return readInt(section, key, fallback, path, problems);
+        final int value = readInt(section, key, fallback, path, problems);
+        if (value < min || value > max) {
+            problems.add(new ConfigProblem(
+                path, "expected a value in [" + min + ", " + max + "], got " + value + "; using " + fallback
+            ));
+            return fallback;
+        }
+        return value;
     }
 
     private static double readDouble(

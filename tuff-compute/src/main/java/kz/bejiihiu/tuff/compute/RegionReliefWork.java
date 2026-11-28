@@ -94,9 +94,12 @@ public interface RegionReliefWork<S, R> {
     /**
      * Reports that the work reached a terminal state without being applied.
      *
-     * <p>Called at most once, only on the owning region thread, instead of {@link #apply(Object)}.
-     * Exactly one of {@code apply}, {@link #onFailure(Throwable)} and this method runs for one
-     * submitted request.
+     * <p>Called at most once, and exactly one of {@code apply}, {@link #onFailure(Throwable)} and
+     * this method runs for one submitted request. It runs on the owning region thread, with one
+     * documented exception: when the owner port refuses the terminal task outright, the discard is
+     * delivered from the thread that observed the completion (a compute worker, or the submitting
+     * region thread if the future was already complete). That thread is not the owner, so a handler is
+     * never allowed to rely on being on it.
      *
      * <p>The default does nothing. A handler must be fast, must not block and <b>must not mutate world
      * state</b>: none of these outcomes proves that the snapshot is still usable.

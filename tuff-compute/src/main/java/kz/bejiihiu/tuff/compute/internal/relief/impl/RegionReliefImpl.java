@@ -43,9 +43,12 @@ import org.jspecify.annotations.Nullable;
  * <p>Every submitted request ends in exactly one terminal call on the owning region thread:
  * {@link RegionReliefWork#apply(Object)} when the result is usable, {@link RegionReliefWork#onFailure}
  * when the computation or the applicator threw, and {@link RegionReliefWork#onDiscard} for stale,
- * expired, cancelled and dropped outcomes. The single exception is an owner port that runs the task
- * off the owner thread: the service then refuses to call anything and counts the request as dropped,
- * because invoking region code from the wrong thread is worse than losing the notification.
+ * expired, cancelled and dropped outcomes. Two exceptions exist, and both are counted as dropped
+ * because they cannot reach the owner thread: an owner port that runs the task off the owner thread
+ * (the service refuses to call anything, since invoking region code from the wrong thread is worse than
+ * losing the notification) and an owner port that refuses the task outright (the discard is then
+ * delivered from the thread that observed the completion, which is a compute worker unless the future
+ * was already complete when the callback was attached).
  *
  * <p>The in-flight counter and the per-owner slot are released by the same callback that makes the
  * terminal decision, so a request cannot leak a slot and a slot cannot outlive its last request.
@@ -151,6 +154,13 @@ public final class RegionReliefImpl implements RegionRelief {
                 task
             ));
         } catch (ComputeRejectedException | ComputeShutdownException _) {
+            this.releaseReservation(state);
+            return this.runInline(owner, work);
+        } catch (RuntimeException _) {
+            // the engine can also fail on a queue hook, an eviction listener or a closed structure.
+            // the request never reached the pool, so it takes the same fallback as a refusal - but the
+            // reservation has to be returned first, otherwise a few such failures would keep the region
+            // permanently over its in-flight cap
             this.releaseReservation(state);
             return this.runInline(owner, work);
         }
@@ -323,10 +333,19 @@ public final class RegionReliefImpl implements RegionRelief {
         try {
             request.owner.runOnOwner(() -> this.finishOnOwner(request, value, terminal, failure));
         } catch (RuntimeException _) {
-            // the region refused the task: the outcome cannot be delivered, so it is only counted
+            // the region refused the task, so the owner thread cannot be reached at all. losing the
+            // notification silently is worse than delivering it from here: the contract says every
+            // request ends in exactly one terminal call, and this is the one case where the call runs
+            // on the thread that observed the completion (a compute worker, or the submitting region
+            // thread when the future was already done) instead of the owner thread. the callback is
+            // documented to only observe, never mutate world state, which is why that is acceptable
             if (request.released.compareAndSet(false, true)) {
                 this.dropped.increment();
-                this.releaseSlot(request);
+                try {
+                    notifyDiscard(request.work, Reason.DROPPED);
+                } finally {
+                    this.releaseSlot(request);
+                }
             }
         }
     }

@@ -78,7 +78,10 @@ thread-management:
   independent sources. A runner that already holds a region's permit and is waiting for the deadline
   may drain that region's intermediate tasks through the handle's own `hasTasks()` / `runTasks` path,
   one bounded pass per wait, so the work happens between two ticks instead of at the start of the
-  next one. A runner with no permit at all may take one job from the thread layer's idle-safe source
+  next one. While that pass runs, the runner is not given another tick: the queue does not evict its
+  permit and a cancellation of the waiting tick parks the runner and lets it pick work up again when
+  the pass has returned, so a region can never be started twice. A runner with no permit at all may
+  take one job from the thread layer's idle-safe source
   (the only producer shipped is that layer's periodic metrics pass, offered once every five seconds
   while the refresher keeps the other passes). A tick always wins: the pass checks the deadline before
   the slice and the job's cancellation flag reads the runner state, so a granted tick stops both at
@@ -118,9 +121,12 @@ thread-management:
 - **A live thread is never recreated.** Growth appends a slot; shrink asks an idle runner to leave;
   a dead slot is reused by the next spawn. There is no `halt()` of a live runner, no migration and no
   `setThreadAllocation`-style rebuild. `getAliveThreads()` reflects the real fund at any moment.
-- **Shutdown is unchanged.** `halt()` sets the flag and unparks the supervisor and every runner;
-  `join(60s)` waits for the supervisor and for every thread that was ever created, including retired
-  ones. A spawn that loses the race with `halt()` exits at its first loop check.
+- **Shutdown is unchanged.** `halt()` sets the flag and unparks the supervisor and every runner; it
+  never waits, so it is safe from a tick thread. `join(60s)` waits for the supervisor and for every
+  thread that was ever created, including retired ones. A spawn holds a fence from its halt check to
+  the end of `thread.start()`, and the join waits for that fence and re-checks liveness after joining,
+  so a spawn that loses the race with `halt()` cannot leave a live thread behind a successful join. A
+  runner that is started after the flag is set exits at its first loop check.
 - **`threads` is live.** While the fund is elastic, `/tuff reload`'s `threaded-regions.threads` moves
   the floor: the supervisor grows towards it, and a lowered floor is drained one retire per second.
   While the fund is fixed the value is still restart only and logs a warning instead of silently
@@ -137,11 +143,11 @@ thread-management:
 | `region-execution.kairos.max-threads` | tuff.yml | `-1` | ceiling; `-1` means the thread layer budget when it runs, otherwise `floor(cores * 0.8)` |
 | `region-execution.kairos.keep-alive-seconds` | tuff.yml | `30` | how long a thread must sit idle before it may be retired |
 | `region-execution.kairos.spawn-rate-per-second` | tuff.yml | `10` | how many new tick threads may be started per second |
-| `region-execution.kairos.catch-up.cap-ticks` | tuff.yml | `1` | tick bodies one late region may run back to back; `1` is the stock skip, needs a budget above 0 |
-| `region-execution.kairos.catch-up.budget-millis` | tuff.yml | `50` | wall clock one catch-up burst may spend; `0` disables catch-up |
-| `region-execution.kairos.steal.threshold-millis` | tuff.yml | `3` | how late a kept tick must be before another runner may take it |
-| `region-execution.kairos.affinity.local-queue-size` | tuff.yml | `0` | ticks a runner may keep for itself; `0` keeps the single shared queue |
-| `region-execution.kairos.lease.timeout-seconds` | tuff.yml | `0` | permit wait that triggers a warning; `0` keeps the measurement only |
+| `region-execution.kairos.catch-up.cap-ticks` | tuff.yml | `1` | tick bodies one late region may run back to back, `1` to `64`; `1` is the stock skip, needs a budget above 0 |
+| `region-execution.kairos.catch-up.budget-millis` | tuff.yml | `50` | wall clock one catch-up burst may spend, `0` to `600000`; `0` disables catch-up |
+| `region-execution.kairos.steal.threshold-millis` | tuff.yml | `3` | how late a kept tick must be before another runner may take it, `0` to `1000` |
+| `region-execution.kairos.affinity.local-queue-size` | tuff.yml | `0` | ticks a runner may keep for itself, `0` to `256`; `0` keeps the single shared queue |
+| `region-execution.kairos.lease.timeout-seconds` | tuff.yml | `0` | permit wait that triggers a warning, `0` to `3600`; `0` keeps the measurement only |
 | `region-execution.metrics.jfr` | tuff.yml | `false` | record every executed tick body as `tuff.scheduler.Tick`, whatever scheduler runs it; off costs one volatile read per tick |
 | `region-execution.kairos.metrics.jfr` | tuff.yml | `false` | record every supervisor pass as `tuff.scheduler.Fund`; the per-tick event has its own switch above |
 | `region-execution.kairos.idle-work.enabled` | tuff.yml | `false` | master switch of the idle path |
@@ -180,7 +186,7 @@ never waits for a tick. The shape is fixed, the numbers are whatever the server 
 ```
 Tuff scheduler: Kairos (experimental) - status: ok
   fund: min 2, live 3, target 4, max 11; elasticity on, ceiling source: utmi budget (usable cores plus the deducted region threads)
-  queue: 1 queued, 2 awaiting, 0 executing; tick wait avg 40.0 ms, max 104.0 ms; overdue 1 (threshold 166 ms, oldest 180 ms)
+  queue: 1 queued, 2 awaiting, 0 executing (3 scheduled); tick wait avg 40.0 ms, max 104.0 ms; overdue 1 (threshold 166 ms, oldest 180 ms)
   supervisor: running; last decision grow (2 -> 3, target 4)
   fund events: spawned 1, retired 0
   ticks: affinity hits 214, steals 3, catch-up 7 burst(s) / 12 tick(s)
@@ -196,6 +202,11 @@ Tuff scheduler: Kairos (experimental) - status: ok
 - `tick wait avg / max` is the age of `scheduledStart` for ticks that are waiting. A tick whose
   deadline is still in the future contributes zero, so an idle queue and a queue of early ticks both
   read `0.0 ms`.
+- `scheduled` is the number of ticks the scheduler holds in total: queued, waiting for a deadline and
+  executing together. It is the other side of the permit accounting - `queued + awaiting + executing`
+  equals it unless a transition leaked an entry - and a cancelled tick leaves it immediately, so the
+  same handle may be scheduled again rather than answering "already scheduled" from an entry no queue
+  can see.
 - `overdue` counts waiting ticks in the shared queue **and** in runner backlogs, so affinity cannot
   hide a tick from the detector. `threshold` is two observed periods with a 100 ms floor: `100 ms` on
   a healthy 20 TPS server, `166 ms` at 12 TPS.
@@ -260,9 +271,14 @@ same miss next to free headroom is a slow tick.
 - **These are OS threads.** Every extra tick thread is a parked platform thread when idle. The fund
   exists to remove queueing, not to keep the process small.
 - **Shutdown is the gate.** A retired-but-alive thread that is not joined would let a save race a
-  tick, which is the one way this class can corrupt a world. Retired threads stay in the join list
-  and `join` re-reads that list until it stops growing, so the guarantee holds even against a spawn
-  that races with `halt()`.
+  tick, which is the one way this class can corrupt a world. Retired threads stay in the join list,
+  a spawn is fenced from its halt check to the end of `Thread.start()`, and `join` re-reads the list
+  and re-checks every thread's liveness until no new thread appeared and none is alive. The guarantee
+  therefore holds even against a spawn that races with `halt()`.
+- **A tick without a deadline is refused.** `schedule` rejects a tick whose `scheduledStart` is
+  `DEADLINE_NOT_SET`, as the parent contract says; the naive park for that value would otherwise hold
+  a permit for about three centuries. The wait itself is also bounded to one second and re-checks the
+  deadline, so even a value that moves under a runner cannot park it indefinitely.
 - **A stale tick is detected, not fixed.** The warning proves that permits, not CPU scarcity, are the
   reason a region is not moving; it cannot create capacity that is not there. The honest fixes are
   fewer regions or a larger budget, and admission control is not in this prototype.

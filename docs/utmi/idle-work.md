@@ -89,6 +89,13 @@ second driver asking politely would always read the cache and move nothing. The 
 internal sampler behind the public view. The refresher keeps running its one-second loop as the
 fallback, so metrics cannot starve when every runner is busy.
 
+The pass is a single atomic sample: it holds the sampler's own lock for the whole walk and has no
+cancellation point inside it. The offered unit therefore checks `canContinue` before it starts a pass
+and never starts one on a slice that is already spent, but a pass that has started runs to its end. The
+overrun is bounded by one pass - a few hundred microseconds on a normal server - and that is the
+shortest unit this layer can offer. A caller that needs a tighter bound must not hand out this
+producer.
+
 The five second gap is not caution for its own sake. A pass taken from a tick thread answers the region
 part from the refresher's last list, because the regioniser lock must not be taken there. Four passes
 out of five stay on the refresher and do the walk, so the region view is at most about one interval

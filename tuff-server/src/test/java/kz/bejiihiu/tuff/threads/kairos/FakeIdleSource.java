@@ -27,6 +27,9 @@ final class FakeIdleSource implements IdleWorkSource {
     private volatile boolean offer = true;
     private volatile boolean drain = true;
     private volatile long overrunNanos;
+    private volatile String fatalThreadName;
+    private volatile Error fatal;
+    private final AtomicInteger fatalOffers = new AtomicInteger(1);
 
     FakeIdleSource withNothingToOffer() {
         this.offer = false;
@@ -46,6 +49,23 @@ final class FakeIdleSource implements IdleWorkSource {
      */
     FakeIdleSource ignoringTheSliceFor(final long nanos) {
         this.overrunNanos = nanos;
+        return this;
+    }
+
+    /**
+     * Offers one job that throws an {@link Error} on the named thread, then nothing at all.
+     *
+     * <p>Naming the thread is what makes a runner death deterministic: the test knows the slot of the
+     * thread the factory created first, so it can kill exactly that runner. The idle loop only catches
+     * {@code RuntimeException} and {@code LinkageError}, which is what an {@code Error} stands in for.
+     *
+     * @param threadName exact {@link Thread#getName()} of the runner that must die
+     * @param error      error the job throws
+     * @return this source
+     */
+    FakeIdleSource failingOnceOnThreadNamed(final String threadName, final Error error) {
+        this.fatalThreadName = threadName;
+        this.fatal = error;
         return this;
     }
 
@@ -79,6 +99,16 @@ final class FakeIdleSource implements IdleWorkSource {
     @Override
     public IdleWork poll() {
         this.polls.incrementAndGet();
+        final Error failure = this.fatal;
+        if (failure != null) {
+            if (Thread.currentThread().getName().equals(this.fatalThreadName)
+                && this.fatalOffers.getAndSet(0) > 0) {
+                return canContinue -> {
+                    throw failure;
+                };
+            }
+            return null;
+        }
         if (!this.offer) {
             return null;
         }

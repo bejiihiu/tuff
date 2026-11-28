@@ -79,6 +79,7 @@ class KairosElasticFundTest {
         assertTrue(done.await(5L, TimeUnit.SECONDS));
 
         this.awaitLive(1, 20_000L);
+        this.awaitRetires(elastic, 3, 20_000L);
 
         assertEquals(3, elastic.retireCount(), "exactly the runners above the floor are retired");
         assertEquals(4, this.threads.created().size(), "shrink must not create a replacement thread");
@@ -179,6 +180,7 @@ class KairosElasticFundTest {
         assertEquals(1L, elastic.retireCount(), "two retires within a second would be a sawtooth");
 
         this.awaitLive(1, 20_000L);
+        this.awaitRetires(elastic, 3, 20_000L);
         assertEquals(3L, elastic.retireCount());
     }
 
@@ -286,6 +288,33 @@ class KairosElasticFundTest {
             if (System.nanoTime() - deadline >= 0L) {
                 throw new AssertionError(
                     "expected " + expected + " live threads, got " + elastic.liveThreads()
+                );
+            }
+            Thread.sleep(2L);
+        }
+    }
+
+    /**
+     * Waits for the retire counter, which trails the live count by the moment the decision is recorded.
+     *
+     * <p>The counter is incremented before the runner is asked to leave, so a live count that already
+     * reached the floor cannot legitimately be ahead of it; the wait only covers the supervisor's one
+     * retire per second, not a race in the assertion.
+     *
+     * @param elastic    scheduler under test
+     * @param expected   retire count to wait for
+     * @param waitMillis budget of the wait
+     * @throws InterruptedException if the test is interrupted
+     * @throws AssertionError       if the retire count never arrives
+     */
+    private void awaitRetires(final KairosScheduler elastic, final long expected, final long waitMillis)
+        throws InterruptedException {
+        final long deadline = System.nanoTime() + millis(waitMillis);
+        while (elastic.retireCount() != expected) {
+            if (System.nanoTime() - deadline >= 0L) {
+                throw new AssertionError(
+                    "expected " + expected + " retires, got " + elastic.retireCount()
+                        + " (live " + elastic.liveThreads() + ')'
                 );
             }
             Thread.sleep(2L);

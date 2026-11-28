@@ -180,9 +180,10 @@ final class KairosRig implements AutoCloseable {
      * @throws AssertionError if the fund never becomes quiescent
      */
     void awaitQuiescent(final long timeoutMillis) {
-        SoakFixtures.await("queued + awaiting + executing == 0", timeoutMillis, () -> {
+        SoakFixtures.await("queued + awaiting + executing == scheduled == 0", timeoutMillis, () -> {
             final KairosSnapshot snapshot = this.snapshot();
-            return snapshot.queuedTicks() + snapshot.awaitingTicks() + snapshot.executingTicks() == 0;
+            return snapshot.scheduledTicks() == 0
+                && snapshot.queuedTicks() + snapshot.awaitingTicks() + snapshot.executingTicks() == 0;
         });
     }
 
@@ -194,6 +195,22 @@ final class KairosRig implements AutoCloseable {
     int permitsInUse() {
         final KairosSnapshot snapshot = this.snapshot();
         return snapshot.queuedTicks() + snapshot.awaitingTicks() + snapshot.executingTicks();
+    }
+
+    /**
+     * Asserts that the permit counters account for every tick the scheduler still holds.
+     *
+     * <p>Comparing the sum with itself is what used to hide a cancel that left its state entry behind;
+     * the scheduled count is the other side of the equation and is read from the same snapshot.
+     *
+     * @throws AssertionError if the two sides disagree
+     */
+    void assertPermitAccounting() {
+        final KairosSnapshot snapshot = this.snapshot();
+        if (snapshot.scheduledTicks()
+            != snapshot.queuedTicks() + snapshot.awaitingTicks() + snapshot.executingTicks()) {
+            throw new AssertionError("permit accounting drifted from the scheduled set: " + snapshot);
+        }
     }
 
     /**

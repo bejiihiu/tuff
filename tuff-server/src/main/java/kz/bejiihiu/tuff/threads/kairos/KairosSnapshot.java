@@ -27,6 +27,7 @@ import java.util.Objects;
  * @param queuedTicks             ticks waiting for a permit
  * @param awaitingTicks           runners holding a permit and waiting for the deadline
  * @param executingTicks          runners inside {@code runTick}
+ * @param scheduledTicks          ticks the scheduler holds in total, including executing ones
  * @param overdueTicks            queued ticks whose {@code scheduledStart} is older than the threshold
  * @param oldestOverdueMillis     age of the oldest overdue tick, in milliseconds, or zero when none
  * @param averageWaitMillis       mean positive wait across queued and awaiting ticks, in milliseconds
@@ -55,6 +56,7 @@ public record KairosSnapshot(
     int queuedTicks,
     int awaitingTicks,
     int executingTicks,
+    int scheduledTicks,
     int overdueTicks,
     long oldestOverdueMillis,
     double averageWaitMillis,

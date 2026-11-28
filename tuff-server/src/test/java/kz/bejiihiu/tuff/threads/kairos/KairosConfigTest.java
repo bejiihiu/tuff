@@ -130,6 +130,78 @@ class KairosConfigTest {
         );
     }
 
+    @Test
+    void anOutOfRangeValueIsReportedPerKeyAndDoesNotLeakIntoAnother(@TempDir final Path directory) throws IOException {
+        final ThreadsConfig.ThreadsLoadResult result = load(directory, """
+            thread-management:
+              region-execution:
+                kairos:
+                  catch-up:
+                    cap-ticks: 2_000_000
+                    budget-millis: 75
+                  steal:
+                    threshold-millis: 60_000
+                  affinity:
+                    local-queue-size: 400
+                  lease:
+                    timeout-seconds: 4_000
+            """);
+
+        assertFalse(result.problems().isEmpty(), "every bad value must be reported");
+        for (final String key : new String[] {"cap-ticks", "threshold-millis", "local-queue-size", "timeout-seconds"}) {
+            assertTrue(
+                result.problems().stream().anyMatch(problem -> problem.toString().contains(key)),
+                () -> "the out of range key must be named: " + key + " in " + result.problems()
+            );
+        }
+        assertEquals(new KairosKernel(1, 75, 0, 3, 0), KairosGate.kernel(),
+            "each bad value falls back to its own default, the valid neighbours stay");
+    }
+
+    @Test
+    void theDocumentedUpperBoundsAreAccepted(@TempDir final Path directory) throws IOException {
+        final ThreadsConfig.ThreadsLoadResult result = load(directory, """
+            thread-management:
+              region-execution:
+                kairos:
+                  catch-up:
+                    cap-ticks: 64
+                  steal:
+                    threshold-millis: 1_000
+                  affinity:
+                    local-queue-size: 256
+                  lease:
+                    timeout-seconds: 3_600
+            """);
+
+        assertTrue(result.problems().isEmpty(), () -> "unexpected problems: " + result.problems());
+        assertEquals(new KairosKernel(64, 50, 256, 1_000, 3_600_000), KairosGate.kernel());
+    }
+
+    @Test
+    void aHugeLeaseTimeoutDoesNotResetTheOtherKeys(@TempDir final Path directory) throws IOException {
+        final ThreadsConfig.ThreadsLoadResult result = load(directory, """
+            thread-management:
+              region-execution:
+                kairos:
+                  catch-up:
+                    cap-ticks: 3
+                  affinity:
+                    local-queue-size: 4
+                  lease:
+                    timeout-seconds: 2_147_483
+            """);
+
+        final KairosKernel kernel = KairosGate.kernel();
+        assertEquals(3, kernel.catchUpCapTicks(), "one bad lease value must not disable catch-up");
+        assertEquals(4, kernel.affinityQueueSize(), "one bad lease value must not disable affinity");
+        assertEquals(0L, kernel.leaseTimeoutMillis(), "the lease falls back to accounting only");
+        assertTrue(
+            result.problems().stream().anyMatch(problem -> problem.toString().contains("timeout-seconds")),
+            () -> "the lease key must be named: " + result.problems()
+        );
+    }
+
     private static ThreadsConfig.ThreadsLoadResult load(final Path directory, final String yaml) throws IOException {
         final Path file = directory.resolve("tuff.yml");
         Files.writeString(file, yaml, StandardCharsets.UTF_8);

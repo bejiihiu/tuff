@@ -60,12 +60,17 @@ class KairosCancelTest {
         assertTrue(fixed.cancel(awaiting), "a tick that only waits for its deadline is cancellable");
 
         // the replacement holds the permit now; it must be visible in the awaiting count, otherwise the
-        // snapshot silently loses one permit and the next tick start throws
+        // snapshot silently loses one permit and the next tick start throws on the runner thread
         final KairosSnapshot afterCancel = fixed.snapshot();
         assertEquals(0, afterCancel.queuedTicks());
         assertEquals(1, afterCancel.awaitingTicks(), "the replacement must be linked into awaiting");
         assertEquals(
             1,
+            afterCancel.scheduledTicks(),
+            "the cancelled tick must leave the scheduler's state map"
+        );
+        assertEquals(
+            afterCancel.scheduledTicks(),
             afterCancel.queuedTicks() + afterCancel.awaitingTicks() + afterCancel.executingTicks(),
             "queued + awaiting + executing must match the scheduled set"
         );
@@ -74,6 +79,7 @@ class KairosCancelTest {
         this.awaitIdle(fixed);
         assertEquals(0, queued.runs(), "a cancelled tick must never run");
         assertEquals(0, awaiting.runs());
+        assertEquals(0, fixed.scheduledTicks(), "two cancellations must leave an empty state map");
     }
 
     @Test

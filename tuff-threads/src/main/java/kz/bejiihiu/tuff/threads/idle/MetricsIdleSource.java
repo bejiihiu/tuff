@@ -120,6 +120,13 @@ public final class MetricsIdleSource implements IdleWorkSource {
      * disabled are both inert: there is nothing to refresh and the structural snapshot they would
      * return is not worth a tick thread.
      *
+     * <p>The pass itself is a single atomic sample of the thread layer: it holds the sampler's own lock
+     * for the whole walk and there is no cancellation point inside it. The returned unit therefore
+     * checks {@code canContinue} before it starts a pass and again after it returns - a slice that is
+     * already spent never starts a pass, and a pass that was started cannot be stopped half way. The
+     * bound on the overrun is one pass, which is the shortest unit this layer can offer; a caller that
+     * needs a smaller bound must not hand out this producer.
+     *
      * @return the pass, or {@code null} when not due
      */
     @Override
@@ -135,6 +142,15 @@ public final class MetricsIdleSource implements IdleWorkSource {
         if (!this.lastOfferNanos.compareAndSet(last, now)) {
             return null;
         }
-        return canContinue -> this.refresh.run();
+        return canContinue -> {
+            if (!canContinue.getAsBoolean()) {
+                // the slice is spent: do not start work that has no cancellation point
+                return;
+            }
+            this.refresh.run();
+            // no way to abandon a pass that is already running; the answer is only read so a future
+            // sliced implementation has the same shape and the overrun stays one pass by construction
+            canContinue.getAsBoolean();
+        };
     }
 }

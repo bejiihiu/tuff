@@ -77,7 +77,8 @@ public final class KairosReport {
             + ", ceiling source: " + snapshot.budgetSource());
         lines.add(INDENT + "queue: " + snapshot.queuedTicks() + " queued, "
             + snapshot.awaitingTicks() + " awaiting, "
-            + snapshot.executingTicks() + " executing; tick wait avg "
+            + snapshot.executingTicks() + " executing ("
+            + snapshot.scheduledTicks() + " scheduled); tick wait avg "
             + describeMs(snapshot.averageWaitMillis()) + ", max "
             + describeMs(snapshot.longestWaitMillis()) + "; overdue "
             + snapshot.overdueTicks() + " (threshold " + snapshot.overdueThresholdMillis() + " ms"

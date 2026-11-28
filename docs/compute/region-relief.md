@@ -37,7 +37,8 @@ That check is what makes a scheduling mistake cost a result instead of world int
 ## Completion contract
 
 Every submitted request reaches exactly one of three terminal calls, always on the owning region thread,
-always at most once:
+always at most once. The only exception is an owner port that refuses the terminal task: the discard is
+then delivered from the thread that observed the completion, which is still at most once.
 
 | Call | When | Context |
 | --- | --- | --- |
@@ -55,9 +56,14 @@ time. An applicator that throws is reported through `onFailure` and does not esc
 fallbacks reported at submit time follow the same rule: a failure calls `onFailure` and `submit` returns
 `false`.
 
-Two cases cannot call anything: an owner port that runs the scheduled task off the owner thread (the result
-is dropped and counted, because calling region code from the wrong thread is worse than losing the
-notification), and a port that refuses the task outright. The relief metrics count both.
+Two cases cannot run an applicator: an owner port that runs the scheduled task off the owner thread
+(the result is dropped and counted, because calling region code from the wrong thread is worse than
+losing the notification), and a port that refuses the task outright. The refused task still delivers
+`onDiscard(DROPPED)` exactly once, because losing the notification silently would leave a submitter
+holding a resource forever; the callback runs on the thread that observed the completion (a compute
+worker, or the submitting region thread when the future was already complete) instead of the owner
+thread. A handler may therefore only observe, exactly as the contract says. The relief metrics count
+both cases as dropped.
 
 ## Submission
 

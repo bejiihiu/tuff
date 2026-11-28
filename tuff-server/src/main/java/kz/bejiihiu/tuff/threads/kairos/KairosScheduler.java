@@ -183,7 +183,8 @@ public final class KairosScheduler extends Scheduler {
 
     /**
      * Ownership of a tick while it is scheduled here. The map replaces the state field leafpile keeps
-     * inside {@link SchedulableTick}; entries are dropped as soon as the tick stops rescheduling.
+     * inside {@link SchedulableTick}; entries are dropped as soon as the tick stops rescheduling or is
+     * cancelled, so the map never outlives the work it describes.
      */
     private final Map<SchedulableTick, ScheduledState> states = new IdentityHashMap<>();
 
@@ -201,6 +202,14 @@ public final class KairosScheduler extends Scheduler {
 
     /** Started and not yet exited. Only the supervisor and the runner loop touch it. */
     private final AtomicInteger live = new AtomicInteger();
+
+    /**
+     * Spawns that have passed the halt check but have not finished registering and starting their
+     * thread yet. {@link #halt()} never waits for this: it only sets the flag and unparks. The join
+     * contract uses the counter as a fence, so a thread cannot appear after join decided that nothing
+     * was left to wait for.
+     */
+    private final AtomicInteger inFlightSpawns = new AtomicInteger();
     private final AtomicLong spawnCount = new AtomicLong();
     private final AtomicLong retireCount = new AtomicLong();
 
@@ -510,8 +519,18 @@ public final class KairosScheduler extends Scheduler {
 
             for (final Runner runner : this.slots) {
                 runner.prepareBacklog();
-                runner.thread.start();
+                // counted before the thread exists, so a runner that exits immediately cannot make the
+                // fund look one smaller than it is (or briefly negative)
                 this.live.incrementAndGet();
+                this.inFlightSpawns.incrementAndGet();
+                try {
+                    runner.thread.start();
+                } catch (final Throwable failure) {
+                    this.live.decrementAndGet();
+                    throw failure;
+                } finally {
+                    this.inFlightSpawns.decrementAndGet();
+                }
             }
 
             if (this.elastic && this.maxThreads > floor) {
@@ -675,9 +694,11 @@ public final class KairosScheduler extends Scheduler {
         long totalAge = 0L;
         long longestAge = 0L;
         int aged = 0;
+        int scheduled;
         synchronized (this.scheduleLock) {
+            scheduled = this.states.size();
             for (final Runner runner : this.slots) {
-                if (runner == null || !runner.thread.isAlive()) {
+                if (runner == null) {
                     continue;
                 }
                 final int state = runner.state.state;
@@ -739,6 +760,7 @@ public final class KairosScheduler extends Scheduler {
             queued,
             awaiting,
             executing,
+            scheduled,
             overdue,
             TimeUnit.NANOSECONDS.toMillis(oldestOverdue),
             averageMillis,
@@ -1077,10 +1099,14 @@ public final class KairosScheduler extends Scheduler {
     private boolean join(final long msToWait, final boolean interruptable) throws InterruptedException {
         final boolean timed = msToWait > 0L;
         final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(msToWait);
-        // a halt can race with one last spawn, so re-read the list until it stops growing
-        int seen = -1;
-        while (seen != this.everCreated.size()) {
-            seen = this.everCreated.size();
+        // a halt can race with one last spawn. the fence covers the window between the halted check
+        // and the thread.start() call, and the final liveness pass covers a thread that was created
+        // but not yet started when the join list was walked: "not alive yet" is not "already joined".
+        while (true) {
+            if (!this.awaitSpawnFence(deadline, timed, interruptable)) {
+                return false;
+            }
+            final int seen = this.everCreated.size();
             if (!joinEach(this.everCreated, deadline, timed, interruptable)) {
                 return false;
             }
@@ -1088,8 +1114,65 @@ public final class KairosScheduler extends Scheduler {
             if (created != null && !joinEach(List.of(created), deadline, timed, interruptable)) {
                 return false;
             }
+            if (!this.awaitSpawnFence(deadline, timed, interruptable)) {
+                return false;
+            }
+            if (this.inFlightSpawns.get() == 0 && seen == this.everCreated.size() && !this.anyThreadAlive()) {
+                return true;
+            }
         }
-        return true;
+    }
+
+    /**
+     * Waits, bounded, until no spawn is between its halt check and the end of {@code thread.start()}.
+     *
+     * <p>The wait is what makes the shutdown guarantee structural: a spawn that lost the race with
+     * {@link #halt()} still decrements the fence before it returns, so a join that sees a zero fence
+     * also sees every thread that spawn could have started.
+     *
+     * @param deadline      join deadline in {@link System#nanoTime()} terms
+     * @param timed         whether the deadline applies
+     * @param interruptable whether an interrupt is propagated
+     * @return {@code false} when the deadline passed first
+     * @throws InterruptedException if interrupted and {@code interruptable}
+     */
+    private boolean awaitSpawnFence(
+        final long deadline,
+        final boolean timed,
+        final boolean interruptable
+    ) throws InterruptedException {
+        boolean interrupted = false;
+        try {
+            while (this.inFlightSpawns.get() != 0) {
+                if (timed && System.nanoTime() - deadline >= 0L) {
+                    return false;
+                }
+                if (Thread.interrupted()) {
+                    if (interruptable) {
+                        throw new InterruptedException();
+                    }
+                    interrupted = true;
+                }
+                // the critical section is a thread factory call and a start; a short park keeps the
+                // shutdown thread polite without giving the spawn a reason to wait for it
+                LockSupport.parkNanos(TimeUnit.MICROSECONDS.toNanos(100L));
+            }
+            return true;
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private boolean anyThreadAlive() {
+        for (final Thread thread : this.everCreated) {
+            if (thread.isAlive()) {
+                return true;
+            }
+        }
+        final Thread created = this.supervisor;
+        return created != null && created.isAlive();
     }
 
     private static boolean joinEach(
@@ -1144,6 +1227,11 @@ public final class KairosScheduler extends Scheduler {
             if (this.states.containsKey(tick)) {
                 throw new IllegalStateException("Task " + tick + " is already scheduled");
             }
+            if (this.scheduledStart.applyAsLong(tick) == TimeUtil.DEADLINE_NOT_SET) {
+                // the parent contract says a tick without a start is refused, and a runner that
+                // believed the missing value would park for centuries while holding the permit
+                throw new IllegalStateException("Task " + tick + " has no scheduled start");
+            }
             final ScheduledState state = new ScheduledState(tick);
             this.states.put(tick, state);
             state.schedulerOwnedBy = this;
@@ -1153,6 +1241,22 @@ public final class KairosScheduler extends Scheduler {
         if (queuedNow && created != null && this.live.get() < this.maxThreads) {
             // demand signal only, the supervisor is the one that spawns
             LockSupport.unpark(created);
+        }
+    }
+
+    /**
+     * Returns how many ticks this scheduler currently holds.
+     *
+     * <p>One entry per scheduled tick, whether it waits in the queue, in a runner backlog, waits for
+     * its deadline or is executing. A cancelled tick and a tick that stops rescheduling leave the
+     * map, so the size is the other half of the permit accounting: it can only equal the sum of the
+     * queue counters when no transition leaks an entry.
+     *
+     * @return the size of the scheduler's state map
+     */
+    public int scheduledTicks() {
+        synchronized (this.scheduleLock) {
+            return this.states.size();
         }
     }
 
@@ -1184,11 +1288,16 @@ public final class KairosScheduler extends Scheduler {
                 return false;
             }
             if (this.queued.remove(state)) {
+                this.cancelState(state);
                 return true;
             }
             if (state.localOwner != null) {
                 // a tick kept by a runner is still unleased, so it is cancellable just like a queued one
-                return this.unstash(state.localOwner, state);
+                if (!this.unstash(state.localOwner, state)) {
+                    return false;
+                }
+                this.cancelState(state);
+                return true;
             }
             if (state.awaitingLink != null) {
                 this.awaiting.remove(state.awaitingLink);
@@ -1196,6 +1305,19 @@ public final class KairosScheduler extends Scheduler {
 
                 final Runner runner = state.ownedBy;
                 state.ownedBy = null;
+                this.cancelState(state);
+                if (runner == null || isDeadSlot(runner)) {
+                    // a permit without a live owner cannot be handed on; the tick is simply gone
+                    return true;
+                }
+                if (runner.midTicking) {
+                    // the runner is inside runTasks for the region this permit belonged to. handing
+                    // it another tick here would let it start a body before that pass returned, so it
+                    // is parked instead and picks work up when the pass ends.
+                    this.idleThreads.set(runner.slot);
+                    runner.forceIdle();
+                    return true;
+                }
                 // the permit has to be handed over through the same transition a returning runner
                 // uses, otherwise the replacement is owned and running but invisible to the queues,
                 // and the next tick start would throw on the runner thread
@@ -1213,6 +1335,35 @@ public final class KairosScheduler extends Scheduler {
     }
 
     /**
+     * Forgets a tick this scheduler will never schedule again.
+     *
+     * <p>This is the same transition {@link #release(ScheduledState)} performs when a runner returns a
+     * tick that does not reschedule. Without it the map would keep the handle - and through the region
+     * handle of a real server, the region and its world - alive forever, and a later schedule of the
+     * same handle would answer "already scheduled" from an entry no queue can see.
+     *
+     * @param state state of the cancelled tick
+     */
+    private void cancelState(final ScheduledState state) {
+        state.schedulerOwnedBy = null;
+        this.states.remove(state.tick);
+    }
+
+    /**
+     * Whether a slot's thread has run and exited, as opposed to not being started yet.
+     *
+     * <p>{@link Thread#isAlive()} is false for both, and the scheduler schedules ticks before
+     * {@code start()} starts the floor, so "not alive" must not be read as "dead". Only a thread that
+     * reached {@link Thread.State#TERMINATED} can never wake up for a tick.
+     *
+     * @param runner runner occupying the slot
+     * @return {@code true} when its thread ran and exited
+     */
+    private static boolean isDeadSlot(final Runner runner) {
+        return runner.thread.getState() == Thread.State.TERMINATED;
+    }
+
+    /**
      * Offers a tick to a free permit, the worst waiting tick, or the queue, in that order.
      *
      * @param task tick to place
@@ -1221,24 +1372,44 @@ public final class KairosScheduler extends Scheduler {
     private boolean insertFresh(final ScheduledState task) {
         final Runner[] runners = this.slots;
 
-        final int firstIdleThread = this.idleThreads.nextSetBit(0);
-        if (firstIdleThread != -1) {
-            this.grant(runners[firstIdleThread], task);
-            return false;
+        int firstIdleThread = this.idleThreads.nextSetBit(0);
+        while (firstIdleThread != -1) {
+            final Runner runner = firstIdleThread < runners.length ? runners[firstIdleThread] : null;
+            if (runner == null || isDeadSlot(runner)) {
+                // a slot whose thread is gone must not keep its permit bit: the grant would park a
+                // tick on a thread that will never wake up for it
+                this.idleThreads.clear(firstIdleThread);
+            } else if (!runner.midTicking) {
+                this.grant(runner, task);
+                return false;
+            }
+            // a mid-ticking runner keeps its bit for when the pass ends, but may not take work before
+            // that: its region is still marked ticking inside runTasks
+            firstIdleThread = this.idleThreads.nextSetBit(firstIdleThread + 1);
         }
 
         // try to replace the last awaiting task, the same eviction EDF performs
         final ScheduledState last = this.awaiting.last();
         if (last != null && this.compareByDeadline(task, last) < 0) {
-            this.awaiting.pollLast();
-            last.awaitingLink = null;
             final Runner runner = last.ownedBy;
-            last.ownedBy = null;
-            this.queued.add(last);
+            if (runner != null && !isDeadSlot(runner) && !runner.midTicking) {
+                this.awaiting.pollLast();
+                last.awaitingLink = null;
+                last.ownedBy = null;
+                this.queued.add(last);
 
-            this.grant(runner, task);
-            this.recordDemand();
-            return false;
+                this.grant(runner, task);
+                this.recordDemand();
+                return false;
+            }
+            if (runner != null && isDeadSlot(runner)) {
+                // the permit's owner died; its tick can never run from there, so put it back into the
+                // queue instead of leaving it attached to a dead runner
+                this.awaiting.pollLast();
+                last.awaitingLink = null;
+                last.ownedBy = null;
+                this.queued.add(last);
+            }
         }
 
         this.queued.add(task);
@@ -1564,6 +1735,30 @@ public final class KairosScheduler extends Scheduler {
         return Math.max(0L, now - start);
     }
 
+    /**
+     * Returns how long a runner may park while waiting for a deadline.
+     *
+     * <p>Bounded on purpose. A deadline that was never set is {@link TimeUtil#DEADLINE_NOT_SET}, the
+     * smallest {@code long}, and the naive subtraction turns it into a number of nanoseconds that parks
+     * the thread for about three centuries while it holds the tick's permit; the watchdog would then be
+     * the only thing that notices. The same bound keeps a very distant deadline from making shutdown
+     * wait for the OS to schedule the parked thread again.
+     *
+     * @param deadline deadline of the tick the runner holds, in {@link System#nanoTime()} terms
+     * @param now      current {@link System#nanoTime()}
+     * @return the park duration, positive; zero when the deadline has already passed
+     */
+    static long parkNanos(final long deadline, final long now) {
+        if (deadline == TimeUtil.DEADLINE_NOT_SET) {
+            return IDLE_PARK_NANOS;
+        }
+        final long diff = deadline - now;
+        if (diff <= 0L) {
+            return 0L;
+        }
+        return Math.min(diff, IDLE_PARK_NANOS);
+    }
+
     private @Nullable ScheduledState returnTask(final Runner runner, final @Nullable ScheduledState reschedule) {
         if (reschedule != null && !this.stash(runner, reschedule)) {
             this.queued.add(reschedule);
@@ -1590,14 +1785,62 @@ public final class KairosScheduler extends Scheduler {
      * a backlog tick that is already late; otherwise it would park next to work it is allowed to do.
      */
     private void pump() {
-        int slot;
-        while ((slot = this.idleThreads.nextSetBit(0)) >= 0) {
-            final Runner runner = this.slots[slot];
+        int slot = 0;
+        while (true) {
+            slot = this.idleThreads.nextSetBit(slot);
+            if (slot < 0) {
+                return;
+            }
+            final Runner runner = slot < this.slots.length ? this.slots[slot] : null;
+            if (runner == null || isDeadSlot(runner)) {
+                // no thread, no permit: a tick handed to this slot would park forever
+                this.idleThreads.clear(slot);
+                ++slot;
+                continue;
+            }
+            if (runner.midTicking) {
+                // the runner is inside runTasks; it keeps its bit and polls the queue when the pass
+                // ends, so this pass must not hand it a tick before its region is unmarked
+                ++slot;
+                continue;
+            }
             final ScheduledState next = this.pollNext(runner);
             if (next == null) {
                 return;
             }
             this.grant(runner, next);
+            // the grant cleared this slot's bit; scan from the start for another free permit
+            slot = 0;
+        }
+    }
+
+    /**
+     * Lets a runner that just finished a mid-tick pass take work it was not allowed to take during it.
+     *
+     * <p>The pass runs while the runner holds a region's permit, so the runner must not be handed a
+     * different tick while {@code runTasks} is on its stack. A cancel that hit the awaiting tick during
+     * the pass parked the runner instead of replacing the permit; this is where that replacement
+     * happens, once the region is no longer marked ticking.
+     *
+     * @param runner     runner that just left the pass
+     * @param awaitState runner state the pass was started under
+     */
+    private void resumeAfterMidTick(final Runner runner, final Runner.TickThreadRunnerState awaitState) {
+        if (runner.state == awaitState) {
+            // the ordinary case: the permit is still the same, so no lock is taken on the wait path
+            return;
+        }
+        synchronized (this.scheduleLock) {
+            if (runner.state.state != Runner.STATE_IDLE) {
+                return;
+            }
+            if (!runner.thread.isAlive() || !this.idleThreads.get(runner.slot)) {
+                return;
+            }
+            final ScheduledState next = this.pollNext(runner);
+            if (next != null) {
+                this.grant(runner, next);
+            }
         }
     }
 
@@ -1672,7 +1915,7 @@ public final class KairosScheduler extends Scheduler {
             int slot = -1;
             for (int index = 0; index < before.length; ++index) {
                 final Runner candidate = before[index];
-                if (candidate == null || !candidate.thread.isAlive()) {
+                if (candidate == null || isDeadSlot(candidate)) {
                     slot = index;
                     break;
                 }
@@ -1680,26 +1923,42 @@ public final class KairosScheduler extends Scheduler {
             if (slot < 0) {
                 slot = before.length;
             }
+            final Runner replaced = slot < before.length ? before[slot] : null;
+            if (replaced != null) {
+                this.reclaimDeadSlot(replaced);
+            }
 
-            // built here rather than through createRunner so a failure to start leaves no trace
-            final LazyRunnable body = new LazyRunnable();
-            final Thread thread = this.threadFactory.newThread(body);
-            final Runner runner = new Runner(thread, slot, this);
-            body.setRunnable(runner);
-            runner.prepareBacklog();
-            final Runner[] grown = slot == before.length ? Arrays.copyOf(before, slot + 1) : before.clone();
-            grown[slot] = runner;
-            this.slots = grown;
-            this.everCreated.add(thread);
-            this.live.incrementAndGet();
+            // the fence is what the join contract waits for: a thread that appears between the halted
+            // check above and its start() must be visible before join may report that nothing is left
+            this.inFlightSpawns.incrementAndGet();
+            final Thread started;
             try {
-                thread.start();
-            } catch (final Throwable failure) {
-                // roll the half built slot back: the fund keeps its current size, ticks keep running
-                this.slots = before;
-                this.everCreated.remove(thread);
-                this.live.decrementAndGet();
-                throw failure;
+                if (this.halted) {
+                    return false;
+                }
+                // built here rather than through createRunner so a failure to start leaves no trace
+                final LazyRunnable body = new LazyRunnable();
+                final Thread thread = this.threadFactory.newThread(body);
+                started = thread;
+                final Runner runner = new Runner(thread, slot, this);
+                body.setRunnable(runner);
+                runner.prepareBacklog();
+                final Runner[] grown = slot == before.length ? Arrays.copyOf(before, slot + 1) : before.clone();
+                grown[slot] = runner;
+                this.slots = grown;
+                this.everCreated.add(thread);
+                this.live.incrementAndGet();
+                try {
+                    thread.start();
+                } catch (final Throwable failure) {
+                    // roll the half built slot back: the fund keeps its current size, ticks keep running
+                    this.slots = before;
+                    this.everCreated.remove(thread);
+                    this.live.decrementAndGet();
+                    throw failure;
+                }
+            } finally {
+                this.inFlightSpawns.decrementAndGet();
             }
 
             this.spawnCount.incrementAndGet();
@@ -1709,9 +1968,36 @@ public final class KairosScheduler extends Scheduler {
             }
             if (this.halted) {
                 // lost the race with halt: the loop exits at its first check, unpark only speeds it up
-                LockSupport.unpark(thread);
+                LockSupport.unpark(started);
             }
             return true;
+        }
+    }
+
+    /**
+     * Takes back what a dead runner still held before its slot is handed to a new thread.
+     *
+     * <p>A runner can die under an uncaught throwable. The ticks it kept in its private queue and the
+     * tick whose permit it was waiting for would then belong to a runner that no longer exists: the
+     * first set is invisible to every queue walk and the second can never reach its deadline. Both go
+     * back to the shared queue here, exactly like {@link #drainBacklog(Runner)} does for a retire.
+     *
+     * @param dead runner whose thread is not alive any more
+     */
+    private void reclaimDeadSlot(final Runner dead) {
+        synchronized (this.scheduleLock) {
+            this.idleThreads.clear(dead.slot);
+            this.drainBacklog(dead);
+            final Runner.TickThreadRunnerState state = dead.state;
+            final ScheduledState pending = state.stateTarget;
+            if (state.state != Runner.STATE_AWAITING_TICK || pending == null || pending.awaitingLink == null) {
+                return;
+            }
+            this.awaiting.remove(pending.awaitingLink);
+            pending.awaitingLink = null;
+            pending.ownedBy = null;
+            this.queued.add(pending);
+            this.recordDemand();
         }
     }
 
@@ -2088,9 +2374,12 @@ public final class KairosScheduler extends Scheduler {
             // the hint of a leaving runner dies with it: whatever it kept goes back to the one queue,
             // and the slot that may be reused by the next spawn has no stale owner left behind
             this.drainBacklog(candidate);
+            // counted before the runner is unparked: the thread may exit and decrement live before
+            // this line would run otherwise, and then a fund that reads live == floor could still
+            // report one retire less than it made
+            this.retireCount.incrementAndGet();
             candidate.retire();
             this.nextRetireNanos = now + RETIRE_COOLDOWN_NANOS;
-            this.retireCount.incrementAndGet();
             this.pump();
             return true;
         }
@@ -2327,6 +2616,16 @@ public final class KairosScheduler extends Scheduler {
         private long idleWorkEndNanos;
 
         /**
+         * Whether this runner is inside {@code runTasks} right now.
+         *
+         * <p>While it is, the region of the tick it holds a permit for is marked ticking, so no queue
+         * path may hand this runner another tick: the eviction, the idle bit and the cancel replacement
+         * all read this flag. The runner itself clears it in the pass finally and then polls the queue
+         * once, which is where a permit that was withdrawn during the pass comes back from.
+         */
+        private volatile boolean midTicking;
+
+        /**
          * Ticks kept for this runner while soft affinity is on, or {@code null} when it is off.
          * Guarded by {@link KairosScheduler#scheduleLock}.
          */
@@ -2489,36 +2788,48 @@ public final class KairosScheduler extends Scheduler {
                 return false;
             }
             final ScheduledState task = awaitState.stateTarget;
-            if (task == null || this.state != awaitState) {
-                return false;
-            }
-            if (scheduler.ticks.cancelled().test(task.tick)) {
-                // a dropped region owns nothing to drain; the stock path never touches it either
-                return false;
-            }
-            final long deadline = scheduler.scheduledStart.applyAsLong(task.tick);
-            final long now = System.nanoTime();
-            if (now - deadline >= 0L) {
-                return false;
-            }
-            if (!task.tick.hasTasks()) {
-                return false;
-            }
-            final long sliceEnd = now + scheduler.idleSliceNanos;
-            final BooleanSupplier canContinue = () -> this.midTickCanContinue(awaitState, task, deadline, sliceEnd);
-            final long workStart = System.nanoTime();
+            // the flag goes up before anything is asked of the handle: hasTasks() and runTasks() are
+            // foreign code, and a queue path that ran between them could take this permit away while
+            // the region is about to be marked ticking
+            this.midTicking = true;
             try {
-                task.tick.runTasks(canContinue);
+                if (task == null || this.state != awaitState) {
+                    return false;
+                }
+                if (scheduler.ticks.cancelled().test(task.tick)) {
+                    // a dropped region owns nothing to drain; the stock path never touches it either
+                    return false;
+                }
+                final long deadline = scheduler.scheduledStart.applyAsLong(task.tick);
+                final long now = System.nanoTime();
+                if (now - deadline >= 0L) {
+                    return false;
+                }
+                if (!task.tick.hasTasks()) {
+                    return false;
+                }
+                final long sliceEnd = now + scheduler.idleSliceNanos;
+                final BooleanSupplier canContinue =
+                    () -> this.midTickCanContinue(awaitState, task, deadline, sliceEnd);
+                final long workStart = System.nanoTime();
+                try {
+                    task.tick.runTasks(canContinue);
+                } finally {
+                    final long workEnd = System.nanoTime();
+                    scheduler.accountIdleWork(workEnd - workStart);
+                    scheduler.midTickPasses.increment();
+                    this.idleWorkEndNanos = workEnd;
+                }
+                if (this.state != awaitState || System.nanoTime() - deadline >= 0L) {
+                    scheduler.idlePreemptions.increment();
+                }
+                return true;
             } finally {
-                final long workEnd = System.nanoTime();
-                scheduler.accountIdleWork(workEnd - workStart);
-                scheduler.midTickPasses.increment();
-                this.idleWorkEndNanos = workEnd;
+                this.midTicking = false;
+                // a cancel that hit the awaiting tick during the pass parked this runner instead of
+                // replacing its permit; the region is unmarked now, so it may take a tick again
+                scheduler.resumeAfterMidTick(this, awaitState);
             }
-            if (this.state != awaitState || System.nanoTime() - deadline >= 0L) {
-                scheduler.idlePreemptions.increment();
-            }
-            return true;
         }
 
         /**
@@ -2652,16 +2963,16 @@ public final class KairosScheduler extends Scheduler {
                         final boolean trackWait = this.scheduler.idleWork.armed();
                         while (this.state == startState) {
                             Thread.interrupted();
-                            final long diff = deadline - System.nanoTime();
-                            if (diff <= 0L) {
+                            final long park = KairosScheduler.parkNanos(deadline, System.nanoTime());
+                            if (park <= 0L) {
                                 break;
                             }
                             if (trackWait) {
                                 final long parkStart = System.nanoTime();
-                                LockSupport.parkNanos(startState, diff);
+                                LockSupport.parkNanos(startState, park);
                                 this.scheduler.idleWaitNanos.add(System.nanoTime() - parkStart);
                             } else {
-                                LockSupport.parkNanos(startState, diff);
+                                LockSupport.parkNanos(startState, park);
                             }
                             if (this.scheduler.halted) {
                                 return;

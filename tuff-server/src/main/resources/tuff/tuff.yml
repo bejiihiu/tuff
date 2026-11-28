@@ -103,23 +103,24 @@ thread-management:
         # Tick bodies a region may run back to back while it is behind. Each of them accounts for one
         # period, so the missed ticks are actually run instead of skipped; the last body of the burst
         # writes off whatever is left, so the region returns to its normal cadence. 1 is the stock
-        # behaviour. The value only takes effect together with a budget above 0.
+        # behaviour. The value only takes effect together with a budget above 0. Allowed: 1 to 64.
         cap-ticks: 1
         # Wall clock a single catch-up burst may spend, in milliseconds. 0 disables catch-up, because a
-        # cap without a budget would let one slow region hold a permit for a whole tick.
+        # cap without a budget would let one slow region hold a permit for a whole tick. Allowed: 0 to
+        # 600000.
         budget-millis: 50
       steal:
         # How late a tick kept by another runner must be before this runner may take it. Only used
-        # while affinity.local-queue-size is above 0.
+        # while affinity.local-queue-size is above 0. Allowed: 0 to 1000.
         threshold-millis: 3
       affinity:
         # Ticks a runner may keep for the region it just ticked. 0 is the stock single queue; above 0
         # is soft affinity: the tick tends to come back to the same thread, and another runner only
-        # takes it when it is past `steal.threshold-millis`.
+        # takes it when it is past `steal.threshold-millis`. Allowed: 0 to 256.
         local-queue-size: 0
       lease:
         # Warn (once per ten seconds) when a tick waited longer than this for its permit. 0 keeps the
-        # measurement in /tuff scheduler and the JFR event only, with no log line.
+        # measurement in /tuff scheduler and the JFR event only, with no log line. Allowed: 0 to 3600.
         timeout-seconds: 0
       metrics:
         # Record every executed tick and every supervisor pass as JFR events
