@@ -84,7 +84,7 @@ public final class KairosReport {
             "Tuff scheduler: " + scheduler,
             INDENT + "no fund telemetry: only Kairos keeps a tick fund, tick wait ages and a supervisor thread",
             INDENT + "configured region threads: " + describeThreads(configuredThreads)
-                + " (threaded-regions.threads); a change needs a restart"
+                + " (threaded-regions.threads); " + describeThreadsChange(scheduler)
         );
     }
 
@@ -466,6 +466,24 @@ public final class KairosReport {
 
     private static String describeThreads(final int threads) {
         return threads > 0 ? Integer.toString(threads) : "unknown (automatic)";
+    }
+
+    /**
+     * Says whether a new thread count can take effect while the server runs.
+     *
+     * <p>EDF fixes its thread arrays at construction, so {@code TickRegionScheduler.setThreads} is a
+     * silent no-op for it and only a restart applies a new count. Work stealing rebuilds its allocation
+     * through {@code setThreadAllocation}, so the scheduler it is running is resized in place. An
+     * elastic Kairos fund never reaches this line - it has a snapshot and prints its own report - and a
+     * fixed one is restart only, which is why the remaining names fall back to the restart sentence.
+     *
+     * @param scheduler active scheduler name
+     * @return one clause for the configured thread count line
+     */
+    private static String describeThreadsChange(final String scheduler) {
+        return "WORK_STEALING".equalsIgnoreCase(scheduler)
+            ? "a change is applied live by the work stealing scheduler"
+            : "a change needs a restart";
     }
 
     private static String describeMs(final double millis) {

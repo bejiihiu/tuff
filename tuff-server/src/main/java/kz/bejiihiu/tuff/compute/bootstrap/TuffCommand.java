@@ -1,6 +1,7 @@
 package kz.bejiihiu.tuff.compute.bootstrap;
 
 import io.papermc.paper.threadedregions.RegionizedServer;
+import java.util.ArrayList;
 import java.util.List;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
 import kz.bejiihiu.tuff.compute.ComputeSettings;
@@ -34,26 +35,48 @@ import org.jspecify.annotations.Nullable;
  * their own service thread and report back when they finish, so a dump never stalls the region that
  * ran the command. A disabled engine is never an error: the command says so and returns.
  *
- * <p>Permission {@code tuff.command.compute}, granted to operators by default. The scheduler part of
- * the command also accepts {@code tuff.command.scheduler}, so diagnostics can be handed out without
- * the reload and Flight Recorder controls.
+ * <p>Permission {@code tuff.command.compute}, granted to operators by default, is the control
+ * permission and covers every form of the command. {@code tuff.command.scheduler} is the read-only
+ * diagnostics permission: {@code threads} and the scheduler overview with its {@code leases},
+ * {@code budget} and {@code help} views. A sender that holds only the read-only permission is refused
+ * everything else - the compute views, {@code reload}, the Flight Recorder verbs and
+ * {@code scheduler reset} - with a message naming the permission those actions need, and tab
+ * completion only offers the words that sender may run.
  */
 public final class TuffCommand extends Command implements TabCompleter {
 
     /**
-     * Permission required to use any part of the command.
+     * Permission required to control the engine: reload, Flight Recorder and the scheduler reset.
+     * It also grants every read-only view, so operators need only this one.
      */
     public static final String PERMISSION = "tuff.command.compute";
 
     /**
-     * Permission required to read the scheduler report. Granted to operators by default and kept apart
-     * from the compute permission so a server can hand the diagnostics to a wider group without also
-     * handing over reload and JFR.
+     * Permission required for the read-only diagnostics: the thread layer summary and the region
+     * scheduler report with its leases, budget and help views. Granted to operators by default and
+     * kept apart from the compute permission so a server can hand the diagnostics to a wider group
+     * without also handing over reload, the Flight Recorder verbs, the scheduler counter reset or the
+     * compute views.
      */
     public static final String SCHEDULER_PERMISSION = "tuff.command.scheduler";
 
     /**
-     * Creates the command and registers its permission when that has not happened yet.
+     * Root subcommands the read-only permission may run.
+     */
+    private static final List<String> READ_ONLY_ROOT = List.of("threads", "scheduler");
+
+    /**
+     * Scheduler subcommands the read-only permission may run.
+     */
+    private static final List<String> READ_ONLY_SCHEDULER = List.of("leases", "budget", "help");
+
+    /**
+     * Message for a sender without either permission.
+     */
+    private static final String NO_PERMISSION = "You do not have permission to use the Tuff command.";
+
+    /**
+     * Creates the command and registers its two permissions when that has not happened yet.
      *
      * @return a command ready to be registered in the command map
      */
@@ -62,18 +85,23 @@ public final class TuffCommand extends Command implements TabCompleter {
         return new TuffCommand();
     }
 
-    private TuffCommand() {
+    /**
+     * Builds the command.
+     *
+     * <p>Package private so the permission matrix can be exercised without a running server;
+     * {@link #create()} is the entry point that production code uses and it also registers the two
+     * permissions.
+     */
+    TuffCommand() {
         super("tuff", "Inspects and controls the Tuff compute engine.", ComputeCommand.USAGE, List.of());
         this.setPermission(PERMISSION);
-        this.permissionMessage(Component.text(
-            "You do not have permission to use the Tuff command.", NamedTextColor.RED));
+        this.permissionMessage(Component.text(NO_PERMISSION, NamedTextColor.RED));
     }
 
     @Override
     public boolean execute(final CommandSender sender, final String commandLabel, final String[] args) {
         if (!this.allowed(sender)) {
-            sender.sendMessage(Component.text(
-                "You do not have permission to use the Tuff command.", NamedTextColor.RED));
+            sender.sendMessage(Component.text(NO_PERMISSION, NamedTextColor.RED));
             return true;
         }
         final ComputeCommand.Request request = ComputeCommand.parse(args);
@@ -84,6 +112,10 @@ public final class TuffCommand extends Command implements TabCompleter {
         final ComputeCommand.Action action = request.action();
         if (action == null) {
             sender.sendMessage(Component.text("Usage: " + ComputeCommand.USAGE, NamedTextColor.RED));
+            return true;
+        }
+        if (!readOnly(action) && !this.mayControl(sender)) {
+            sender.sendMessage(Component.text(denyPermission(action), NamedTextColor.RED));
             return true;
         }
         switch (action) {
@@ -112,7 +144,11 @@ public final class TuffCommand extends Command implements TabCompleter {
         if (!this.allowed(sender)) {
             return List.of();
         }
-        return ComputeCommand.completions(args);
+        final List<String> candidates = ComputeCommand.completions(args);
+        if (this.mayControl(sender) || candidates.isEmpty()) {
+            return candidates;
+        }
+        return readOnly(candidates, args);
     }
 
     /**
@@ -199,7 +235,74 @@ public final class TuffCommand extends Command implements TabCompleter {
     }
 
     private boolean allowed(final CommandSender sender) {
-        return this.testPermissionSilent(sender) || sender.hasPermission(SCHEDULER_PERMISSION);
+        return this.mayControl(sender) || sender.hasPermission(SCHEDULER_PERMISSION);
+    }
+
+    private boolean mayControl(final CommandSender sender) {
+        return this.testPermissionSilent(sender);
+    }
+
+    /**
+     * Checks whether the read-only scheduler permission covers an action.
+     *
+     * <p>The read-only permission is the thread layer summary and the scheduler report with its
+     * {@code leases}, {@code budget} and {@code help} views. Everything else - the compute views,
+     * {@code reload}, the three Flight Recorder verbs and {@code scheduler reset} - needs
+     * {@code tuff.command.compute}.
+     *
+     * @param action parsed action
+     * @return {@code true} when {@code tuff.command.scheduler} alone may run the action
+     */
+    private static boolean readOnly(final ComputeCommand.Action action) {
+        return switch (action) {
+            case THREADS, SCHEDULER, SCHEDULER_LEASES, SCHEDULER_BUDGET, SCHEDULER_HELP -> true;
+            case SUMMARY, CONSUMERS, TASKS, RELOAD, JFR_START, JFR_STOP, JFR_DUMP, SCHEDULER_RESET -> false;
+        };
+    }
+
+    /**
+     * Builds the refusal for a sender that only holds the read-only permission.
+     *
+     * @param action the refused action
+     * @return one line naming the form and the permission it needs
+     */
+    private static String denyPermission(final ComputeCommand.Action action) {
+        final String form = switch (action) {
+            case SUMMARY, CONSUMERS, TASKS -> "/tuff compute";
+            case RELOAD -> "/tuff reload";
+            case JFR_START -> "/tuff compute jfr start";
+            case JFR_STOP -> "/tuff compute jfr stop";
+            case JFR_DUMP -> "/tuff compute jfr dump";
+            case SCHEDULER_RESET -> "/tuff scheduler reset";
+            case THREADS, SCHEDULER, SCHEDULER_LEASES, SCHEDULER_BUDGET, SCHEDULER_HELP -> "/tuff";
+        };
+        return "You do not have permission to run " + form + ": it needs " + PERMISSION
+            + ", and " + SCHEDULER_PERMISSION + " only covers the read-only thread and scheduler views.";
+    }
+
+    /**
+     * Removes the words a read-only sender may not run from a completion list.
+     *
+     * <p>The parser owns the grammar; this only keeps the branches the scheduler permission covers, so
+     * the two lists below are the same two statements the refusal and the docs make.
+     *
+     * @param candidates completions of the current position
+     * @param args       arguments as Bukkit passes them
+     * @return the completions that sender may run
+     */
+    private static List<String> readOnly(final List<String> candidates, final String[] args) {
+        final List<String> permitted = switch (args.length - 1) {
+            case 0 -> READ_ONLY_ROOT;
+            case 1 -> args[0].equalsIgnoreCase("scheduler") ? READ_ONLY_SCHEDULER : List.of();
+            default -> List.of();
+        };
+        final List<String> visible = new ArrayList<>(permitted.size());
+        for (final String candidate : candidates) {
+            if (permitted.contains(candidate)) {
+                visible.add(candidate);
+            }
+        }
+        return List.copyOf(visible);
     }
 
     private void reload(final CommandSender sender) {
@@ -288,7 +391,8 @@ public final class TuffCommand extends Command implements TabCompleter {
         if (pluginManager.getPermission(SCHEDULER_PERMISSION) == null) {
             pluginManager.addPermission(new Permission(
                 SCHEDULER_PERMISSION,
-                "Allows reading the Tuff region scheduler report.",
+                "Allows reading the Tuff thread layer and region scheduler reports; the compute views, "
+                    + "reload, Flight Recorder and the scheduler counter reset need tuff.command.compute.",
                 PermissionDefault.OP
             ));
         }

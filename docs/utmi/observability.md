@@ -10,8 +10,9 @@ line and no external metrics endpoint.
 /tuff threads
 ```
 
-It needs `tuff.command.compute` (granted to operators by default) and works from the console and from
-players. It is a subcommand of `/tuff`, not a separate command, and it takes no arguments.
+It needs `tuff.command.compute` or `tuff.command.scheduler` (both granted to operators by default); the
+second is read-only and is enough for this view. It works from the console and from players. It is a
+subcommand of `/tuff`, not a separate command, and it takes no arguments.
 
 | State | What it prints |
 | --- | --- |
@@ -137,11 +138,17 @@ ledger; none of them measures anything on the calling thread.
 
 | Command | What it prints | Permission |
 | --- | --- | --- |
-| `/tuff scheduler` | fund, queue, supervisor, tick counters, idle work, lease totals, degraded reasons | `tuff.command.scheduler` |
-| `/tuff scheduler leases [n]` | the `n` worst recent permit waits with region, tick, queued wait, parked wait and age, 1 to 20, default 5 | `tuff.command.scheduler` |
-| `/tuff scheduler budget` | the budget ledger and its region, chunk, IO and reserve terms, usable cores, the compute floor, the Kairos floor/ceiling and the reason for every degraded state | `tuff.command.scheduler` |
-| `/tuff scheduler reset` | one line confirming that the A/B counters were zeroed; the fund, the regions and the permits stay | `tuff.command.scheduler` |
-| `/tuff scheduler help` | the grammar above | `tuff.command.scheduler` |
+| `/tuff scheduler` | fund, queue, supervisor, tick counters, idle work, lease totals, degraded reasons | `tuff.command.scheduler` or `tuff.command.compute` |
+| `/tuff scheduler leases [n]` | the `n` worst recent permit waits with region, tick, queued wait, parked wait and age, 1 to 20, default 5 | `tuff.command.scheduler` or `tuff.command.compute` |
+| `/tuff scheduler budget` | the budget ledger and its region, chunk, IO and reserve terms, usable cores, the compute floor, the Kairos floor/ceiling and the reason for every degraded state | `tuff.command.scheduler` or `tuff.command.compute` |
+| `/tuff scheduler reset` | one line confirming that the A/B counters were zeroed; the fund, the regions and the permits stay | `tuff.command.compute` (the scheduler permission is read-only) |
+| `/tuff scheduler help` | the grammar above | `tuff.command.scheduler` or `tuff.command.compute` |
+
+The compute summary with its `consumers` and `tasks` views, `reload` and the compute `jfr start/stop/dump`
+verbs always need `tuff.command.compute`. A sender holding only `tuff.command.scheduler` is refused them
+and `scheduler reset` with a line that names the permission those actions need. Tab completion offers
+each sender only the forms it may run; the split is stated in full in
+[scheduler/kairos.md](../scheduler/kairos.md#command-reference).
 
 Anything the layer cannot publish - disabled, failed, no sample yet, an unregistered compute pool -
 prints `n/a` with the reason on the same line rather than a zero. The shapes and the reset semantics

@@ -232,6 +232,25 @@ class KairosCommandReportTest {
     }
 
     @Test
+    void aWorkStealingServerIsToldTheThreadCountIsLive() {
+        final List<String> lines = KairosReport.overview("WORK_STEALING", 4, null);
+
+        final String text = String.join("\n", lines);
+        assertTrue(text.contains("configured region threads: 4"), text);
+        assertTrue(text.contains("applied live by the work stealing scheduler"), text);
+        assertFalse(text.contains("needs a restart"), text);
+    }
+
+    @Test
+    void edfKeepsTheRestartSentenceBecauseItCannotBeResized() {
+        final List<String> lines = KairosReport.overview("EDF", -1, null);
+
+        final String text = String.join("\n", lines);
+        assertTrue(text.contains("configured region threads: unknown (automatic)"), text);
+        assertTrue(text.contains("a change needs a restart"), text);
+    }
+
+    @Test
     void helpListsTheWholeSchedulerGrammar() {
         final List<String> lines = KairosReport.help();
 

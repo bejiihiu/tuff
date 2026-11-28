@@ -179,19 +179,28 @@ whether the fund is at its ceiling.
 
 ## Command reference
 
-`/tuff scheduler` is a `/tuff` subcommand. Reading it needs `tuff.command.scheduler`; the compute
-permission `tuff.command.compute` also accepts it, because operators had it before the scheduler report
-existed. Every form copies counters and, for the overview, walks the two tick queues under the schedule
-lock. Nothing else is touched: no region is scanned, no tick body is waited for, no file is read, no
-lock a runner holds is taken. The command therefore runs on whatever thread sent it, which on a Folia
-console is the global region tick thread.
+`/tuff scheduler` is a `/tuff` subcommand. The views are read-only diagnostics and the reset is a
+control action, so the command is split over two permissions:
+
+| Permission | What it grants |
+|---|---|
+| `tuff.command.compute` | every form of `/tuff`: the compute summary with its consumer and task views, `threads`, every scheduler view, `reload`, `jfr start/stop/dump` and `scheduler reset` |
+| `tuff.command.scheduler` | the read-only diagnostics only: `threads` and `scheduler` with `leases`, `budget` and `help` |
+
+Both default to operators. A sender holding only `tuff.command.scheduler` is refused the compute
+views, `reload`, `jfr start/stop/dump` and `scheduler reset` with a line that names
+`tuff.command.compute`, and tab completion only offers that sender the forms it may run. Every form
+copies counters and, for the overview, walks the two tick queues under the schedule lock. Nothing else
+is touched: no region is scanned, no tick body is waited for, no file is read, no lock a runner holds
+is taken. The command therefore runs on whatever thread sent it, which on a Folia console is the global
+region tick thread.
 
 | Command | What it prints |
 |---|---|
 | `/tuff scheduler` | overview: fund, queue, supervisor, fund events, tick counters, idle work, leases and degraded reasons |
 | `/tuff scheduler leases [n]` | the `n` worst recent permit waits (1 to 20, default 5) with region, tick, both waits and age |
 | `/tuff scheduler budget` | the budget ledger and its deduction terms, usable cores, the compute floor, the Kairos ceiling and the reason for any degraded state |
-| `/tuff scheduler reset` | zeroes the scheduler's A/B counters and returns one line; the fund, the regions and the permits stay |
+| `/tuff scheduler reset` | zeroes the scheduler's A/B counters and returns one line; the fund, the regions and the permits stay (control action: needs `tuff.command.compute`) |
 | `/tuff scheduler help` | the grammar above |
 
 An unknown argument under `scheduler` prints the usage line instead of failing. The parser never throws.
@@ -456,8 +465,15 @@ same miss next to free headroom is a slow tick.
 - **Not a faster scheduler.** Order and clamping are EDF's. Any gain must come from the elasticity
   and from the optional tick policies above; if a measurement shows none, the feature is expected to
   be removed rather than kept as a curiosity.
-- **Experimental.** No soak, no full A/B and no canary yet. Do not enable it on a server whose world
-  you cannot restore from a backup.
+- **Experimental.** There is no 24 hour production soak, no canary deployment and no complete A/B
+  series, and no performance number is published here. What does ship is a soak and fault-injection
+  suite that runs with the normal test task (`tuff-server/src/test/java/kz/bejiihiu/tuff/threads/soak`,
+  tag `soak`, a 150 s timeout per class): permit accounting under concurrent schedule and cancel churn
+  (`KairosPermitSoakTest`), lifecycle faults - a dead supervisor, a spawn that fails, a halt racing a
+  spawn or a retire, a repeated halt (`KairosLifecycleSoakTest`) - and a profiler that reads a clock and
+  a thread CPU counter on every body (`KairosProfilerSoakTest`). Each one drives the real scheduler and
+  asserts an invariant, and none of them runs for hours. Do not enable it on a server whose world you
+  cannot restore from a backup.
 - **NUMA and affinity are not supported.** Threads are created on demand by the supervisor and
   inherit whatever the OS gives them; there is no pinning and no NUMA node allocation.
 
