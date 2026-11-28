@@ -433,6 +433,8 @@ class RegionReliefTest {
             owner, new TestWork("snapshot", 7L, applied, new AtomicInteger(), new AtomicReference<>(), null)
         )));
         assertTrue(applied.await(10L, TimeUnit.SECONDS));
+        awaitUntil("the applied request is counted", Duration.ofSeconds(10L),
+            () -> this.relief.metrics().completed() == 1L);
 
         final RegionReliefMetrics metrics = this.relief.metrics();
         assertEquals(1L, metrics.completed());
