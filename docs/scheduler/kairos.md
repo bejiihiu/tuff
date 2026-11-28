@@ -127,10 +127,11 @@ thread-management:
   the end of `thread.start()`, and the join waits for that fence and re-checks liveness after joining,
   so a spawn that loses the race with `halt()` cannot leave a live thread behind a successful join. A
   runner that is started after the flag is set exits at its first loop check.
-- **`threads` is live.** While the fund is elastic, `/tuff reload`'s `threaded-regions.threads` moves
-  the floor: the supervisor grows towards it, and a lowered floor is drained one retire per second.
-  While the fund is fixed the value is still restart only and logs a warning instead of silently
-  doing nothing.
+- **`threads` is live.** While the fund is elastic, changing `threaded-regions.threads` in
+  `config/paper-global.yml` moves the floor without a restart: the scheduler receives the new value
+  through its post-process, the supervisor grows towards it, and a lowered floor is drained one
+  retire per second. While the fund is fixed the value is still restart only and logs a warning
+  instead of silently doing nothing.
 
 ## Configuration
 

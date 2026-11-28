@@ -386,8 +386,9 @@ These are facts, not measurements, and they need no baseline:
   thing to explain, before any tick number.
 - **`/tuff scheduler`.** Under Kairos it prints the fund, the queue, the supervisor and the degraded
   reasons; under EDF or work stealing it prints the configured thread count and says there is no
-  fund telemetry. Both `/tuff threads` and `/tuff scheduler` need `tuff.command.compute`; the
-  scheduler report also accepts `tuff.command.scheduler`.
+  fund telemetry. Both `/tuff threads` and the read-only scheduler views accept either
+  `tuff.command.compute` or `tuff.command.scheduler`; control actions (reload, JFR, scheduler reset)
+  need `tuff.command.compute`.
 
 A preset whose arithmetic does not appear here did not apply. Read the `Thread config:` and
 `Compute config:` warning lines before changing anything else.
