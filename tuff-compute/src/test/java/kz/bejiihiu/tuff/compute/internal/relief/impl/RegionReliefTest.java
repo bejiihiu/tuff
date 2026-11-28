@@ -99,8 +99,8 @@ class RegionReliefTest {
 
         assertTrue(accepted, "a healthy pool must take the request");
         assertTrue(applied.await(10L, TimeUnit.SECONDS), "the applicator must run");
-        awaitCompleted(1L);
-        awaitInFlightZero();
+        this.awaitCompleted(1L);
+        this.awaitInFlightZero();
         final RegionReliefMetrics metrics = this.relief.metrics();
         assertEquals(1L, metrics.requests());
         assertEquals(1L, metrics.accepted());
@@ -122,7 +122,7 @@ class RegionReliefTest {
         awaitUntil("the stale result is counted", Duration.ofSeconds(10L),
             () -> this.relief.metrics().stale() == 1L);
         assertTrue(work.terminal.await(10L, TimeUnit.SECONDS), "the discard callback must run");
-        awaitInFlightZero();
+        this.awaitInFlightZero();
         assertEquals(0, work.applies.get(), "a stale result must never be applied");
         assertEquals(1, work.discards.get(), "the work must hear about the discard exactly once");
         assertEquals(Reason.STALE, work.discardReason.get());
@@ -222,7 +222,7 @@ class RegionReliefTest {
         awaitUntil("the cancelled result is counted as dropped", Duration.ofSeconds(10L),
             () -> this.relief.metrics().dropped() == 1L);
         assertTrue(work.terminal.await(10L, TimeUnit.SECONDS), "the discard callback must run");
-        awaitInFlightZero();
+        this.awaitInFlightZero();
         assertEquals(0, work.applies.get(), "a cancelled region must not receive a result");
         assertEquals(1, work.discards.get());
         assertEquals(Reason.DROPPED, work.discardReason.get());
@@ -239,7 +239,7 @@ class RegionReliefTest {
         assertTrue(this.onRegion(() -> this.relief.submit(owner, work)));
 
         assertTrue(work.terminal.await(10L, TimeUnit.SECONDS), "the failure callback must run");
-        awaitInFlightZero();
+        this.awaitInFlightZero();
         assertEquals(0, work.applies.get(), "a failed computation must not be applied");
         assertEquals(1, work.failures.get(), "the failure must be reported exactly once");
         assertEquals(0, work.discards.get(), "a failure is not a discard");
@@ -302,7 +302,7 @@ class RegionReliefTest {
         release.countDown();
 
         assertTrue(work.terminal.await(10L, TimeUnit.SECONDS), "the terminal callback must still run");
-        awaitInFlightZero();
+        this.awaitInFlightZero();
         assertEquals(1, work.discards.get(), "the discard is delivered exactly once");
         assertEquals(Reason.DROPPED, work.discardReason.get());
         assertEquals(0, work.applies.get(), "a refused port must not receive the result");
@@ -410,7 +410,7 @@ class RegionReliefTest {
         awaitUntil("the expired request runs inline", Duration.ofSeconds(10L),
             () -> this.relief.metrics().expired() == 1L);
         assertTrue(applied.await(10L, TimeUnit.SECONDS), "the same work must be applied after expiry");
-        awaitCompleted(1L);
+        this.awaitCompleted(1L);
         assertEquals(1, applies.get());
         assertEquals(1L, this.relief.metrics().inlineFallbacks());
         assertEquals(1L, this.relief.metrics().completed());
