@@ -3,13 +3,13 @@ package kz.bejiihiu.tuff.compute.bootstrap;
 import io.papermc.paper.threadedregions.RegionizedServer;
 import java.util.List;
 import kz.bejiihiu.tuff.compute.AsyncComputeScheduler;
+import kz.bejiihiu.tuff.compute.ComputeSettings;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import kz.bejiihiu.tuff.threads.bootstrap.ThreadsBootstrap;
 import kz.bejiihiu.tuff.threads.bootstrap.ThreadsReport;
 import kz.bejiihiu.tuff.threads.bootstrap.ThreadsStatus;
 import kz.bejiihiu.tuff.threads.kairos.KairosReport;
 import kz.bejiihiu.tuff.threads.kairos.KairosScheduler;
-import kz.bejiihiu.tuff.threads.kairos.KairosSnapshot;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
@@ -25,7 +25,7 @@ import org.jspecify.annotations.Nullable;
 
 /**
  * The {@code /tuff} server command: engine summary, per consumer breakdown, configuration reload,
- * Flight Recorder control and the thread layer summary.
+ * Flight Recorder control, the thread layer summary and the region scheduler report.
  *
  * <p>Registered through the Bukkit command map next to {@code /tps}, so it survives {@code /reload}
  * and works from the console and from players alike. Reading metrics is lock free and can happen on
@@ -34,7 +34,9 @@ import org.jspecify.annotations.Nullable;
  * their own service thread and report back when they finish, so a dump never stalls the region that
  * ran the command. A disabled engine is never an error: the command says so and returns.
  *
- * <p>Permission {@code tuff.command.compute}, granted to operators by default.
+ * <p>Permission {@code tuff.command.compute}, granted to operators by default. The scheduler part of
+ * the command also accepts {@code tuff.command.scheduler}, so diagnostics can be handed out without
+ * the reload and Flight Recorder controls.
  */
 public final class TuffCommand extends Command implements TabCompleter {
 
@@ -90,6 +92,10 @@ public final class TuffCommand extends Command implements TabCompleter {
             case TASKS -> this.send(sender, ComputeReport.tasks(ComputeBootstrap.status(), request.limit()));
             case THREADS -> this.send(sender, ThreadsReport.overview(ThreadsBootstrap.status()));
             case SCHEDULER -> this.sendScheduler(sender);
+            case SCHEDULER_LEASES -> this.sendLeases(sender, request.limit());
+            case SCHEDULER_BUDGET -> this.sendBudget(sender);
+            case SCHEDULER_RESET -> this.resetScheduler(sender);
+            case SCHEDULER_HELP -> this.send(sender, KairosReport.help());
             case RELOAD -> this.reload(sender);
             case JFR_START -> this.startRecording(sender);
             case JFR_STOP, JFR_DUMP -> this.controlRecording(sender, action == ComputeCommand.Action.JFR_STOP);
@@ -128,13 +134,68 @@ public final class TuffCommand extends Command implements TabCompleter {
 
     private void sendScheduler(final CommandSender sender) {
         final ThreadsStatus status = ThreadsBootstrap.status();
-        final KairosSnapshot kairos = KairosScheduler.activeSnapshot();
         final ThreadManagementSettings settings = status.settings();
-        final String scheduler = kairos != null
-            ? "KAIROS"
-            : settings == null ? null : settings.regionExecution().scheduler().name();
         final int configured = settings == null ? -1 : settings.regionExecution().threads();
-        this.send(sender, KairosReport.overview(scheduler, configured, kairos));
+        this.send(sender, KairosReport.overview(activeScheduler(status), configured, status.kairos()));
+    }
+
+    private void sendLeases(final CommandSender sender, final int limit) {
+        final ThreadsStatus status = ThreadsBootstrap.status();
+        this.send(sender, KairosReport.leases(activeScheduler(status), status.kairos(), limit));
+    }
+
+    private void sendBudget(final CommandSender sender) {
+        final ThreadsStatus status = ThreadsBootstrap.status();
+        final ComputeSettings.@Nullable Workers workers = ComputeBootstrap.status().engine()
+            .map(engine -> engine.settings().workers())
+            .orElse(null);
+        this.send(sender, KairosReport.budget(new KairosReport.BudgetInput(
+            activeScheduler(status),
+            status.snapshot(),
+            status.sampleAgeMillis(),
+            status.snapshot() == null ? describeMissingSample(status) : null,
+            status.kairos(),
+            workers == null ? 0 : workers.minThreads(),
+            workers == null ? -1 : workers.maxThreads()
+        )));
+    }
+
+    private void resetScheduler(final CommandSender sender) {
+        final boolean applied = KairosScheduler.resetActiveCounters();
+        this.send(sender, KairosReport.reset(applied, activeScheduler(ThreadsBootstrap.status())));
+    }
+
+    /**
+     * Names the active region scheduler, or {@code null} when the thread layer cannot name one.
+     *
+     * @param status current thread layer status
+     * @return {@code KAIROS} while a fund exists, the configured name otherwise
+     */
+    private static @Nullable String activeScheduler(final ThreadsStatus status) {
+        if (status.kairos() != null) {
+            return "KAIROS";
+        }
+        final ThreadManagementSettings settings = status.settings();
+        return settings == null ? null : settings.regionExecution().scheduler().name();
+    }
+
+    /**
+     * Explains why the thread layer has no sample to read.
+     *
+     * @param status current thread layer status
+     * @return one clause for the budget view
+     */
+    private static String describeMissingSample(final ThreadsStatus status) {
+        return switch (status.state()) {
+            case NOT_INITIALISED -> "not started yet; the ledger, the deductions and usable cores are n/a "
+                + "until the thread layer starts";
+            case DISABLED -> "disabled (thread-management.enabled: false); the ledger, the deductions and "
+                + "usable cores are n/a";
+            case FAILED -> "failed to start (the cause is in the Tuff/Threads log); the ledger, the "
+                + "deductions and usable cores are n/a";
+            case RUNNING -> "running, no sample yet (the refresher takes one pass per second); the ledger, "
+                + "the deductions and usable cores are n/a until it publishes one";
+        };
     }
 
     private boolean allowed(final CommandSender sender) {

@@ -11,9 +11,11 @@ import java.util.Objects;
  * a runner, which is what makes it safe to build on the global region tick thread the console command
  * runs on.
  *
- * <p>Every age in the snapshot is the age of a tick's {@code scheduledStart}: a positive number means
- * the deadline has already passed and the tick is still waiting. A tick whose deadline is still in the
- * future contributes zero, so an empty queue and a queue of early ticks both read as zero wait.
+ * <p>Every queue age in the snapshot is the age of a tick's {@code scheduledStart}: a positive number
+ * means the deadline has already passed and the tick is still waiting. A tick whose deadline is still in
+ * the future contributes zero, so an empty queue and a queue of early ticks both read as zero wait. The
+ * one other age is {@link LeaseWait.Sample#ageMillis()}, which is how long ago a permit wait was
+ * measured, not how long the tick waited.
  *
  * <p>{@code budgetSource} is the text the scheduler resolved at start. It is {@code null} before the
  * scheduler starts; printing the operator's ceiling there instead of a resolved one would hide a
@@ -46,6 +48,10 @@ import java.util.Objects;
  * @param catchUpBursts           catch-up bursts the fund started
  * @param catchUpTicks            tick bodies run to recover a backlog
  * @param idleWork                the idle path: what it is allowed to do, what it did and why it stopped
+ * @param executedTicks           tick bodies started since the process began
+ * @param affinityMisses          picks that came from outside the runner's own backlog
+ * @param overdueWarns            queued-overdue warnings written since the process began
+ * @param suppressedOverdueWarns  overdue passes the quiet window swallowed since the last warning
  */
 public record KairosSnapshot(
     boolean elastic,
@@ -74,7 +80,11 @@ public record KairosSnapshot(
     long stolenTicks,
     long catchUpBursts,
     long catchUpTicks,
-    IdleWork idleWork
+    IdleWork idleWork,
+    long executedTicks,
+    long affinityMisses,
+    long overdueWarns,
+    long suppressedOverdueWarns
 ) {
 
     /**
@@ -197,19 +207,35 @@ public record KairosSnapshot(
      * runners racing for the same maximum may overwrite each other, and a metric that is occasionally
      * one sample short is worth more than an atomic on the tick path.
      *
+     * <p>{@code recent} is a bounded ring of the latest waits; the slot order is not chronological and
+     * the command sorts it. A sample is one grant, so the list never grows with uptime and a busy server
+     * overwrites the oldest entry instead of allocating a history.
+     *
      * @param grants             permits handed out and measured
      * @param queuedMaxMillis    longest wait between a deadline and its permit grant
      * @param parkedMaxMillis    longest wait between the later of grant and deadline and the body
      * @param timeouts           grants whose wait exceeded the timeout
      * @param timeoutMillis      configured timeout, or zero when only accounting is on
+     * @param recent             latest measured waits, at most a few dozen, possibly empty
      */
     public record LeaseWait(
         long grants,
         long queuedMaxMillis,
         long parkedMaxMillis,
         long timeouts,
-        long timeoutMillis
+        long timeoutMillis,
+        List<Sample> recent
     ) {
+
+        /**
+         * Validates the record.
+         *
+         * @throws NullPointerException if {@code recent} is {@code null}
+         */
+        public LeaseWait {
+            Objects.requireNonNull(recent, "recent");
+            recent = List.copyOf(recent);
+        }
 
         /**
          * Returns whether the operator asked to be warned about slow permits.
@@ -218,6 +244,33 @@ public record KairosSnapshot(
          */
         public boolean armed() {
             return this.timeoutMillis > 0L;
+        }
+
+        /**
+         * One measured permit wait: who waited, for how long, and how long ago.
+         *
+         * @param regionId       region that owned the tick, or {@code -1} when the tick is not a region
+         * @param tickId         id of the tick the permit was granted for
+         * @param queuedMillis   wait between the deadline and the grant
+         * @param parkedMillis   wait between the later of grant and deadline and the body start
+         * @param ageMillis      time between the measurement and this snapshot
+         */
+        public record Sample(
+            long regionId,
+            long tickId,
+            long queuedMillis,
+            long parkedMillis,
+            long ageMillis
+        ) {
+
+            /**
+             * Returns the worse of the two waits, which is how samples are ranked.
+             *
+             * @return {@code max(queued, parked)} in milliseconds
+             */
+            public long worstWaitMillis() {
+                return Math.max(this.queuedMillis, this.parkedMillis);
+            }
         }
     }
 

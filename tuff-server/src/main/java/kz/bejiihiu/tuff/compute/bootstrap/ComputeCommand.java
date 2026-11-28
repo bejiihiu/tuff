@@ -21,6 +21,10 @@ import org.jspecify.annotations.Nullable;
  *     <li>{@code /tuff compute jfr start|stop|dump} - Flight Recorder control;</li>
  *     <li>{@code /tuff threads} - pools, coverage and degraded reasons of the thread layer;</li>
  *     <li>{@code /tuff scheduler} - active region scheduler, Kairos fund and wait queue;</li>
+ *     <li>{@code /tuff scheduler leases [n]} - worst recent permit waits;</li>
+ *     <li>{@code /tuff scheduler budget} - budget ledger, usable cores and degraded reasons;</li>
+ *     <li>{@code /tuff scheduler reset} - zero the scheduler's A/B counters;</li>
+ *     <li>{@code /tuff scheduler help} - the scheduler grammar;</li>
  *     <li>{@code /tuff status} and {@code /tuff reload} - shorthands for the two commands above.</li>
  * </ul>
  */
@@ -30,7 +34,14 @@ public final class ComputeCommand {
      * Usage line shown on argument errors and in {@code /help}.
      */
     public static final String USAGE =
-        "/tuff [compute] [consumers|tasks [n]|reload|jfr <start|stop|dump>] | /tuff threads | /tuff scheduler";
+        "/tuff [compute] [consumers|tasks [n]|reload|jfr <start|stop|dump>] | /tuff threads | "
+            + "/tuff scheduler [leases [n]|budget|reset|help]";
+
+    /**
+     * Usage line of the scheduler subcommand, shown by {@code /tuff scheduler help} and on a wrong
+     * scheduler argument.
+     */
+    public static final String SCHEDULER_USAGE = "/tuff scheduler [leases [n]|budget|reset|help]";
 
     /**
      * Number of tasks {@code /tuff compute tasks} shows when no count is given.
@@ -42,9 +53,20 @@ public final class ComputeCommand {
      */
     public static final int MAX_TASK_LIMIT = 50;
 
+    /**
+     * Number of permit waits {@code /tuff scheduler leases} shows when no count is given.
+     */
+    public static final int DEFAULT_LEASE_LIMIT = 5;
+
+    /**
+     * Upper bound for the optional lease count.
+     */
+    public static final int MAX_LEASE_LIMIT = 20;
+
     private static final List<String> ROOT = List.of("compute", "status", "reload", "threads", "scheduler");
     private static final List<String> COMPUTE = List.of("consumers", "tasks", "reload", "jfr");
     private static final List<String> JFR = List.of("start", "stop", "dump");
+    private static final List<String> SCHEDULER = List.of("leases", "budget", "reset", "help");
 
     private ComputeCommand() {
     }
@@ -63,10 +85,41 @@ public final class ComputeCommand {
             case "status" -> exactly(args, 1, Action.SUMMARY);
             case "reload" -> exactly(args, 1, Action.RELOAD);
             case "threads" -> exactly(args, 1, Action.THREADS);
-            case "scheduler" -> exactly(args, 1, Action.SCHEDULER);
+            case "scheduler" -> parseScheduler(args);
             case "compute" -> parseCompute(args);
             default -> Request.error("Unknown subcommand '" + args[0] + "'. Usage: " + USAGE);
         };
+    }
+
+    private static Request parseScheduler(final String[] args) {
+        if (args.length == 1) {
+            return Request.of(Action.SCHEDULER);
+        }
+        return switch (args[1].toLowerCase(Locale.ROOT)) {
+            case "leases" -> parseLeases(args);
+            case "budget" -> exactly(args, 2, Action.SCHEDULER_BUDGET, SCHEDULER_USAGE);
+            case "reset" -> exactly(args, 2, Action.SCHEDULER_RESET, SCHEDULER_USAGE);
+            case "help" -> exactly(args, 2, Action.SCHEDULER_HELP, SCHEDULER_USAGE);
+            default -> Request.error(
+                "Unknown scheduler subcommand '" + args[1] + "'. Usage: " + SCHEDULER_USAGE
+            );
+        };
+    }
+
+    private static Request parseLeases(final String[] args) {
+        if (args.length == 2) {
+            return Request.leases(DEFAULT_LEASE_LIMIT);
+        }
+        if (args.length > 3) {
+            return Request.error("Usage: /tuff scheduler leases [n]");
+        }
+        final int requested;
+        try {
+            requested = Integer.parseInt(args[2]);
+        } catch (NumberFormatException _) {
+            return Request.error("'" + args[2] + "' must be a number between 1 and " + MAX_LEASE_LIMIT);
+        }
+        return Request.leases(Math.clamp(requested, 1, MAX_LEASE_LIMIT));
     }
 
     private static Request parseCompute(final String[] args) {
@@ -109,17 +162,19 @@ public final class ComputeCommand {
             return List.of();
         }
         final int index = args.length - 1;
-        if (index >= 1 && !args[0].equalsIgnoreCase("compute")) {
+        final boolean compute = args[0].equalsIgnoreCase("compute");
+        final boolean scheduler = args[0].equalsIgnoreCase("scheduler");
+        if (index >= 1 && !compute && !scheduler) {
             return List.of();
         }
-        if (index == 2 && !args[1].equalsIgnoreCase("jfr")) {
+        if (index >= 2 && !(compute && args[1].equalsIgnoreCase("jfr"))) {
+            // tasks and leases take a number, the other subcommands take nothing: no word to suggest
             return List.of();
         }
         final List<String> candidates = switch (index) {
             case 0 -> ROOT;
-            case 1 -> COMPUTE;
-            case 2 -> JFR;
-            default -> List.of();
+            case 1 -> compute ? COMPUTE : SCHEDULER;
+            default -> JFR;
         };
         return filter(candidates, args[index]);
     }
@@ -140,8 +195,17 @@ public final class ComputeCommand {
     }
 
     private static Request exactly(final String[] args, final int expected, final Action action) {
+        return exactly(args, expected, action, USAGE);
+    }
+
+    private static Request exactly(
+        final String[] args,
+        final int expected,
+        final Action action,
+        final String usage
+    ) {
         if (args.length != expected) {
-            return Request.error("Usage: " + USAGE);
+            return Request.error("Usage: " + usage);
         }
         return Request.of(action);
     }
@@ -193,6 +257,26 @@ public final class ComputeCommand {
         SCHEDULER,
 
         /**
+         * Worst recent permit waits of the Kairos fund.
+         */
+        SCHEDULER_LEASES,
+
+        /**
+         * Budget ledger, usable cores and degraded reasons of the thread layer and the fund.
+         */
+        SCHEDULER_BUDGET,
+
+        /**
+         * Zero the scheduler's A/B counters without touching the fund.
+         */
+        SCHEDULER_RESET,
+
+        /**
+         * Usage of the scheduler subcommand.
+         */
+        SCHEDULER_HELP,
+
+        /**
          * Start a Flight Recorder recording that includes the compute events.
          */
         JFR_START,
@@ -213,7 +297,8 @@ public final class ComputeCommand {
      *
      * @param action the action to run, {@code null} when parsing failed
      * @param error  the problem to show, {@code null} when parsing succeeded
-     * @param limit  requested number of tasks for {@link Action#TASKS}, {@code 0} otherwise
+     * @param limit  requested count for {@link Action#TASKS} and {@link Action#SCHEDULER_LEASES},
+     *               {@code 0} otherwise
      */
     public record Request(@Nullable Action action, @Nullable String error, int limit) {
 
@@ -249,6 +334,16 @@ public final class ComputeCommand {
          */
         static Request tasks(final int limit) {
             return new Request(Action.TASKS, null, limit);
+        }
+
+        /**
+         * Creates a permit wait listing request.
+         *
+         * @param limit number of waits to show, already clamped into the accepted range
+         * @return the request
+         */
+        static Request leases(final int limit) {
+            return new Request(Action.SCHEDULER_LEASES, null, limit);
         }
 
         /**

@@ -177,19 +177,36 @@ is one `WARN` per minute: the fund keeps the size it has and the ticks keep runn
 a slow permit are one `WARN` per ten seconds each, and the lines name the region, its wait, and
 whether the fund is at its ceiling.
 
-## `/tuff scheduler`
+## Command reference
 
-The command is a `/tuff` subcommand and needs `tuff.command.compute` (operators get it by default). It
-reads counters and walks the two tick queues under the schedule lock; it never walks regions and
-never waits for a tick. The shape is fixed, the numbers are whatever the server is doing:
+`/tuff scheduler` is a `/tuff` subcommand. Reading it needs `tuff.command.scheduler`; the compute
+permission `tuff.command.compute` also accepts it, because operators had it before the scheduler report
+existed. Every form copies counters and, for the overview, walks the two tick queues under the schedule
+lock. Nothing else is touched: no region is scanned, no tick body is waited for, no file is read, no
+lock a runner holds is taken. The command therefore runs on whatever thread sent it, which on a Folia
+console is the global region tick thread.
+
+| Command | What it prints |
+|---|---|
+| `/tuff scheduler` | overview: fund, queue, supervisor, fund events, tick counters, idle work, leases and degraded reasons |
+| `/tuff scheduler leases [n]` | the `n` worst recent permit waits (1 to 20, default 5) with region, tick, both waits and age |
+| `/tuff scheduler budget` | the budget ledger and its deduction terms, usable cores, the compute floor, the Kairos ceiling and the reason for any degraded state |
+| `/tuff scheduler reset` | zeroes the scheduler's A/B counters and returns one line; the fund, the regions and the permits stay |
+| `/tuff scheduler help` | the grammar above |
+
+An unknown argument under `scheduler` prints the usage line instead of failing. The parser never throws.
+
+### Overview
+
+The shape is fixed, the numbers are whatever the server is doing:
 
 ```
 Tuff scheduler: Kairos (experimental) - status: ok
   fund: min 2, live 3, target 4, max 11; elasticity on, ceiling source: utmi budget (usable cores plus the deducted region threads)
-  queue: 1 queued, 2 awaiting, 0 executing (3 scheduled); tick wait avg 40.0 ms, max 104.0 ms; overdue 1 (threshold 166 ms, oldest 180 ms)
+  queue: 1 queued, 2 awaiting, 0 executing (3 scheduled); tick wait avg 40.0 ms, max 104.0 ms; overdue 1 (threshold 166 ms, oldest 180 ms); warnings 2 (1 suppressed)
   supervisor: running; last decision grow (2 -> 3, target 4)
   fund events: spawned 1, retired 0
-  ticks: affinity hits 214, steals 3, catch-up 7 burst(s) / 12 tick(s)
+  ticks: executed 9120, affinity hits 214, misses 3, steals 3, catch-up 7 burst(s) / 12 tick(s)
   idle work: off (idle-work.enabled is false)
   leases: 812 measured, wait max queued 24 ms / parked 4 ms, 3 over the 100 ms timeout
   degraded: none
@@ -210,9 +227,15 @@ Tuff scheduler: Kairos (experimental) - status: ok
 - `overdue` counts waiting ticks in the shared queue **and** in runner backlogs, so affinity cannot
   hide a tick from the detector. `threshold` is two observed periods with a 100 ms floor: `100 ms` on
   a healthy 20 TPS server, `166 ms` at 12 TPS.
-- `ticks` is the affinity counter pair and the catch-up counters: `affinity hits` are ticks handed
-  back to the runner that ran them last, `steals` are ticks another runner took because they were
-  late, and `catch-up bursts / tick(s)` are the bursts started and the extra bodies they ran.
+- `ticks` is the performance pair plus the catch-up counters: `executed` is the number of bodies
+  started since the process began (or since the last reset), `affinity hits` are ticks handed back to
+  the runner that ran them last, `misses` are picks that came from outside that runner's own backlog
+  (including steals), `steals` are ticks another runner took because they were late, and
+  `catch-up bursts / tick(s)` are the bursts started and the extra bodies they ran. Under a fund with
+  affinity turned off, `hits` and `misses` stay at zero because locality never applied.
+- `warnings` on the queue line counts queued-overdue warnings written and the passes the ten second
+  quiet window swallowed. A fixed fund has no supervisor and therefore no warnings; its `overdue`
+  gauge is still filled by the command's own walk.
 - `leases` is the permit accounting: grants measured, the worst wait before a permit existed, the
   worst wait after it existed, and the timeouts when a timeout is configured.
 - `idle work` names the sources and what they did: jobs and mid-tick passes taken, preemptions, wall
@@ -226,6 +249,135 @@ Tuff scheduler: Kairos (experimental) - status: ok
 
 `/tuff threads` shows the same fund condensed into one `scheduler:` line, and under EDF or work
 stealing says `no fund telemetry (Kairos only)`.
+
+### Lease ranking
+
+```
+Tuff scheduler: leases (recent permit waits)
+  grants: 812 measured, 3 over the 100 ms timeout; worst queued 240 ms, worst parked 41 ms
+  worst waits: top 5 of 16 recent sample(s)
+    #1 region 3, tick 4811: queued 240 ms, parked 41 ms, age 1.2 s ago
+    #2 region 11, tick 4802: queued 118 ms, parked 22 ms, age 1.3 s ago
+    #3 region unknown, tick 4790: queued 90 ms, parked 1 ms, age 1.4 s ago
+```
+
+- Every measured grant leaves one sample behind: region id, tick id, the wait between the deadline and
+  the permit (`queued`), the wait between the later of grant and deadline and the body (`parked`), and
+  the moment of the measurement. The sample is one small immutable record; nothing on the tick path
+  formats or sorts.
+- Samples are ranked by the worse of the two waits, descending, with the higher tick id first on a
+  tie. `queued` is the shortage signal - a region waited for a permit - and `parked` is contention -
+  the permit existed, the deadline had passed, and the body still did not start.
+- `age` is how long ago the wait was measured, not how long the tick waited. A sample that is minutes
+  old is historical, and the current queue line in the overview is the live number.
+- `region unknown` means the tick is not a region handle (a synthetic test tick, or a scheduler
+  wrapper this project does not know); the tick id is still printed. The region id comes from the
+  public field Folia already exposes, read through a per-class cached lookup.
+- The history is a fixed ring of 32 samples, overwritten in place. Memory does not grow with uptime and
+  a server that ran for a week prints the same shape as one that just started. A sample that is
+  overwritten mid-read is read as either the old or the new record, never as a torn one.
+- `n` is 1 to 20 and defaults to 5. More than the ring holds simply prints the whole ring. `grants:
+  none measured yet` means no permit was handed out since start or since the last reset, not that the
+  measurement is broken.
+- Under EDF or `WORK_STEALING` the command prints `no permit waits: only Kairos keeps a tick fund` and
+  names the active scheduler. Those schedulers hand permits out inside code this project cannot read.
+
+### Budget
+
+```
+Tuff scheduler: budget
+  thread layer: running, sample taken 412 ms ago
+  ledger: cores 16: ceiling 12 = region 2 + chunk 4 + io 1 + reserve 1 + usable 4
+  deductions: region 2, chunk 4, io 1, reserve 1 core(s)
+  usable: 4 core(s) after every deduction; 1 core(s) reserved by configuration, 0 held for the critical lanes
+  compute: floor 1 worker(s), max auto; effective budget 4 core(s) (the pool's declared budget resolved against the ledger's usable cores)
+  kairos: min 2, max 4 tick thread(s) (the resolved ceiling); budget source: utmi budget (usable cores plus the deducted region threads)
+  degraded: none
+```
+
+- `ledger` is verbatim the thread layer's own budget line, produced from the plan the controller is
+  actually using: ceiling, every deducted lane, the reserved cores and the remainder, with the floor
+  called out when the subtraction went to zero or below.
+- `deductions` reads the individual terms back out of that same line. The thread layer publishes them
+  as one sentence rather than as separate accessors, so the command does not keep a second copy of the
+  arithmetic; a line whose terms cannot be read prints `n/a` with the reason instead of a guess.
+- `usable` is the ledger's `usable`, the one usable number of the module. It is already net of region,
+  chunk, IO, the reserve and the critical reserve; nothing here subtracts any of them again.
+- `compute` is the compute engine's own floor (`workers.min-threads`) and its declared pool budget
+  resolved against the usable cores. The resolved number is what the pool may claim, not a promise
+  that it currently has that many workers; `/tuff compute` prints the live count.
+- `kairos` is the floor, the resolved ceiling and the source string the scheduler recorded at start.
+  Like the rest of the Kairos section, a new ceiling needs a restart.
+- Anything the thread layer cannot publish right now is `n/a` with the reason on the same line: layer
+  disabled, layer failed, refresher has not taken its first pass, the compute pool is not registered.
+  A number is never invented to fill the gap, and a zero is never printed where the value is unknown.
+- `degraded` names every reason and what it means, from both surfaces: the thread layer's pool reasons
+  (`BUDGET_EXHAUSTED`, `SCHEDULER_LIMITATION`, `CRITICAL_POOL_PRESSURE`, ...) and the fund's own
+  (`kairos NO_HEADROOM`, `kairos SUPERVISOR_DEAD`, `kairos QUEUED_OVERDUE`). `none` means both lists
+  are empty, not that nobody looked.
+
+### Reset
+
+```
+Tuff scheduler: counters reset (spawns, retires, executed ticks, affinity hits and misses, steals, catch-up bursts and ticks, permit waits and their worst values, overdue warnings); the fund, the regions and the permits are untouched.
+```
+
+- The point is a measurement window. An A/B series starts when the operator says so; recreating the
+  scheduler for that would lose the live threads, the permits and the queue, and would make the two
+  arms incomparable.
+- Zeroed: spawn and retire counts, executed ticks, affinity hits and misses, steals, catch-up bursts
+  and ticks, measured grants and timeouts, the worst queued and parked waits, the recent sample ring,
+  the overdue warning counters and the suppressed counts.
+- Not touched: the floor, the ceiling, the live threads, the target, the queues, the permits, the
+  observed period, the idle-work accounting and the last supervisor decision.
+- Threading: every zeroed value is an atomic or a volatile counter, the ring is an array of
+  independently published references, and the call takes no schedule lock, walks no queue and waits
+  for no runner. It is safe from a tick body and from the global tick thread. The zeroing is a
+  sequence of independent writes, so a snapshot taken in that same instant can mix a zero with a value
+  that has not been zeroed yet; that is a torn window, not a broken fund.
+- Without a running fund the command refuses and says why:
+  `Tuff scheduler: counters not reset: Kairos is not running (the active scheduler is EDF), so there
+  are no counters to zero`.
+
+### Help
+
+```
+Tuff scheduler commands:
+  /tuff scheduler                fund, queue, supervisor, idle work, leases and degraded state
+  /tuff scheduler leases [n]     worst recent permit waits (n 1..20, default 5)
+  /tuff scheduler budget         budget ledger, usable cores and the reason for any degraded state
+  /tuff scheduler reset          zero the scheduler's A/B counters; the fund and the permits stay
+  /tuff scheduler help           this list
+```
+
+`/tuff scheduler` with an argument it does not know prints the same grammar, so a typo costs one line
+of output and never an exception.
+
+## Admission
+
+This part is stated plainly because "scheduler" invites assumptions it does not meet.
+
+- **Kairos does not arbitrate between regions beyond EDF.** It sorts one queue by deadline and hands
+  permits to runners. There is no per-region quota, no priority above the deadline order, no fair
+  share, no preemption of a region that already holds a permit. A region that is late is late; the
+  fund can add a thread, and that is the whole remedy.
+- **There is no external blocking acquire.** Nothing in Kairos makes a caller wait for a permit. A
+  region calls `schedule` and returns; the tick waits in the queue and a runner picks it up. A tick
+  body never blocks on the fund, and a plugin cannot ask the scheduler for capacity.
+- **The lease wait is observability.** `queued` and `parked` measure how long a permit took and how
+  long a due body then waited. They do not gate anything: no tick is dropped, refused or reordered
+  because of them, and the timeout only decides whether a warning is written.
+- **Capacity admission lives in the UTMI resource controller.** It owns the ledger, the usable cores,
+  the critical reserve, leases and load shedding; that is where a pool is told how much it may start.
+  Kairos asks it exactly once, at start, for a ceiling, and then keeps its own fund inside it. It
+  neither duplicates nor overrides the controller's arithmetic.
+- **Idle work has its own guards.** A slice is bounded by wall clock (`slice-millis`), by the next
+  deadline, by `max-share-percent` of a one second window, and by the self-protection that turns the
+  whole path off when it added more lateness than `max-added-lag-millis`. None of that is admission
+  either: it is housekeeping that never delays a due tick on purpose.
+
+Adding real admission - refusing or queueing work by region before it starts - would be a different
+feature with a different failure mode, and it is not in this build.
 
 ## Recording
 
@@ -281,7 +433,8 @@ same miss next to free headroom is a slow tick.
   deadline, so even a value that moves under a runner cannot park it indefinitely.
 - **A stale tick is detected, not fixed.** The warning proves that permits, not CPU scarcity, are the
   reason a region is not moving; it cannot create capacity that is not there. The honest fixes are
-  fewer regions or a larger budget, and admission control is not in this prototype.
+  fewer regions or a larger budget, and admission control is not part of Kairos - see
+  [Admission](#admission).
 - **Affinity trades latency for locality.** A late tick that another runner could have taken waits for
   its owner until it is past the steal threshold, and an owner that frees up before that moment runs
   it itself. The wait is bounded by the owner's current body, and the private queue is only used while

@@ -106,6 +106,67 @@ class ComputeCommandTest {
     }
 
     @Test
+    void schedulerDetailsAreRecognized() {
+        assertAction(ComputeCommand.Action.SCHEDULER_LEASES, "scheduler", "leases");
+        assertAction(ComputeCommand.Action.SCHEDULER_BUDGET, "scheduler", "budget");
+        assertAction(ComputeCommand.Action.SCHEDULER_RESET, "scheduler", "RESET");
+        assertAction(ComputeCommand.Action.SCHEDULER_HELP, "scheduler", "help");
+        assertAction(ComputeCommand.Action.SCHEDULER_HELP, "scheduler", "HELP");
+    }
+
+    @Test
+    void leaseListingDefaultsToFiveAndClampsTheCount() {
+        assertLeases(ComputeCommand.DEFAULT_LEASE_LIMIT, "scheduler", "leases");
+        assertLeases(7, "scheduler", "leases", "7");
+        assertLeases(ComputeCommand.MAX_LEASE_LIMIT, "scheduler", "leases", "500");
+        assertLeases(1, "scheduler", "leases", "0");
+        assertLeases(1, "scheduler", "leases", "-4");
+    }
+
+    @Test
+    void aBrokenLeaseCountExplainsTheAcceptedRange() {
+        final ComputeCommand.Request request = ComputeCommand.parse(new String[] {"scheduler", "leases", "many"});
+
+        assertTrue(request.failed());
+        assertTrue(request.error().contains("between 1 and " + ComputeCommand.MAX_LEASE_LIMIT), request.error());
+    }
+
+    @Test
+    void extraLeaseArgumentsAreRejected() {
+        final ComputeCommand.Request request = ComputeCommand.parse(
+            new String[] {"scheduler", "leases", "5", "more"}
+        );
+
+        assertTrue(request.failed());
+        assertTrue(request.error().contains("/tuff scheduler leases [n]"), request.error());
+    }
+
+    @Test
+    void anUnknownSchedulerSubcommandShowsTheSchedulerUsage() {
+        final ComputeCommand.Request request = ComputeCommand.parse(new String[] {"scheduler", "nonsense"});
+
+        assertTrue(request.failed());
+        assertTrue(request.error().contains(ComputeCommand.SCHEDULER_USAGE), request.error());
+    }
+
+    @Test
+    void schedulerDetailsRejectExtraArguments() {
+        final ComputeCommand.Request request = ComputeCommand.parse(new String[] {"scheduler", "budget", "now"});
+
+        assertTrue(request.failed());
+        assertTrue(request.error().contains(ComputeCommand.SCHEDULER_USAGE), request.error());
+    }
+
+    @Test
+    void schedulerSubcommandCompletesItsOwnGrammar() {
+        assertEquals(List.of("leases", "budget", "reset", "help"), completions("scheduler", ""));
+        assertEquals(List.of("leases"), completions("scheduler", "l"));
+        assertEquals(List.of(), completions("scheduler", "leases", ""));
+        assertEquals(List.of(), completions("scheduler", "budget", ""));
+        assertEquals(List.of(), completions("scheduler", "reset", ""));
+    }
+
+    @Test
     void completionsWalkDownTheArgumentTree() {
         assertEquals(List.of("compute", "status", "reload", "threads", "scheduler"), completions(""));
         assertEquals(List.of("compute"), completions("c"));
@@ -144,6 +205,13 @@ class ComputeCommandTest {
         final ComputeCommand.Request request = ComputeCommand.parse(args);
         assertFalse(request.failed(), () -> "unexpected error: " + request.error());
         assertEquals(ComputeCommand.Action.TASKS, request.action());
+        assertEquals(expectedLimit, request.limit());
+    }
+
+    private static void assertLeases(final int expectedLimit, final String... args) {
+        final ComputeCommand.Request request = ComputeCommand.parse(args);
+        assertFalse(request.failed(), () -> "unexpected error: " + request.error());
+        assertEquals(ComputeCommand.Action.SCHEDULER_LEASES, request.action());
         assertEquals(expectedLimit, request.limit());
     }
 

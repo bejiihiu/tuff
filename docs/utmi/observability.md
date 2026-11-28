@@ -126,7 +126,26 @@ How to read it:
   status. Under EDF or `WORK_STEALING` it says `no fund telemetry (Kairos only)`: those schedulers have
   no fund, supervisor or readable wait queue, and a made-up number would be worse than the sentence.
   `/tuff scheduler` prints the same facts with the tick wait ages, the last fund decision and the
-  degraded reasons, and adds the configured thread count for the schedulers that have no fund.
+  degraded reasons, and adds the configured thread count for the schedulers that have no fund. Its
+  `leases` view ranks the recent permit waits, `budget` prints the ledger and the reason for every
+  degraded state, and `reset` starts a new measurement window without touching the fund.
+
+### Scheduler views
+
+The `/tuff scheduler` details read the same cached sample, the fund's own counters and the budget
+ledger; none of them measures anything on the calling thread.
+
+| Command | What it prints | Permission |
+| --- | --- | --- |
+| `/tuff scheduler` | fund, queue, supervisor, tick counters, idle work, lease totals, degraded reasons | `tuff.command.scheduler` |
+| `/tuff scheduler leases [n]` | the `n` worst recent permit waits with region, tick, queued wait, parked wait and age, 1 to 20, default 5 | `tuff.command.scheduler` |
+| `/tuff scheduler budget` | the budget ledger and its region, chunk, IO and reserve terms, usable cores, the compute floor, the Kairos floor/ceiling and the reason for every degraded state | `tuff.command.scheduler` |
+| `/tuff scheduler reset` | one line confirming that the A/B counters were zeroed; the fund, the regions and the permits stay | `tuff.command.scheduler` |
+| `/tuff scheduler help` | the grammar above | `tuff.command.scheduler` |
+
+Anything the layer cannot publish - disabled, failed, no sample yet, an unregistered compute pool -
+prints `n/a` with the reason on the same line rather than a zero. The shapes and the reset semantics
+are in [scheduler/kairos.md](../scheduler/kairos.md#command-reference).
 
 ## What a snapshot contains
 

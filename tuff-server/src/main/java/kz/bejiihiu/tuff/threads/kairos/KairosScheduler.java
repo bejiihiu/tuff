@@ -7,6 +7,7 @@ import ca.spottedleaf.concurrentutil.set.LinkedSortedSet;
 import ca.spottedleaf.concurrentutil.util.ConcurrentUtil;
 import ca.spottedleaf.concurrentutil.util.LazyRunnable;
 import java.lang.invoke.VarHandle;
+import java.lang.reflect.Field;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -24,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
@@ -66,6 +68,13 @@ import org.jspecify.annotations.Nullable;
  * class only sorts by the value the handle wrote.
  */
 public final class KairosScheduler extends Scheduler {
+
+    /**
+     * Slots of the recent permit wait ring. A power of two so the cursor masks instead of dividing.
+     * Thirty two entries cover the twenty a command may print with history to spare, and a busy server
+     * overwrites its oldest sample instead of growing a history.
+     */
+    static final int LEASE_RING_SIZE = 32;
 
     private static final Logger LOGGER = LogManager.getLogger("Tuff/Kairos");
 
@@ -157,6 +166,36 @@ public final class KairosScheduler extends Scheduler {
      */
     private static final AtomicReference<@Nullable KairosScheduler> ACTIVE = new AtomicReference<>();
 
+    /**
+     * Cached readers for a tick's region id.
+     *
+     * <p>The facade patch only adds the deadline accessor, so the region comes from the public field
+     * Folia already exposes. The lookups are cached per tick class because the tick path asks for a
+     * region on every grant, and a reflective field search there would cost more than the measurement
+     * it records. A class without the two fields answers {@code -1} for every tick.
+     */
+    private static final ClassValue<ToLongFunction<SchedulableTick>> REGION_ID = new ClassValue<>() {
+        @Override
+        protected ToLongFunction<SchedulableTick> computeValue(final Class<?> type) {
+            final Field regionField;
+            final Field idField;
+            try {
+                regionField = type.getField("region");
+                idField = regionField.getType().getField("id");
+            } catch (NoSuchFieldException | RuntimeException _) {
+                return tick -> -1L;
+            }
+            return tick -> {
+                try {
+                    final Object region = regionField.get(tick);
+                    return region == null ? -1L : idField.getLong(region);
+                } catch (IllegalAccessException | RuntimeException _) {
+                    return -1L;
+                }
+            };
+        }
+    };
+
     private final ToLongFunction<SchedulableTick> scheduledStart;
     private final ThreadFactory threadFactory;
 
@@ -235,7 +274,10 @@ public final class KairosScheduler extends Scheduler {
     private long lastOverdueWarnNanos;
 
     /** Supervisor only: overdue passes that the quiet window swallowed since the last warning. */
-    private long suppressedOverdueWarns;
+    private final AtomicLong suppressedOverdueWarns = new AtomicLong();
+
+    /** Queued-overdue warnings actually written since the process began. */
+    private final LongAdder overdueWarns = new LongAdder();
 
     private volatile int minThreads;
 
@@ -327,6 +369,12 @@ public final class KairosScheduler extends Scheduler {
     /** Ticks that were handed back to the runner that just ran them. */
     private final LongAdder affinityHits = new LongAdder();
 
+    /** Picks that came from outside the runner's own backlog; a steal counts here too. */
+    private final LongAdder affinityMisses = new LongAdder();
+
+    /** Tick bodies started, including the ones that end in an exception. */
+    private final LongAdder executedTicks = new LongAdder();
+
     /** Ticks another runner took out of a backlog because they were late. */
     private final LongAdder stolenTicks = new LongAdder();
 
@@ -342,6 +390,16 @@ public final class KairosScheduler extends Scheduler {
     /** Longest wait between a permit grant and the tick start, best effort. */
     private volatile long leaseParkedMaxNanos;
 
+    /**
+     * Bounded ring of the latest measured waits. Written on the tick path, read by the command; both
+     * sides are lock free and a slot is replaced rather than appended, so the ring costs the same
+     * memory after a week as after a second.
+     */
+    private final AtomicReferenceArray<LeaseSample> leaseRing = new AtomicReferenceArray<>(LEASE_RING_SIZE);
+
+    /** Next ring slot; wraps and is masked by {@link #LEASE_RING_SIZE}. */
+    private final AtomicInteger leaseRingCursor = new AtomicInteger();
+
     /** Set by a runner that saw a wait above the timeout; cleared by the warning that reports it. */
     private volatile boolean leaseTimeoutPending;
 
@@ -355,7 +413,7 @@ public final class KairosScheduler extends Scheduler {
     private long lastLeaseWarnNanos;
 
     /** Supervisor only: lease timeouts the quiet window swallowed since the last warning. */
-    private long suppressedLeaseWarns;
+    private final AtomicLong suppressedLeaseWarns = new AtomicLong();
 
     /** Supervisor only: at least one lease warning was written, so the quiet window has a start. */
     private boolean leaseWarned;
@@ -778,14 +836,106 @@ public final class KairosScheduler extends Scheduler {
                 TimeUnit.NANOSECONDS.toMillis(this.leaseQueuedMaxNanos),
                 TimeUnit.NANOSECONDS.toMillis(this.leaseParkedMaxNanos),
                 this.leaseTimeouts.sum(),
-                this.kernel.leaseTimeoutMillis()
+                this.kernel.leaseTimeoutMillis(),
+                this.recentLeaseWaits(now)
             ),
             this.affinityHits.sum(),
             this.stolenTicks.sum(),
             this.catchUpBursts.sum(),
             this.catchUpTicks.sum(),
-            this.idleWorkSnapshot()
+            this.idleWorkSnapshot(),
+            this.executedTicks.sum(),
+            this.affinityMisses.sum(),
+            this.overdueWarns.sum(),
+            this.suppressedOverdueWarns.get()
         );
+    }
+
+    /**
+     * Copies the recent wait ring into immutable samples with their age.
+     *
+     * <p>No lock and no ordering: the ring is a set of independent slots, so the copy is a handful of
+     * volatile reads and the command does the sorting. A slot that is being overwritten right now is
+     * read as either its old or its new sample, never as a half written one.
+     *
+     * @param now snapshot clock reading, used for the age of every sample
+     * @return the samples, possibly empty, in slot order
+     */
+    private List<KairosSnapshot.LeaseWait.Sample> recentLeaseWaits(final long now) {
+        final List<KairosSnapshot.LeaseWait.Sample> samples = new ArrayList<>(LEASE_RING_SIZE);
+        for (int index = 0; index < LEASE_RING_SIZE; index++) {
+            final LeaseSample sample = this.leaseRing.get(index);
+            if (sample == null) {
+                continue;
+            }
+            samples.add(new KairosSnapshot.LeaseWait.Sample(
+                sample.regionId(),
+                sample.tickId(),
+                TimeUnit.NANOSECONDS.toMillis(sample.queuedNanos()),
+                TimeUnit.NANOSECONDS.toMillis(sample.parkedNanos()),
+                TimeUnit.NANOSECONDS.toMillis(Math.max(0L, now - sample.atNanos()))
+            ));
+        }
+        return List.copyOf(samples);
+    }
+
+    /**
+     * Zeroes the A/B counters of the running fund, if one is running.
+     *
+     * <p>A measurement window starts when a series of runs starts, and dropping and recreating the
+     * scheduler for that would lose the fund, the live threads and every permit. This only writes the
+     * counters, so a run can be restarted without touching the world or the region scheduler.
+     *
+     * @return {@code true} when a fund was running and its counters were zeroed
+     */
+    public static boolean resetActiveCounters() {
+        final KairosScheduler current = ACTIVE.get();
+        if (current == null) {
+            return false;
+        }
+        current.resetCounters();
+        return true;
+    }
+
+    /**
+     * Zeroes the A/B counters of this fund.
+     *
+     * <p>What is zeroed: spawns, retires, executed ticks, affinity hits and misses, steals, catch-up
+     * bursts and ticks, measured permit waits (including the worst values and the recent sample ring)
+     * and the overdue-warning counters, with the pending warning flags cleared so a timeout measured
+     * before the reset cannot resurface in the new window. What is not: the floor, the ceiling, the live
+     * threads, the target, the queues, the permits, the observed period, the idle-work accounting and the
+     * last supervisor decision. A monitor that asks "how did the next hour go" therefore starts from a
+     * clean counter set while the fund keeps running the same way.
+     *
+     * <p>Safe from the global tick thread: every value is an atomic or a volatile counter, the ring is
+     * an array of independently published references, and the method never takes {@link #scheduleLock},
+     * never walks a queue and never waits for a runner. The zeroing is a sequence of independent
+     * writes, so a concurrent reader may briefly see one counter already at zero next to one that has
+     * not been zeroed yet; that is a torn window, not a broken fund, and it cannot outlive the call.
+     */
+    public void resetCounters() {
+        // maxima and the ring first, so the cheapest reader never sees a new maximum next to an
+        // already cleared history
+        this.leaseQueuedMaxNanos = 0L;
+        this.leaseParkedMaxNanos = 0L;
+        for (int index = 0; index < LEASE_RING_SIZE; index++) {
+            this.leaseRing.set(index, null);
+        }
+        this.leaseGrants.reset();
+        this.leaseTimeouts.reset();
+        this.leaseTimeoutPending = false;
+        this.suppressedLeaseWarns.set(0L);
+        this.suppressedOverdueWarns.set(0L);
+        this.overdueWarns.reset();
+        this.affinityHits.reset();
+        this.affinityMisses.reset();
+        this.stolenTicks.reset();
+        this.catchUpBursts.reset();
+        this.catchUpTicks.reset();
+        this.executedTicks.reset();
+        this.spawnCount.set(0L);
+        this.retireCount.set(0L);
     }
 
     /**
@@ -1491,9 +1641,10 @@ public final class KairosScheduler extends Scheduler {
      * deadline and the actual start: the permit existed and the tick was due, yet the body still did
      * not run, which is CPU or parking contention rather than a shortage of permits.
      *
-     * <p>Cheap on purpose: a few counter updates on the runner thread. Nothing here locks, logs or
-     * allocates, because this is the tick path; the warning that reports a timeout is written by the
-     * supervisor.
+     * <p>Cheap on purpose: a few counter updates and one small immutable sample on the runner thread.
+     * Nothing here locks, logs or formats, because this is the tick path; the warning that reports a
+     * timeout is written by the supervisor, and the samples are only sorted when a command asks for
+     * them.
      *
      * @param tick tick whose body is about to run
      */
@@ -1512,6 +1663,7 @@ public final class KairosScheduler extends Scheduler {
             if (parked > this.leaseParkedMaxNanos) {
                 this.leaseParkedMaxNanos = parked;
             }
+            this.recordLeaseSample(tick.tick, now, queued, parked);
             final long timeout = TimeUnit.MILLISECONDS.toNanos(this.kernel.leaseTimeoutMillis());
             if (timeout > 0L && Math.max(queued, parked) >= timeout) {
                 this.leaseTimeouts.increment();
@@ -1519,6 +1671,29 @@ public final class KairosScheduler extends Scheduler {
             }
         }
         this.recordPeriod(now, tick);
+    }
+
+    /**
+     * Keeps one bounded sample of a measured wait for {@code /tuff scheduler leases}.
+     *
+     * <p>The ring is the only place the command can learn which region waited; the maxima above say
+     * how long, not who. One small record per grant is the whole cost - the slot is overwritten, never
+     * appended - and the write is a single volatile store, so a reader sees either the previous sample
+     * or the new one, never a torn one.
+     *
+     * @param tick    tick the permit was granted for
+     * @param now     moment the body started
+     * @param queued  wait between the deadline and the grant, in nanoseconds
+     * @param parked  wait between the later of grant and deadline and the body, in nanoseconds
+     */
+    private void recordLeaseSample(
+        final SchedulableTick tick,
+        final long now,
+        final long queued,
+        final long parked
+    ) {
+        final int index = this.leaseRingCursor.getAndIncrement() & (LEASE_RING_SIZE - 1);
+        this.leaseRing.set(index, new LeaseSample(regionId(tick), tick.id, queued, parked, now));
     }
 
     /**
@@ -1687,8 +1862,15 @@ public final class KairosScheduler extends Scheduler {
             best.localOwner = null;
             --this.localDepth;
             this.affinityHits.increment();
-        } else if (best == global) {
-            this.queued.poll();
+        } else {
+            if (best == global) {
+                this.queued.poll();
+            }
+            if (this.affinityQueueSize > 0) {
+                // not waiting in this runner's own backlog: either an earlier tick from the shared
+                // queue won or another runner kept it, and both mean affinity did not apply
+                this.affinityMisses.increment();
+            }
         }
         return best;
     }
@@ -2164,12 +2346,12 @@ public final class KairosScheduler extends Scheduler {
         }
         if (this.lastOverdueWarnNanos != 0L
             && now - this.lastOverdueWarnNanos < OVERDUE_WARN_INTERVAL_NANOS) {
-            ++this.suppressedOverdueWarns;
+            this.suppressedOverdueWarns.incrementAndGet();
             return overdue;
         }
-        final long suppressed = this.suppressedOverdueWarns;
-        this.suppressedOverdueWarns = 0L;
+        final long suppressed = this.suppressedOverdueWarns.getAndSet(0L);
         this.lastOverdueWarnNanos = now;
+        this.overdueWarns.increment();
 
         final int liveNow = this.live.get();
         final boolean saturated = liveNow >= this.maxThreads;
@@ -2234,11 +2416,10 @@ public final class KairosScheduler extends Scheduler {
             return;
         }
         if (this.leaseWarned && now - this.lastLeaseWarnNanos < OVERDUE_WARN_INTERVAL_NANOS) {
-            ++this.suppressedLeaseWarns;
+            this.suppressedLeaseWarns.incrementAndGet();
             return;
         }
-        final long suppressed = this.suppressedLeaseWarns;
-        this.suppressedLeaseWarns = 0L;
+        final long suppressed = this.suppressedLeaseWarns.getAndSet(0L);
         this.lastLeaseWarnNanos = now;
         this.leaseWarned = true;
 
@@ -2268,22 +2449,39 @@ public final class KairosScheduler extends Scheduler {
     }
 
     /**
-     * Reads the region id of a queued tick without linking the scheduler to Folia's classes.
+     * Reads the region id of a tick without linking the scheduler to Folia's classes.
      *
      * <p>The facade patch is deliberately limited to the deadline accessor, so the region is read from
-     * the public field Folia already exposes. This only runs on a rate-limited warning and never on the
-     * tick path; an unknown tick answers {@code -1} and the warning says so.
+     * the public field Folia already exposes. The field lookups behind {@link #REGION_ID} are cached
+     * per class, which is what makes this cheap enough for the per-grant lease sample as well as for
+     * the rate limited warning.
      *
      * @param tick queued tick
      * @return the region id, or {@code -1} when this tick is not a region handle
      */
     private static long regionId(final SchedulableTick tick) {
-        try {
-            final Object data = tick.getClass().getField("region").get(tick);
-            return data == null ? -1L : data.getClass().getField("id").getLong(data);
-        } catch (ReflectiveOperationException | RuntimeException _) {
-            return -1L;
-        }
+        return REGION_ID.get(tick.getClass()).applyAsLong(tick);
+    }
+
+    /**
+     * One measured permit wait, kept in the recent ring.
+     *
+     * <p>Immutable and published as a single reference, so a reader never sees a half filled sample.
+     * The values are the raw nanoseconds; the snapshot converts them once per command.
+     *
+     * @param regionId    region that owned the tick, or {@code -1} when the tick is not a region
+     * @param tickId      id of the tick the permit was granted for
+     * @param queuedNanos wait between the deadline and the grant
+     * @param parkedNanos wait between the later of grant and deadline and the body start
+     * @param atNanos     moment the wait was measured, for the age of the sample
+     */
+    private record LeaseSample(
+        long regionId,
+        long tickId,
+        long queuedNanos,
+        long parkedNanos,
+        long atNanos
+    ) {
     }
 
     /**
@@ -2982,6 +3180,8 @@ public final class KairosScheduler extends Scheduler {
                         if (this.state != startState || !this.takeTask(startState, startStateTask)) {
                             continue;
                         }
+                        // one body starts: the A/B counter behind "ticks: executed"
+                        this.scheduler.executedTicks.increment();
 
                         // measured before the body: the only work that can push a body past its
                         // deadline is an idle slice, and only the guard cares about that number
