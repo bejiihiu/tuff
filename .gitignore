@@ -21,3 +21,7 @@ build
 # jvm crash dumps
 *.hprof
 *.log
+
+# flight recordings and the directory the JFR command writes them to
+*.jfr
+/debug
