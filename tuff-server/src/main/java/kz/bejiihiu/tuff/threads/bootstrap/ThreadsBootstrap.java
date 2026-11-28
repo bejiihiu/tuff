@@ -201,10 +201,12 @@ public final class ThreadsBootstrap {
                 // every heavy read (region walk, thread table, probes) happens on this thread from now
                 // on: the console command is itself on a region tick thread in Folia and must not do it
                 final TickPressureMonitor createdPressure = pressureMonitor(settings, created);
-                final ThreadsSampler createdSampler = ThreadsSampler.start(created, createdPressure);
-                this.runtime = created;
-                this.sampler = createdSampler;
+                // publish each piece before the next thing that can throw: the catch below stops
+                // whatever the fields hold, so a grab that is not published yet would run forever
                 this.pressure = createdPressure;
+                final ThreadsSampler createdSampler = ThreadsSampler.start(created, createdPressure);
+                this.sampler = createdSampler;
+                this.runtime = created;
                 this.status = ThreadsStatus.running(settings);
                 // the scheduler starts later than this hook, so the seams are published now: the fund
                 // reads its ceiling from the controller and its supervisor thread from the service pool
@@ -219,6 +221,11 @@ public final class ThreadsBootstrap {
                 this.sampler = null;
                 if (partial != null) {
                     partial.stop();
+                }
+                final TickPressureMonitor partialPressure = this.pressure;
+                this.pressure = null;
+                if (partialPressure != null) {
+                    partialPressure.stop();
                 }
                 this.status = ThreadsStatus.failed();
                 if (created != null) {

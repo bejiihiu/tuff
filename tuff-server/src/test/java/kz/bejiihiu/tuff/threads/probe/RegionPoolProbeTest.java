@@ -6,10 +6,12 @@ import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolObservation;
 import kz.bejiihiu.tuff.threads.region.RegionReading;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@Timeout(120)
 class RegionPoolProbeTest {
 
     @Test

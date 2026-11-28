@@ -6,6 +6,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -17,6 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * the walk itself never touches the regioniser. What is under test is the policy around the walk, which is
  * exactly the part that could hurt the server if it were wrong.
  */
+@Timeout(120)
 class FoliaRegionTickProviderTest {
 
     private static final long FIVE_SECONDS = 5_000_000_000L;

@@ -324,6 +324,10 @@ The trigger block carries its own counters:
 The consumer line itself (`region-relief: enabled, 25% of the pool, ...`) carries the usual submitted,
 completed, rejected, expired and timing counters of the pool.
 
+`peakWorkers` on the `/tuff compute` line records the pool the engine actually ran with: with an automatic
+worker count the pool is created empty and spawned once, at the budget the region scheduler reports, so
+the startup placeholder never shows up as a peak.
+
 ## Operational notes
 
 - Keep the trigger off unless there is a region subsystem that actually registers offloadable work. The
@@ -354,5 +358,3 @@ The trigger is a restart-only feature with a single switch:
    calls it.
 
 No state survives the restart: the window epoch, the counters and the cooldown are rebuilt from zero.
-- The metric `peakWorkers` is no longer polluted by the startup budget: with an automatic worker count the pool
-  is created empty and spawned once, at the budget the region scheduler reports.

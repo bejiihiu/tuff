@@ -20,6 +20,7 @@ import kz.bejiihiu.tuff.threads.ResourceSnapshot;
 import kz.bejiihiu.tuff.threads.SaturationReport;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -34,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>The clock is the argument, not the wall clock, so a test that means "two seconds later" gets
  * exactly that.
  */
+@Timeout(120)
 class TickPressureMonitorTest {
 
     private static final long SECOND = TimeUnit.SECONDS.toNanos(1L);

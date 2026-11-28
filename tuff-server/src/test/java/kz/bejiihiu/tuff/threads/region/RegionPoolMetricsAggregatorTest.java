@@ -3,6 +3,7 @@ package kz.bejiihiu.tuff.threads.region;
 import java.util.List;
 import kz.bejiihiu.tuff.threads.RegionPoolMetrics;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -14,6 +15,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * <p>No server is involved: a reading is a value object, so every case - no regions, one region, many,
  * a lagging region, a region that has not ticked yet - is a list literal.
  */
+@Timeout(120)
 class RegionPoolMetricsAggregatorTest {
 
     @Test

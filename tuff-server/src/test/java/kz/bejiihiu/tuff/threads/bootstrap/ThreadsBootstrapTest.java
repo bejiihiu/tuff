@@ -20,6 +20,7 @@ import kz.bejiihiu.tuff.threads.bridge.RegionThreads;
 import kz.bejiihiu.tuff.threads.config.ThreadsConfig;
 import kz.bejiihiu.tuff.threads.kairos.KairosServices;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -30,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@Timeout(120)
 class ThreadsBootstrapTest {
 
     @TempDir

@@ -4,10 +4,12 @@ import java.util.List;
 import kz.bejiihiu.tuff.threads.PoolId;
 import kz.bejiihiu.tuff.threads.internal.spi.PoolObservation;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@Timeout(120)
 class ChatPoolProbeTest {
 
     @Test

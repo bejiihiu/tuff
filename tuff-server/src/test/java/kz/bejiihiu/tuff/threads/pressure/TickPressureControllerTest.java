@@ -3,6 +3,7 @@ package kz.bejiihiu.tuff.threads.pressure;
 import java.util.concurrent.TimeUnit;
 import kz.bejiihiu.tuff.threads.ThreadManagementSettings;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -15,6 +16,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * no test sleeps. A decision that moves the reserve has to name its reason; a decision that does not
  * must leave the number alone.
  */
+@Timeout(120)
 class TickPressureControllerTest {
 
     private static final long SECOND = TimeUnit.SECONDS.toNanos(1L);

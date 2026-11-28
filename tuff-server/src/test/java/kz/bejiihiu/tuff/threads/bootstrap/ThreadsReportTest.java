@@ -18,10 +18,12 @@ import kz.bejiihiu.tuff.threads.pressure.TickPressureController;
 import kz.bejiihiu.tuff.threads.pressure.TickPressureSnapshot;
 import kz.bejiihiu.tuff.threads.pressure.TickSignal;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@Timeout(120)
 class ThreadsReportTest {
 
     @Test
