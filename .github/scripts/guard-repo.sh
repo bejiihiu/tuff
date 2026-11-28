@@ -35,4 +35,53 @@ expect_one_in_patches 'ComputeBootstrap.applyRegionBudget()' 'region budget hook
 expect_one_in_patches 'ComputeBootstrap.stop()' 'compute stop hook'
 expect_one_in_patches 'COMMANDS.put("tuff"' 'tuff command'
 
-echo "static patch guards ok: no stray folia-*, 4 hooks, checkstyle + gitignore invariants"
+# Our patches sit on top of the upstream stack. Upstream keeps appending numbered
+# feature patches, so "ours is last" is asserted here instead of assumed: a patch
+# renumbered below an upstream one silently interleaves our hunks with theirs.
+features_in() {
+  ls "$1" | grep -E '^[0-9]{4}-.*\.patch$' | sort || true
+}
+
+expect_last_patch() {
+  local dir="$1" number="$2" last
+  last=$(features_in "$dir" | tail -n 1)
+  case "$last" in
+    "$number"-*) ;;
+    *) fail "$dir: the highest numbered patch is '${last:-none}', expected $number-*. Ours always go after the upstream set - renumber instead of inserting below it." ;;
+  esac
+}
+
+PAPER_FEATURES="tuff-server/paper-patches/features"
+MINECRAFT_FEATURES="tuff-server/minecraft-patches/features"
+
+expect_last_patch "$PAPER_FEATURES" 0009
+expect_last_patch "$MINECRAFT_FEATURES" 0016
+
+# 0015 (lifecycle) is the patch right under 0016 (region hooks); an upstream patch
+# landing between them would split one change set across two numbers.
+second_last=$(features_in "$MINECRAFT_FEATURES" | tail -n 2 | head -n 1)
+case "$second_last" in
+  0015-*) ;;
+  *) fail "$MINECRAFT_FEATURES: expected 0015-* directly under 0016, found '${second_last:-none}'." ;;
+esac
+
+# The seams 0016 owns are load bearing: the tick observer call is the only source of
+# per-body lag, the catch up limit is a bounded write off that must be consumed, and
+# the region bridge wrap is what makes a tick body visible to the thread layer.
+PATCH_0016="tuff-server/minecraft-patches/features/0016-Tuff-hook-region-ticks-for-accounting-and-Kairos.patch"
+[ -f "$PATCH_0016" ] || fail "$PATCH_0016 is gone - the region hook patch was renamed or merged into another number."
+
+added_0016=$(grep -E '^\+' "$PATCH_0016" || true)
+
+expect_added_0016() {
+  local needle="$1" what="$2"
+  printf '%s\n' "$added_0016" | grep -qF -- "$needle" \
+    || fail "0016 no longer adds the $what seam ('$needle'). The applied guard checks it again, but losing it here means the patch was rebuilt wrong."
+}
+
+expect_added_0016 'TickObservers.observer()' 'tick observer call'
+expect_added_0016 'final long writeOff = this.writeOffLimit;' 'catch up limit read'
+expect_added_0016 'this.writeOffLimit = 0L;' 'catch up limit clear'
+expect_added_0016 'RegionThreads.wrapBody(run)' 'region bridge wrap'
+
+echo "static patch guards ok: no stray folia-*, 4 hooks, checkstyle + gitignore invariants, our patches last (paper 0009, minecraft 0015/0016) with all 0016 seams"

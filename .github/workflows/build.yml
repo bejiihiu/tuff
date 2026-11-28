@@ -1,8 +1,10 @@
 name: Build
 
+# ver/26.3.x is the branch that ships, so it is built on every push: a red commit
+# there must be visible on the badge and before a tag, not after the version is out.
 on:
   push:
-    branches-ignore:
+    branches:
       - ver/26.3.x
   pull_request:
   workflow_dispatch:
@@ -36,6 +38,7 @@ jobs:
 
       - name: Configure git
         run: |
+          set -euo pipefail
           git config --global user.email "no-reply@github.com"
           git config --global user.name "GitHub Actions"
 
@@ -45,7 +48,9 @@ jobs:
         run: bash .github/scripts/guard-repo.sh
 
       - name: Apply patches
-        run: ./gradlew applyAllPatches --stacktrace
+        run: |
+          set -euo pipefail
+          ./gradlew applyAllPatches --stacktrace
 
       # applied-tree invariants: hooks occupy the right place (not just "somewhere
       # that compiles") and the generated checkstyle config still skips NMS.
@@ -59,6 +64,7 @@ jobs:
       - name: Verify patches reproduce from applied sources
         timeout-minutes: 30
         run: |
+          set -euo pipefail
           # checkoutPaperRepo already produced the upstream clone in the apply step.
           # Excluding it dodges a paperweight/Gradle 9 implicit-dependency validation
           # error: the rebuild tasks read that clone without declaring the dependency.
@@ -81,22 +87,30 @@ jobs:
       # build == check (checkstyle + tests of every module) and the paperclip jar is a separate task.
       # javadoc tasks are not part of build, but they run on publish - fail here instead of on a release tag.
       - name: Build and test
-        run: >
-          ./gradlew build :tuff-server:createPaperclipJar
-          :tuff-compute:javadoc :tuff-api:javadoc
-          --stacktrace
-
-      # a green build with zero executed compute tests is not green; make the count explicit.
-      - name: Verify compute tests ran
         run: |
-          results="tuff-compute/build/test-results/test"
-          if ! ls "$results"/*.xml >/dev/null 2>&1; then
-            echo "no JUnit results under $results - tuff-compute tests did not run" >&2
-            exit 1
-          fi
-          cases=$(cat "$results"/*.xml | grep -c '<testcase ')
-          echo "tuff-compute test cases: $cases"
-          test "$cases" -gt 0
+          set -euo pipefail
+          ./gradlew build :tuff-server:createPaperclipJar \
+            :tuff-compute:javadoc :tuff-api:javadoc \
+            --stacktrace
+
+      # a green build with zero executed tests is not green; every module that ships
+      # or gates the release has to show its own fresh results.
+      - name: Verify tests ran
+        run: |
+          set -euo pipefail
+          for module in tuff-compute tuff-api tuff-server tuff-threads; do
+            results="$module/build/test-results/test"
+            if ! ls "$results"/*.xml >/dev/null 2>&1; then
+              echo "no JUnit results under $results - $module tests did not run" >&2
+              exit 1
+            fi
+            cases=$(cat "$results"/*.xml | grep -c '<testcase ' || true)
+            echo "$module test cases: $cases"
+            if [ "${cases:-0}" -eq 0 ]; then
+              echo "$module reported zero test cases - the suite did not execute" >&2
+              exit 1
+            fi
+          done
 
       - name: Upload test reports
         if: failure()

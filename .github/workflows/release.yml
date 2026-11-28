@@ -27,12 +27,22 @@ jobs:
       - name: Resolve build number
         id: build
         run: |
+          set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "number=${{ inputs.build_number }}" >> "$GITHUB_OUTPUT"
           else
             # tags look like v26.3.build.42, the gradle version is 26.3.build.42-stable
             echo "number=$(echo "${GITHUB_REF_NAME#v}" | sed 's/.*\.build\.//')" >> "$GITHUB_OUTPUT"
           fi
+
+      # Build-Time records the commit that is being released, not the last time the
+      # repository object was touched. A tag checkout points at the tagged commit, so
+      # the same stamp comes out whether this ran from a tag or from a dispatch.
+      - name: Resolve build stamp
+        id: stamp
+        run: |
+          set -euo pipefail
+          echo "started_at=$(git log -1 --format=%cI)" >> "$GITHUB_OUTPUT"
 
       - name: JDK 25
         uses: actions/setup-java@v5
@@ -45,37 +55,53 @@ jobs:
 
       - name: Configure git
         run: |
+          set -euo pipefail
           git config --global user.email "no-reply@github.com"
           git config --global user.name "GitHub Actions"
 
+      # the same pre-flight build runs: a tag must not be the first place a patch
+      # invariant or a javadoc error shows up.
+      - name: Guard patch invariants
+        run: bash .github/scripts/guard-repo.sh
+
       - name: Apply patches
-        run: ./gradlew applyAllPatches --stacktrace
+        run: |
+          set -euo pipefail
+          ./gradlew applyAllPatches --stacktrace
+
+      - name: Guard applied tree
+        run: bash .github/scripts/guard-applied.sh
 
       - name: Build
         env:
           BUILD_NUMBER: ${{ steps.build.outputs.number }}
-          BUILD_STARTED_AT: ${{ github.event.repository.updated_at }}
-        run: ./gradlew build :tuff-server:createPaperclipJar --stacktrace
+          BUILD_STARTED_AT: ${{ steps.stamp.outputs.started_at }}
+        run: |
+          set -euo pipefail
+          ./gradlew build :tuff-server:createPaperclipJar \
+            :tuff-compute:javadoc :tuff-api:javadoc \
+            --stacktrace
 
       # tuff-api depends on tuff-compute, publish the engine first so the api pom never
-      # points at coordinates that are not there yet.
+      # points at coordinates that are not there yet. The token travels as an env var so
+      # it never lands in argv or in a daemon log line.
       - name: Publish compute to GitHub Packages
         env:
           BUILD_NUMBER: ${{ steps.build.outputs.number }}
-        run: >
-          ./gradlew :tuff-compute:publish
-          -PtuffUsername=${{ github.actor }}
-          -PtuffPassword=${{ secrets.GITHUB_TOKEN }}
-          --stacktrace
+          ORG_GRADLE_PROJECT_tuffUsername: ${{ github.actor }}
+          ORG_GRADLE_PROJECT_tuffPassword: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./gradlew :tuff-compute:publish --stacktrace
 
       - name: Publish API to GitHub Packages
         env:
           BUILD_NUMBER: ${{ steps.build.outputs.number }}
-        run: >
-          ./gradlew :tuff-api:publish
-          -PtuffUsername=${{ github.actor }}
-          -PtuffPassword=${{ secrets.GITHUB_TOKEN }}
-          --stacktrace
+          ORG_GRADLE_PROJECT_tuffUsername: ${{ github.actor }}
+          ORG_GRADLE_PROJECT_tuffPassword: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ./gradlew :tuff-api:publish --stacktrace
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2

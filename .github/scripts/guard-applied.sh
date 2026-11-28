@@ -7,6 +7,7 @@ set -euo pipefail
 CRAFT_SERVER="paper-server/src/main/java/org/bukkit/craftbukkit/CraftServer.java"
 PAPER_COMMANDS="paper-server/src/main/java/io/papermc/paper/command/PaperCommands.java"
 MINECRAFT_SERVER="tuff-server/src/minecraft/java/net/minecraft/server/MinecraftServer.java"
+TICK_SCHEDULER="tuff-server/src/minecraft/java/io/papermc/paper/threadedregions/TickRegionScheduler.java"
 CHECKSTYLE="paper-server/.checkstyle/checkstyle.xml"
 
 fail() {
@@ -50,7 +51,7 @@ expect_between() {
     || fail "$label: '$needle' is at line $at, outside '$before' ($lo) .. '$after' ($hi). It still compiles there, but it runs at the wrong moment."
 }
 
-for f in "$CRAFT_SERVER" "$PAPER_COMMANDS" "$MINECRAFT_SERVER" "$CHECKSTYLE"; do
+for f in "$CRAFT_SERVER" "$PAPER_COMMANDS" "$MINECRAFT_SERVER" "$TICK_SCHEDULER" "$CHECKSTYLE"; do
   require_file "$f"
 done
 
@@ -81,4 +82,22 @@ pattern='value="[\\/](paper|folia|tuff)-server[\\/]src[\\/]minecraft[\\/]"'
 hits=$(count_of "$pattern" "$CHECKSTYLE")
 [ "$hits" -eq 1 ] || fail "checkstyle exclusion for tuff-server/src/minecraft is wrong in $CHECKSTYLE (found $hits). The fileNamePattern must keep the tuff alternative: (paper|folia|tuff)-server/src/minecraft - anything narrower starts linting decompiled NMS (4d4253a)."
 
-echo "applied-tree guards ok: 4 hooks in place, checkstyle covers tuff-server/src/minecraft"
+# 6. 0016 seams. All three compile wherever they sit, so each one is pinned to its
+# place: the observer call fires from runTick's finally once the tick bookkeeping is
+# done, the catch up limit is read and consumed before the new tick count is used, and
+# the region thread factory wraps the body it hands to TickThreadRunner.
+expect_once 'TickObservers.observer()' "$TICK_SCHEDULER" "tick observer call"
+expect_between 'tick observer call' 'TickObservers.observer()' \
+  'TickRegionScheduler.setTickingRegion(null);' '// Only AFTER updating the tickStart' "$TICK_SCHEDULER"
+
+expect_once 'final long writeOff = this.writeOffLimit;' "$TICK_SCHEDULER" "catch up limit read"
+expect_between 'catch up limit read' 'final long writeOff = this.writeOffLimit;' \
+  'final long periodsAhead' 'final long tickCount = Math.max' "$TICK_SCHEDULER"
+
+expect_once 'this.writeOffLimit = 0L;' "$TICK_SCHEDULER" "catch up limit clear"
+
+expect_once 'RegionThreads.wrapBody(run)' "$TICK_SCHEDULER" "region bridge wrap"
+expect_between 'region bridge wrap' 'RegionThreads.wrapBody(run)' \
+  'public Thread newThread(' 'ret.setUncaughtExceptionHandler' "$TICK_SCHEDULER"
+
+echo "applied-tree guards ok: 4 hooks in place, checkstyle covers tuff-server/src/minecraft, 0016 seams in place"
