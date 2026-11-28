@@ -113,7 +113,9 @@ public record ComputeSettings(
             Metrics.defaults(),
             Adaptive.defaults(),
             Lanes.defaults(),
-            Duration.ofSeconds(30)
+            // must stay equal to async-compute.shutdown-grace-seconds in the shipped template, or a
+            // server without the key reports a timeout that the operator never configured
+            Duration.ofSeconds(5)
         );
     }
 
