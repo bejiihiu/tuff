@@ -410,6 +410,7 @@ class RegionReliefTest {
         awaitUntil("the expired request runs inline", Duration.ofSeconds(10L),
             () -> this.relief.metrics().expired() == 1L);
         assertTrue(applied.await(10L, TimeUnit.SECONDS), "the same work must be applied after expiry");
+        awaitCompleted(1L);
         assertEquals(1, applies.get());
         assertEquals(1L, this.relief.metrics().inlineFallbacks());
         assertEquals(1L, this.relief.metrics().completed());
@@ -439,8 +440,8 @@ class RegionReliefTest {
             owner, new TestWork("snapshot", 7L, applied, new AtomicInteger(), new AtomicReference<>(), null)
         )));
         assertTrue(applied.await(10L, TimeUnit.SECONDS));
-        awaitUntil("the applied request is counted", Duration.ofSeconds(10L),
-            () -> this.relief.metrics().completed() == 1L);
+        awaitUntil("the saved time estimate is recorded", Duration.ofSeconds(10L),
+            () -> this.relief.metrics().estimatedSavedNanos() == TimeUnit.MILLISECONDS.toNanos(5L));
 
         final RegionReliefMetrics metrics = this.relief.metrics();
         assertEquals(1L, metrics.completed());
